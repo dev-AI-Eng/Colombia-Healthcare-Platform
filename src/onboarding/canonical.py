@@ -341,7 +341,22 @@ _PATIENT: Final = (
         Entity.PATIENT,
         Requirement.OPTIONAL,
         "The clinic's own code for this patient, so a later import updates instead of duplicating.",
-        aliases=("codigo paciente", "id interno", "codigo interno", "historia clinica", "hc"),
+        # "id paciente" must be here rather than left to the fuzzy stage: the
+        # word "paciente" is a `full_name` alias, so a column headed "ID
+        # Paciente" matched the patient's NAME at strong confidence and arrived
+        # pre-ticked. Every row then asked which part of "P-1001" was the given
+        # name. A code is not a name, and the clinic's own code is what makes a
+        # re-import update instead of duplicate.
+        aliases=(
+            "codigo paciente",
+            "id paciente",
+            "id del paciente",
+            "numero paciente",
+            "id interno",
+            "codigo interno",
+            "historia clinica",
+            "hc",
+        ),
     ),
 )
 

@@ -442,3 +442,24 @@ def test_the_allowance_never_exceeds_the_share_it_claims() -> None:
             assert allowed <= service.INVALID_ROW_SHARE * total, (
                 f"{allowed} of {total} is more than the {service.INVALID_ROW_SHARE:.0%} claimed"
             )
+
+
+def test_a_patient_id_column_is_not_mistaken_for_the_patient_name() -> None:
+    """ "ID Paciente" is a code, not a name.
+
+    `paciente` is a `full_name` alias, so a column headed "ID Paciente" matched
+    the patient's NAME at strong confidence and arrived pre-ticked. Every row
+    then asked a reviewer which part of "P-1001" was the given name, and no
+    patient in the file could import. The clinic's own code is also what makes a
+    second import update rather than duplicate, so losing it costs twice.
+    """
+    from src.onboarding.matcher import match_sheet
+
+    mapping = match_sheet(("ID Paciente", "Identificación", "Nombres", "Apellidos"), Entity.PATIENT)
+    targets = {p.column: (p.field.name if p.field else None) for p in mapping.proposals}
+    assert targets["ID Paciente"] == "external_ref", targets
+
+    # A column that really is the name must still reach full_name.
+    for heading in ("Nombre del paciente", "NOMBRE COMPLETO", "Paciente"):
+        named = match_sheet((heading,), Entity.PATIENT).proposals[0]
+        assert named.field is not None and named.field.name == "full_name", heading
