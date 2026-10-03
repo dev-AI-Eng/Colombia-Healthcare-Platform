@@ -237,16 +237,71 @@ def analyse_sheet_for_test(sheet: Sheet) -> SheetReport:
     return _analyse_sheet(sheet)
 
 
+#: The entity a column is offered to when the sheet's own entity has no field
+#: for it, in the order they are tried. A clinic's sheet is one row per visit:
+#: the patient columns and the appointment columns sit side by side, and until
+#: this existed the three columns belonging to the other entity were simply
+#: dropped. HubSpot calls the same shape "one file, multiple objects": each
+#: column is assigned an object as well as a property, and the parent's columns
+#: repeat on every row.
+#:
+#: Patient first, because a sheet about anything else still names its patient,
+#: and a patient is the record everything else refers to.
+_SECONDARY_ENTITIES: Final[tuple[Entity, ...]] = (
+    Entity.PATIENT,
+    Entity.APPOINTMENT,
+    Entity.DOCTOR,
+)
+
+
+def _secondary_proposals(
+    sheet: Sheet, primary: Entity, mapping: SheetMapping
+) -> dict[str, tuple[Entity, Proposal, str]]:
+    """Columns the sheet's own entity cannot use, matched against the others.
+
+    Only columns left over are offered, and only to the dictionary and fuzzy
+    stages -- never to a model. A model asked "which appointment field is this"
+    about a column that is really a patient's is being asked the wrong question,
+    and the answer would be a guess dressed as a proposal.
+    """
+    unmapped = tuple(p.column for p in mapping.proposals if p.field is None)
+    if not unmapped:
+        return {}
+
+    found: dict[str, tuple[Entity, Proposal, str]] = {}
+    for entity in _SECONDARY_ENTITIES:
+        if entity is primary:
+            continue
+        remaining = tuple(c for c in unmapped if c not in found)
+        if not remaining:
+            break
+        for proposal in match_sheet(remaining, entity).proposals:
+            # Only a confident match crosses an entity boundary. A fuzzy guess
+            # that a patient column is really a doctor's would move a person's
+            # name into the wrong table, which is worse than leaving it unmapped
+            # for a reviewer to assign.
+            if proposal.field is not None and proposal.auto:
+                found[proposal.column] = (entity, proposal, proposal.field.name)
+    return found
+
+
 def _analyse_sheet(sheet: Sheet) -> SheetReport:
     entity, reason = guess_entity(sheet.name, sheet.headers)
     mapping = match_sheet(sheet.headers, entity)
     questions = _column_questions(sheet, mapping)
     suggested = _ask_model(sheet, entity, mapping)
+    secondary = _secondary_proposals(sheet, entity, mapping)
+    columns = tuple(
+        _secondary_report(*secondary[p.column])
+        if p.column in secondary
+        else (suggested.get(p.column) or _column_report(p))
+        for p in mapping.proposals
+    )
     return SheetReport(
         sheet=sheet.name,
         entity=entity,
         entity_reason=reason,
-        columns=tuple(suggested.get(p.column) or _column_report(p) for p in mapping.proposals),
+        columns=columns,
         missing_required=mapping.missing_required,
         total_rows=len(sheet.rows),
         valid_rows=0,
@@ -254,6 +309,45 @@ def _analyse_sheet(sheet: Sheet) -> SheetReport:
         invalid_rows=0,
         warnings=sheet.warnings,
         questions=questions,
+    )
+
+
+#: Separates an entity from a field in a qualified target, e.g.
+#: "appointment.status". A bare name still means the sheet's own entity, so
+#: every mapping written before this existed keeps its meaning.
+ENTITY_SEPARATOR: Final = "."
+
+
+def qualified(entity: Entity, field_name: str) -> str:
+    """How a field of another entity is named on the confirmation screen."""
+    return f"{entity.value}{ENTITY_SEPARATOR}{field_name}"
+
+
+def split_target(target: str, default: Entity) -> tuple[Entity, str]:
+    """The entity and field a mapping names, defaulting to the sheet's own.
+
+    An unqualified name belongs to `default`, which is what every stored
+    profile and every hand-written mapping contains.
+    """
+    head, separator, tail = target.partition(ENTITY_SEPARATOR)
+    if not separator:
+        return default, target
+    try:
+        return Entity(head), tail
+    except ValueError:
+        # Not an entity prefix. A field name containing a dot is not one we
+        # define, but treating it as qualified would silently drop the column.
+        return default, target
+
+
+def _secondary_report(entity: Entity, proposal: Proposal, field_name: str) -> ColumnReport:
+    """A column that belongs to an entity other than the sheet's own."""
+    return ColumnReport(
+        column=proposal.column,
+        target_field=qualified(entity, field_name),
+        confidence=proposal.confidence.value,
+        reason=f"{proposal.reason} Belongs to the {entity.value} this row describes.",
+        auto=proposal.auto,
     )
 
 
@@ -323,9 +417,17 @@ def validate(
     # Date order is decided once per column, from the whole column, before any
     # row is converted. Deciding per row would let one file contain both
     # readings, which is how a birth date silently becomes a different date.
+    # Which entity each confirmed column belongs to. A sheet is one row per
+    # visit as often as it is one row per patient, so a column may name a field
+    # of an entity other than the sheet's own: see `_SECONDARY_ENTITIES`.
+    targets: dict[str, tuple[Entity, str]] = {
+        column: split_target(target, entity) for column, target in mapping.items() if target
+    }
+
     orders: dict[str, norm.DayFirst] = {}
     for column, target in mapping.items():
-        canonical = field_for(entity, target) if target else None
+        column_entity, field_name = targets.get(column, (entity, ""))
+        canonical = field_for(column_entity, field_name) if target else None
         if canonical and canonical.normalizer == "date":
             answer = decisions.get(column)
             orders[column] = (
@@ -368,17 +470,29 @@ def validate(
             for header in dict.fromkeys(sheet.headers)
             if header in mapping
         ]
-        row = RowResult(
-            row_number=offset,
-            entity=entity,
-            raw={header: corrected.get(header, raw_row[index[header]]) for header in sheet.headers},
-        )
+        raw_cells = {
+            header: corrected.get(header, raw_row[index[header]]) for header in sheet.headers
+        }
+        # One source row becomes one result per entity it describes. A sheet of
+        # visits holds a patient and their appointment side by side, and the
+        # patient repeats on every row they appear in; `find_duplicates` and the
+        # apply step both key on identity, so the repeat resolves to one record.
+        by_entity: dict[Entity, RowResult] = {
+            entity: RowResult(row_number=offset, entity=entity, raw=dict(raw_cells))
+        }
+        row = by_entity[entity]
         for column, target in in_file_order:
             if target is None:
                 continue
-            canonical = field_for(entity, target)
+            column_entity, field_name = targets.get(column, (entity, target))
+            canonical = field_for(column_entity, field_name)
             if canonical is None:
                 continue
+            if column_entity not in by_entity:
+                by_entity[column_entity] = RowResult(
+                    row_number=offset, entity=column_entity, raw=dict(raw_cells)
+                )
+            row = by_entity[column_entity]
             original = raw_row[index[column]]
             # The reviewer's answer, where they gave one, so the correction is
             # what gets converted rather than only what gets displayed.
@@ -400,15 +514,15 @@ def validate(
                 )
             )
             if outcome.status is norm.Status.VALID:
-                if target in SHARED_FIELDS and target in row.values:
+                if field_name in SHARED_FIELDS and field_name in row.values:
                     # A second column for the same name field: joined in the
                     # file's column order, so "primerNombre" then
                     # "segundoNombre" reads as the person writes their name.
-                    existing = str(row.values[target]).strip()
+                    existing = str(row.values[field_name]).strip()
                     addition = str(_text(outcome.value) or "").strip()
-                    row.values[target] = f"{existing} {addition}".strip()
+                    row.values[field_name] = f"{existing} {addition}".strip()
                 else:
-                    row.values[target] = outcome.value
+                    row.values[field_name] = outcome.value
             elif outcome.status is norm.Status.INVALID:
                 row.errors.append(f"{column}: {outcome.message}")
             else:
@@ -419,12 +533,13 @@ def validate(
         # whose cells all converted was committed as valid. Hiding a row is not
         # deleting it, and the usual reason is a cancellation the clinic never
         # removed, so a person decides.
-        if offset in sheet.hidden_row_numbers:
-            row.reviews.append(
-                "This row is hidden in the file. Hiding is not deleting, so confirm "
-                "whether it should be imported."
-            )
-        rows.append(row)
+        for produced in by_entity.values():
+            if offset in sheet.hidden_row_numbers:
+                produced.reviews.append(
+                    "This row is hidden in the file. Hiding is not deleting, so confirm "
+                    "whether it should be imported."
+                )
+        rows.extend(by_entity.values())
 
     # In the file's own column order, and including the columns nobody mapped.
     # Iterating the mapping instead would reorder the screen against the

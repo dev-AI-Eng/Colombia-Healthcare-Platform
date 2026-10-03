@@ -48,6 +48,7 @@ from src.onboarding.canonical import Entity
 from src.onboarding.matcher import SHARED_FIELDS
 from src.onboarding.models import ImportProfile
 from src.onboarding.reader import ReadResult, UnreadableFile, read_isolated
+from src.onboarding.repository import ApplyResult
 
 router = APIRouter()
 
@@ -895,9 +896,26 @@ async def commit(
             excluded_rows=_excluded_of(record, report.sheet),
             corrections=_corrections_of(record, report.sheet),
         )
-        applied = await repository.apply_rows(
-            db, clinic_id=scope.clinic_id, entity=report.entity, rows=rows
-        )
+        # A sheet of visits converts to a patient AND an appointment per line,
+        # so the rows are grouped by what they are rather than by the sheet's
+        # own entity. Passing an appointment row to `_apply_patients` happened
+        # to be harmless -- it has no document number, so it was skipped -- but
+        # that is luck, not a guarantee, and the counts would be wrong.
+        #
+        # Patients before the appointments that name them, which is the parent
+        # before the child: the same ordering `order` applies across sheets.
+        applied = ApplyResult()
+        for row_entity in sorted({r.entity for r in rows}, key=lambda e: order.get(e, 9)):
+            of_entity = [r for r in rows if r.entity is row_entity]
+            result = await repository.apply_rows(
+                db, clinic_id=scope.clinic_id, entity=row_entity, rows=of_entity
+            )
+            applied = ApplyResult(
+                created=applied.created + result.created,
+                updated=applied.updated + result.updated,
+                skipped=applied.skipped + result.skipped,
+                conflicts=applied.conflicts + result.conflicts,
+            )
         committed[report.sheet] = applied.created + applied.updated
         # Kept apart on purpose. An updated row replaced a record the clinic
         # already had, and anything a receptionist edited by hand since the last

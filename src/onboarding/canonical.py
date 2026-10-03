@@ -313,12 +313,19 @@ _PATIENT: Final = (
         Entity.PATIENT,
         Requirement.OPTIONAL,
         "Emergency contact's phone number.",
+        # Every alias here names *whose* number it is. "telefono contacto" and
+        # "contacto telefono" were listed and had to go: a column headed
+        # "Teléfono de contacto" is the patient's own number in most exports,
+        # and it matched this field at strong confidence and arrived pre-ticked
+        # -- a reviewer accepting it would file the patient's phone as their
+        # emergency contact's, and the reminder would reach the wrong person.
         aliases=(
-            "telefono contacto",
             "telefono de emergencia",
+            "telefono emergencia",
             "celular acudiente",
             "telefono acudiente",
-            "contacto telefono",
+            "celular de emergencia",
+            "contacto de emergencia telefono",
         ),
         normalizer="phone",
     ),

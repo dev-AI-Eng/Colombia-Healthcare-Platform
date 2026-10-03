@@ -2197,3 +2197,50 @@ async def test_a_lone_profile_of_another_kind_is_not_borrowed(scoped: TestClient
         "Nombre was mapped to the doctor profile's field, so these rows would "
         "have been written as doctors"
     )
+
+
+async def test_a_sheet_of_visits_imports_its_patients_and_stages_its_appointments(
+    scoped: TestClient, session
+) -> None:  # type: ignore[no-untyped-def]
+    """One row per visit: the patients are written, the appointments are staged.
+
+    The columns belonging to the other entity used to be dropped on the floor.
+    Now each line yields a patient and an appointment. Only the patients are
+    written -- an appointment needs M2's booking transaction, so it stages and
+    validates exactly as it does on a dedicated appointments sheet -- and the
+    commit says so rather than counting them as imported.
+    """
+    from sqlalchemy import func, select
+
+    from src.registry.models import Patient
+
+    raw = (
+        b"T.D.;CEDULA;NOMBRE COMPLETO;CELULAR;FECHA CITA;ESTADO\n"
+        b"CC;1077001;Ana Perez;3101234567;2027-03-15;atendida\n"
+        b"CC;1077002;Luis Gomez;3109876543;2027-03-16;cancelada\n"
+    )
+    body = _upload_bytes(scoped, "visitas.csv", raw)
+    session_id = body["session_id"]
+
+    sheet = body["sheets"][0]
+    targets = {c["column"]: c["target_field"] for c in sheet["columns"]}
+    assert targets["FECHA CITA"] == "appointment.appointment_date", targets
+    assert targets["ESTADO"] == "appointment.status", targets
+
+    report = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
+    # Two source lines, four staged records.
+    assert sum(s["total_rows"] for s in report["sheets"]) == 4, report["sheets"]
+
+    before = await _patient_count(session, scoped)
+    committed = scoped.post(f"/onboarding/uploads/{session_id}/commit")
+    assert committed.status_code == 200, committed.text
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    written = await session.scalar(select(func.count()).select_from(Patient))
+    assert written - before == 2, "the patients on a visits sheet were not written"
+
+    # The appointments were recognised and checked, and said so rather than
+    # being counted as imported.
+    conflicts = " ".join(committed.json()["conflicts"])
+    assert "booking transaction" in conflicts, committed.json()

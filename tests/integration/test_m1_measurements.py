@@ -113,8 +113,13 @@ async def test_measure_the_name_export_shapes(scoped: TestClient) -> None:
 EXPECTED = {
     "1_clean_ips.xlsx": {"sheets": 3, "rows": 20, "review": 4, "invalid": 0},
     "3_excel_csv_es.csv": {"sheets": 1, "rows": 5, "review": 3, "invalid": 0},
-    "2_receptionist.xlsx": {"sheets": 2, "rows": 16, "review": 4, "invalid": 2},
-    "4_corrupted.xlsx": {"sheets": 1, "rows": 6, "review": 6, "invalid": 0},
+    # 32, not 16: AGENDA is one row per visit, so each line yields a patient
+    # and an appointment. Before multi-entity mapping its four patient columns
+    # were silently dropped.
+    "2_receptionist.xlsx": {"sheets": 2, "rows": 32, "review": 13, "invalid": 2},
+    # 12, not 6: this sheet carries FECHA_CITA and HORA beside the patient's
+    # own columns, so each line is a patient and an appointment.
+    "4_corrupted.xlsx": {"sheets": 1, "rows": 12, "review": 6, "invalid": 0},
 }
 
 

@@ -329,3 +329,64 @@ def test_the_vocabulary_of_a_dental_suite_maps_without_a_model() -> None:
         for proposal in mapping.proposals:
             assert proposal.field is not None
             assert field_for(entity, proposal.field.name) is not None
+
+
+# ---------------------------------------- one row describing more than one thing
+# A clinic's sheet is one row per visit as often as it is one row per patient:
+# the patient's columns and the appointment's sit side by side, and the patient
+# repeats on every row they appear in. The importer assigned one entity per
+# sheet, so the columns belonging to the other one were silently dropped --
+# not refused, not questioned, just never seen. HubSpot calls the shape "one
+# file, multiple objects" and assigns each column an object as well as a field.
+
+
+def _visit_sheet() -> object:
+    from src.onboarding.reader import Sheet
+
+    return Sheet(
+        name="Control",
+        headers=("T.D.", "CEDULA", "NOMBRE COMPLETO", "CELULAR", "FECHA CITA", "ESTADO"),
+        rows=(
+            ("CC", "1020304050", "Ana Perez", "3101234567", "2027-03-15", "atendida"),
+            ("CC", "1020304051", "Luis Gomez", "3109876543", "2027-03-16", "cancelada"),
+        ),
+        header_row=1,
+    )
+
+
+def test_a_sheet_of_visits_yields_both_the_patient_and_the_appointment() -> None:
+    sheet = _visit_sheet()
+    report = service.analyse_sheet_for_test(sheet)  # type: ignore[arg-type]
+
+    targets = {c.column: c.target_field for c in report.columns}
+    assert all(targets.values()), f"columns were dropped: {targets}"
+    # The sheet's own entity is unqualified; the other one is named.
+    assert targets["FECHA CITA"] == "appointment.appointment_date"
+    assert targets["ESTADO"] == "appointment.status"
+
+    rows, _ = service.validate(sheet, report.entity, targets)  # type: ignore[arg-type]
+    produced = {(r.row_number, r.entity) for r in rows}
+    assert len(produced) == 4, f"two source rows should yield four records: {produced}"
+
+    patients = [r for r in rows if r.entity is Entity.PATIENT]
+    appointments = [r for r in rows if r.entity is Entity.APPOINTMENT]
+    assert len(patients) == len(appointments) == 2
+    # Each half carries only its own fields, keyed by the plain field name.
+    assert patients[0].values["document_number"] == "1020304050"
+    assert "appointment_date" in appointments[0].values
+    assert "document_number" not in appointments[0].values
+
+
+def test_an_unqualified_target_still_means_the_sheets_own_entity() -> None:
+    """Every stored profile and hand-written mapping predates the qualified form."""
+    assert service.split_target("full_name", Entity.PATIENT) == (Entity.PATIENT, "full_name")
+    assert service.split_target("appointment.status", Entity.PATIENT) == (
+        Entity.APPOINTMENT,
+        "status",
+    )
+    # An unknown prefix is not an entity, and dropping the column would be worse
+    # than treating the name as the sheet's own.
+    assert service.split_target("nonsense.thing", Entity.PATIENT) == (
+        Entity.PATIENT,
+        "nonsense.thing",
+    )
