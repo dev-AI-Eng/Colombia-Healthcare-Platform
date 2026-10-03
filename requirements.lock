@@ -69,7 +69,6 @@ Pygments==2.21.0
 pytest-asyncio==1.4.0
 pytest-cov==7.1.0
 pytest==9.1.1
-python-calamine==0.8.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
 python-multipart==0.0.32

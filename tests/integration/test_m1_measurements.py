@@ -9,6 +9,8 @@ them rather than take them on trust.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -39,6 +41,35 @@ NAME_SHAPES = (
     "name_3_four_columns.xlsx",
     "name_4_rips_fields.csv",
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def fixtures_exist() -> None:
+    """Build whichever generated files are missing.
+
+    The fixtures are not committed -- one is a zip bomb -- so a clean checkout
+    has none of them. This file is the only one that reads the name shapes and
+    the platform exports, and without this guard `pytest -q` fails on a fresh
+    clone with a FileNotFoundError rather than a test result.
+    """
+    if not (FIXTURES / "1_clean_ips.xlsx").exists():
+        subprocess.run(
+            [sys.executable, "-m", "tests.fixtures.onboarding.generate"],
+            check=True,
+            capture_output=True,
+        )
+    if not (FIXTURES / "name_1_one_column.csv").exists():
+        subprocess.run(
+            [sys.executable, "-m", "tests.fixtures.onboarding.generate_name_shapes"],
+            check=True,
+            capture_output=True,
+        )
+    if not (FIXTURES / "6_rips_us.csv").exists():
+        subprocess.run(
+            [sys.executable, "-m", "tests.fixtures.onboarding.generate_platform_exports"],
+            check=True,
+            capture_output=True,
+        )
 
 
 @pytest.fixture
