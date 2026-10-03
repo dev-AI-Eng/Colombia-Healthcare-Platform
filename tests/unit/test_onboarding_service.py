@@ -285,3 +285,47 @@ def test_a_blank_row_does_not_shift_every_row_number_after_it(tmp_path) -> None:
     assert {row.row_number for row in rows} == {2, 4, 5}, (
         "rows are not numbered as the sheet shows them"
     )
+
+
+# ------------------------------------- a sheet is named after who it holds
+# The sheet-name hints knew `medico`, `doctor`, `profesional` and `especialista`
+# but not `dentista`, so a dental suite's sheet of practitioners was guessed as
+# patients. A doctors sheet read as patients maps almost nothing, because a
+# patient has no specialty and no consulting room.
+
+
+def test_a_sheet_named_after_a_speciality_is_still_a_sheet_of_doctors() -> None:
+    from src.onboarding.matcher import guess_entity
+
+    # Headings that say nothing about who the sheet holds, so only the name can
+    # decide. With "Nombre Dentista" in the headers the header matcher reaches
+    # `doctor` by itself and the test passes whether the hint is there or not.
+    headers = ("Codigo", "Nombre", "Area", "Sala")
+    for name in ("Dentistas", "Odontologos", "Prestadores", "Terapeutas"):
+        entity, reason = guess_entity(name, headers)
+        assert entity is Entity.DOCTOR, f"{name!r} was guessed as {entity.value}: {reason}"
+        assert name in reason, f"{name!r} resolved by headers rather than by its name"
+
+
+def test_the_vocabulary_of_a_dental_suite_maps_without_a_model() -> None:
+    """Aliases before models, per CLAUDE.md section 8.
+
+    These are the headings a dental suite exports. Every one must resolve from
+    the dictionary alone: a column left unmapped here is a reviewer's manual
+    decision on every import, forever.
+    """
+    from src.onboarding.canonical import field_for
+    from src.onboarding.matcher import match_sheet
+
+    pairs = (
+        (Entity.DOCTOR, ("ID Dentista", "Nombre Dentista", "Especialidad", "Box")),
+        (Entity.PATIENT, ("Identificación", "Nombres", "Apellidos", "Celular", "Previsión")),
+        (Entity.APPOINTMENT, ("Identificación", "ID Dentista", "Fecha", "Hora Inicio")),
+    )
+    for entity, headers in pairs:
+        mapping = match_sheet(headers, entity)
+        unmapped = [p.column for p in mapping.proposals if p.field is None]
+        assert not unmapped, f"{entity.value}: {unmapped} needed a model or a person"
+        for proposal in mapping.proposals:
+            assert proposal.field is not None
+            assert field_for(entity, proposal.field.name) is not None

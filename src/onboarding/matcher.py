@@ -283,7 +283,20 @@ def match_sheet(headers: tuple[str, ...], entity: Entity) -> SheetMapping:
 # confirms this too: a sheet named "Hoja1" says nothing.
 _SHEET_HINTS: Final[dict[Entity, tuple[str, ...]]] = {
     Entity.PATIENT: ("paciente", "patient", "usuario", "afiliado"),
-    Entity.DOCTOR: ("medico", "doctor", "profesional", "especialista"),
+    # A clinic names this sheet after the practitioner it employs, so the word
+    # is the specialty as often as it is "medico": a dental suite exports
+    # "Dentistas", and a sheet of doctors guessed as patients maps none of its
+    # columns, because a patient has no specialty or consulting room.
+    Entity.DOCTOR: (
+        "medico",
+        "doctor",
+        "profesional",
+        "especialista",
+        "dentista",
+        "odontolog",
+        "prestador",
+        "terapeuta",
+    ),
     Entity.SPECIALTY: ("especialidad", "specialt", "servicio"),
     Entity.AVAILABILITY: ("disponibilidad", "availability", "horario", "agenda medico"),
     Entity.APPOINTMENT: ("cita", "appointment", "agenda", "consulta", "turno"),
