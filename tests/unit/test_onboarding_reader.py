@@ -1000,3 +1000,20 @@ def test_a_positional_export_is_offered_the_headerless_question(tmp_path: Path) 
     approved = read(path, {"csv.no_header_row": True})
     assert len(approved.sheets[0].rows) == 6, "approving the headerless reading lost rows"
     assert approved.sheets[0].headings_are_settled is True
+
+
+def test_a_real_heading_row_still_needs_no_question(tmp_path: Path) -> None:
+    """The margin must not make every ordinary file ask.
+
+    A genuine heading beats its own data comfortably, because data carries
+    numbers, dates and repeated values and a heading does not.
+    """
+    path = _csv(
+        tmp_path,
+        b"TIPO DOC;IDENTIFICACION;NOMBRES;CELULAR\n"
+        b"CC;1020304050;Ana Perez;3101234567\n"
+        b"CC;1020304051;Luis Gomez;3109876543\n",
+    )
+    result = read(path)
+    assert [q.id for q in result.questions] == []
+    assert result.sheets[0].headers[0] == "TIPO DOC"

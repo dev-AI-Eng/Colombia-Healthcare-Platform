@@ -27,13 +27,21 @@ from typing import Any, Final
 from src.core.config import get_settings
 from src.onboarding import normalizers as norm
 from src.onboarding.canonical import (
+    ALL_FIELDS,
     FIELDS_BY_ENTITY,
     Entity,
     Field,
     field_for,
     required_fields,
 )
-from src.onboarding.matcher import SHARED_FIELDS, Proposal, SheetMapping, guess_entity, match_sheet
+from src.onboarding.matcher import (
+    SHARED_FIELDS,
+    Proposal,
+    SheetMapping,
+    guess_entity,
+    match_sheet,
+    normalize_header,
+)
 from src.onboarding.reader import ReadResult, Sheet
 
 # A column-level decision the file cannot make for itself. Held on the session
@@ -141,6 +149,18 @@ def _column_index(sheet: Sheet) -> dict[str, int]:
     return index
 
 
+def _any_heading_is_recognised(headers: tuple[str, ...]) -> bool:
+    """Whether any heading is a word the alias dictionary knows.
+
+    The question is not "did we map this column" -- that is what the model is
+    for -- but "does this row look like labels at all". One recognised heading
+    is enough: a file whose columns are all unfamiliar still has headings if one
+    of them is "CEDULA", while a row of patients' names matches nothing.
+    """
+    known = {normalize_header(alias) for field in ALL_FIELDS for alias in field.aliases}
+    return any(normalize_header(header) in known for header in headers if header.strip())
+
+
 def _ask_model(sheet: Sheet, entity: Entity, mapping: SheetMapping) -> dict[str, ColumnReport]:
     """Ask a model about the columns the deterministic stages could not resolve.
 
@@ -169,6 +189,20 @@ def _ask_model(sheet: Sheet, entity: Entity, mapping: SheetMapping) -> dict[str,
     # an overlong row has genuine headings, and gating on "any question at all"
     # removed an in-scope feature from those files for no safety gain.
     if not sheet.headings_are_settled:
+        return {}
+
+    # A second gate, because the reader's own test cannot close this one. A
+    # clinic exporting without headings, where every column holds words, has a
+    # first row that scores exactly as a heading row does -- 4.00 for the
+    # patient names and 4.00 for every row beneath them -- so the reader settles
+    # them and asks nothing. Those names would then be the "headings" we send.
+    #
+    # The dictionary separates what the score cannot: a real Spanish heading row
+    # is recognised (2 of 2, 4 of 4 across the fixtures) and a row of patients'
+    # names is not (0 of 4). Recognising none of them is not proof they are
+    # data, so it buys no refusal -- it only withholds them from a provider,
+    # which costs a mapping proposal on a file that had no heading to map.
+    if not _any_heading_is_recognised(sheet.headers):
         return {}
 
     unresolved = [p for p in mapping.proposals if not p.auto]

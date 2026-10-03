@@ -466,3 +466,80 @@ def test_a_file_with_genuine_headings_still_gets_a_proposal(
 
     service.analyse(parsed)
     assert asked == ["ZZZ RARO"], asked
+
+
+def test_a_headerless_file_of_words_sends_nothing_to_a_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The leak `headings_are_settled` alone cannot close.
+
+    A clinic exporting without headings, where every column holds words, has a
+    first row that scores exactly as a heading row does: 4.00 for the patient
+    names and 4.00 for every row beneath them. The reader cannot tell them apart
+    -- a genuine two-column heading scores 4.00 against data of 4.00 too -- so it
+    settles the headings and asks nothing, and those names become the "column
+    headings" the mapping stage sends.
+
+    The dictionary separates what the score cannot. This file matches none of
+    its 288 aliases, so nothing leaves the machine.
+    """
+    from pathlib import Path
+
+    from src.onboarding import service
+    from src.onboarding.reader import read
+
+    sent: list[str] = []
+
+    def _spy(question: Any, entity: Any, **kwargs: Any) -> None:
+        sent.append(question.header)
+        raise llm.LLMUnavailable("spy")
+
+    monkeypatch.setattr(llm, "suggest", _spy)
+    monkeypatch.setattr(
+        "src.onboarding.service.get_settings",
+        lambda: _settings(openai_api_key="a-key-so-the-stage-is-enabled"),
+    )
+
+    path = Path(tmp_path) / "sin_encabezado.csv"
+    path.write_bytes(
+        b"Ana Maria;Perez Gomez;Cardiologia;Bogota\n"
+        b"Luis Felipe;Gomez Diaz;Pediatria;Medellin\n"
+        b"Eva Rosa;Ruiz Mora;Ortopedia;Cali\n"
+    )
+
+    service.analyse(read(path))
+    assert sent == [], f"patient values reached a provider: {sent}"
+
+
+def test_an_ordinary_spanish_export_still_reaches_the_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The dictionary gate must not silence the stage on files that have headings.
+
+    One recognised heading is enough: a file whose other columns are unfamiliar
+    still has headings, and those are exactly the columns the model is for.
+    """
+    from pathlib import Path
+
+    from src.onboarding import service
+    from src.onboarding.reader import read
+
+    sent: list[str] = []
+
+    def _spy(question: Any, entity: Any, **kwargs: Any) -> None:
+        sent.append(question.header)
+        raise llm.LLMUnavailable("spy")
+
+    monkeypatch.setattr(llm, "suggest", _spy)
+    monkeypatch.setattr(
+        "src.onboarding.service.get_settings",
+        lambda: _settings(openai_api_key="a-key-so-the-stage-is-enabled"),
+    )
+
+    path = Path(tmp_path) / "con_encabezado.csv"
+    path.write_bytes(
+        b"CEDULA;MUTUALISTA;ZONA DE COBRO\n1020304050;Sura;Norte\n1020304051;Nueva EPS;Sur\n"
+    )
+
+    service.analyse(read(path))
+    assert sent, "a file with a recognised heading asked the model nothing"
