@@ -427,3 +427,18 @@ def test_the_allowance_never_exceeds_a_fifth_of_the_file() -> None:
     for total in range(1, 500):
         allowed = service.tolerable_invalid_rows(total)
         assert allowed <= 0.20 * total, f"{allowed} of {total} is more than a fifth"
+
+
+def test_the_allowance_never_exceeds_the_share_it_claims() -> None:
+    """Both bounds truncate, so "2%" is a ceiling rather than a rounding.
+
+    `round` is banker's rounding in Python: 2% of 125 rounds down to 2 and 2% of
+    175 rounds up to 4, which makes whether a file imports depend on which side
+    of .5 its size falls. The floor keeps the stated share honest.
+    """
+    for total in range(1, 2000):
+        allowed = service.tolerable_invalid_rows(total)
+        if allowed > service.INVALID_ROW_FLOOR:
+            assert allowed <= service.INVALID_ROW_SHARE * total, (
+                f"{allowed} of {total} is more than the {service.INVALID_ROW_SHARE:.0%} claimed"
+            )

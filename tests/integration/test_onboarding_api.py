@@ -678,7 +678,26 @@ async def test_rows_below_the_table_can_be_excluded(scoped: TestClient) -> None:
     )
 
     with_junk = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
-    assert any("could not be converted" in reason for reason in with_junk["blocking"])
+    # Two of fifteen rows fail to convert, which is inside the allowance the
+    # client agreed, so they no longer refuse the sheet. They are still reported
+    # -- that is the part that matters, and the reviewer acts on it below.
+    assert any("could not be converted" in reason for reason in with_junk["tolerated"]), with_junk[
+        "tolerated"
+    ]
+    # None of the four is written: two cannot convert at all and two are held
+    # for a person. Either way the totals line and the pasted table stay out of
+    # the clinic's patients, which is what this test exists for.
+    held_back = {
+        row["row_number"]
+        for status in ("review", "invalid")
+        for row in scoped.get(
+            f"/onboarding/uploads/{session_id}/rows",
+            params={"sheet": "AGENDA", "status": status},
+        ).json()
+    }
+    assert {18, 21, 22, 23} <= held_back, (
+        f"the totals line and the pasted table were not held back: {sorted(held_back)}"
+    )
 
     scoped.put(
         f"/onboarding/uploads/{session_id}/mapping",

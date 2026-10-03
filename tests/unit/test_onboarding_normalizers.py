@@ -648,3 +648,29 @@ def test_an_ordinary_value_in_those_fields_still_imports() -> None:
         field = canonical.field_for(entity, field_name)
         assert field is not None
         assert service._apply(field, value, n.DayFirst.UNDECIDED).status is n.Status.VALID
+
+
+def test_every_document_code_maps_to_itself_however_it_is_punctuated() -> None:
+    """A table of hand-written aliases is one typo away from a wrong identity.
+
+    "c.c." mapped to TI: a cédula de ciudadanía read as a tarjeta de identidad,
+    which is the commonest document type in Colombia and the exact spelling the
+    receptionist fixture uses. It pairs a real number with the wrong legal
+    identity -- the failure CLAUDE.md section 11 names for defaulting an unknown
+    type, arriving instead through a mis-keyed alias.
+
+    Every code must therefore resolve to itself, plain and dotted, and this is
+    the check that would have caught it.
+    """
+    from src.registry.models import DocumentType
+
+    for code in DocumentType:
+        plain = n.document_type(code.value)
+        assert plain.status is n.Status.VALID, f"{code.value} is not recognised at all"
+        assert plain.value is code, f"{code.value!r} maps to {plain.value}"
+
+        dotted = n.document_type(".".join(code.value) + ".")
+        if dotted.status is n.Status.VALID:
+            assert dotted.value is code, (
+                f"{'.'.join(code.value)}. maps to {dotted.value}, not {code}"
+            )

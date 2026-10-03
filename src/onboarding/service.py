@@ -757,9 +757,12 @@ def tolerable_invalid_rows(total_rows: int) -> int:
     """
     if total_rows <= 0:
         return 0
-    allowance = max(INVALID_ROW_FLOOR, round(INVALID_ROW_SHARE * total_rows))
-    # Never more than the cap, however small the file. `int` truncates, so a
-    # 6-row sheet allows 1, not 1.2.
+    # Both bounds truncate rather than round. `round` is banker's rounding in
+    # Python, so a share landing on .5 goes down at 125 rows and up at 175 --
+    # an arbitrary difference in whether a file imports. "2% of the file" means
+    # at most 2%, and the cap reads the same way: a 6-row sheet allows 1, not
+    # 1.2.
+    allowance = max(INVALID_ROW_FLOOR, int(INVALID_ROW_SHARE * total_rows))
     return min(allowance, int(INVALID_ROW_CAP * total_rows))
 
 
