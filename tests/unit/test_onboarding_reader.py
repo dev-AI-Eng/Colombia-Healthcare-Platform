@@ -968,3 +968,35 @@ def test_a_question_records_whether_it_was_answered(tmp_path: Path) -> None:
     assert read(path).questions[0].answered is None
     assert read(path, {"csv.no_header_row": True}).questions[0].answered is True
     assert read(path, {"csv.no_header_row": False}).questions[0].answered is False
+
+
+def test_a_positional_export_is_offered_the_headerless_question(tmp_path: Path) -> None:
+    """A file with no headings anywhere must be recognised as having none.
+
+    The national RIPS archivo is positional: every row is a patient and no row
+    is a label. `_find_csv_header` returned the least-bad row regardless of
+    score, so a file where nothing clears the floor was reported as having five
+    title lines above a header on row 6. The headerless question was then never
+    asked -- it is gated on "no preamble found" -- and the only readings on offer
+    discarded five patients or one.
+    """
+    raw = (
+        b"CC,1045678901,EPS001,1,Perez,Gomez,Carlos,Andres\n"
+        b"CC,1023456789,EPS002,1,Lopez,Torres,Maria,Fernanda\n"
+        b"TI,1102345678,EPS005,2,Ortiz,Mejia,Luisa,Fernanda\n"
+        b"CC,71234567,EPS008,1,Castro,Vargas,Luis,Ernesto\n"
+        b"RC,1140567890,EPS010,2,Suarez,Velez,Andres,Felipe\n"
+        b"CE,E0456789,EPS001,1,Dubois,Martin,Jean,Pierre\n"
+    )
+    path = _csv(tmp_path, raw)
+
+    result = read(path)
+    assert "csv.no_header_row" in [q.id for q in result.questions], (
+        "a file with no headings was not offered the headerless question"
+    )
+    assert result.sheets[0].headings_are_settled is False
+
+    # Approving keeps every row, which is the whole point.
+    approved = read(path, {"csv.no_header_row": True})
+    assert len(approved.sheets[0].rows) == 6, "approving the headerless reading lost rows"
+    assert approved.sheets[0].headings_are_settled is True

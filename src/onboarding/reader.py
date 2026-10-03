@@ -427,6 +427,13 @@ def _find_csv_header(rows: list[tuple[str, ...]]) -> int:
         # is the one the file is about.
         if score > best_score:
             best, best_score = index, score
+    # Nothing here looks like column labels. Returning the least-bad row would
+    # claim a preamble the file does not have and discard the patients above it
+    # -- a positional export such as the RIPS archivo has no headings anywhere,
+    # and every row scores low. Reporting 0 says "no preamble found", which is
+    # what lets the headerless question be asked instead.
+    if best_score < HEADER_SCORE_FLOOR:
+        return 0
     return best
 
 
