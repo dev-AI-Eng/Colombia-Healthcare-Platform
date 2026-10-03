@@ -24,10 +24,11 @@ import contextlib
 import html
 import re
 import uuid
-from typing import Annotated, Any
+from pathlib import Path
+from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from src.api.dependencies import ClinicScopeDep, SessionDep
 from src.api.onboarding.routes import SKIP_SHEET
@@ -415,6 +416,77 @@ async def review_screen(
     never written. Nothing is imported until you press Import.
   </p>
 </main></body></html>""")
+
+
+def _read_test_console() -> str | None:
+    """The console page, read once at import rather than per request.
+
+    It cannot change while the process runs, and reading a file inside an async
+    handler blocks the event loop.
+    """
+    page = Path(__file__).resolve().parents[3] / "docs" / "m1_test_console.html"
+    return page.read_text(encoding="utf-8") if page.exists() else None
+
+
+_TEST_CONSOLE: Final = _read_test_console()
+
+
+#: Where the generated test files live. The console uploads them through the
+#: real API, so it needs to read them, and a page served from the app cannot
+#: reach the filesystem any other way.
+_FIXTURES: Final = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "onboarding"
+
+
+@router.get(
+    "/test-console/fixture/{name}",
+    include_in_schema=False,
+    summary="One generated test file, for the console to upload",
+)
+async def test_console_fixture(name: str) -> Response:
+    """Serve a generated fixture by name, for the test console only.
+
+    The name is matched against the directory listing rather than joined onto a
+    path: a name is attacker-controlled in principle, and `..` or an absolute
+    path would otherwise read anything the process can. Nothing here is patient
+    data -- these files are generated and every value in them is invented -- but
+    the traversal would be real.
+    """
+    if _FIXTURES.is_dir():
+        for candidate in _FIXTURES.iterdir():
+            if candidate.name == name and candidate.is_file():
+                return Response(candidate.read_bytes(), media_type="application/octet-stream")
+    raise HTTPException(
+        status.HTTP_404_NOT_FOUND,
+        f"No generated fixture called {name!r}. Run the three generators in "
+        "tests/fixtures/onboarding first.",
+    )
+
+
+@router.get(
+    "/test-console",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    summary="A page that drives the import API step by step, for testing by hand",
+)
+async def test_console() -> HTMLResponse:
+    """Serve `docs/m1_test_console.html` from the app itself.
+
+    It has to be same-origin. The page uploads the generated fixtures with
+    `fetch`, and a browser refuses both the fixture read and the API call when
+    the page is opened from `file://` -- there is no CORS middleware, which is
+    correct for a surface that answers only to loopback.
+
+    It lives under the same synthetic-data gate as the rest of the review API:
+    outside that mode this router is not mounted at all, so the page cannot
+    exist anywhere a real patient could be reached.
+    """
+    if _TEST_CONSOLE is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "docs/m1_test_console.html is not present. `docs/` is outside version "
+            "control, so a clone has the code without it.",
+        )
+    return HTMLResponse(_TEST_CONSOLE)
 
 
 @router.get(
