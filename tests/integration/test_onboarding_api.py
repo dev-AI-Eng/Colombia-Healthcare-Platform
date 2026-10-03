@@ -754,15 +754,26 @@ async def test_a_third_differently_structured_file_imports(scoped: TestClient, s
 
     await session.commit()
     await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
-    ana = await session.scalar(
-        select(Patient).where(Patient.document_number_bidx == blind_index("1020304050"))
+    # A patient the FILE contains, not the one the clinic fixture seeds. These
+    # assertions used to read 1020304050, which is `factories.DOCUMENT` and
+    # appears in no spreadsheet -- so the seeded row satisfied them and they
+    # passed with document-type normalisation fully broken.
+    carlos = await session.scalar(
+        select(Patient).where(Patient.document_number_bidx == blind_index("1045678901"))
     )
-    assert ana is not None, "the patient the files share was not written"
+    assert carlos is not None, "a patient from 1_clean_ips.xlsx was not written"
     # Values in the right columns, not merely a row count: an import that put
     # every cell one field to the left would satisfy a count.
-    assert ana.document_type == DocumentType.CC
-    assert ana.document_number == "1020304050"
-    assert ana.phone_e164 is not None and ana.phone_e164.startswith("+57")
+    assert carlos.document_type == DocumentType.CC
+    assert carlos.document_number == "1045678901"
+    assert carlos.given_names == "Carlos Andrés"
+    assert carlos.family_names == "Pérez Gómez"
+    assert carlos.phone_e164 is not None and carlos.phone_e164.startswith("+57")
+
+    # The dotted "C.C." spelling that 3_excel_csv_es.csv uses is guarded in
+    # tests/unit/test_onboarding_normalizers.py: every patient in that file also
+    # appears in 1_clean_ips.xlsx, which imports first with the plain "CC", so an
+    # assertion here would only ever read the row the clean export wrote.
 
 
 async def test_the_messy_workbook_is_fixed_entirely_from_the_screen(
