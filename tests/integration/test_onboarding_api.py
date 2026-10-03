@@ -2314,7 +2314,7 @@ async def test_a_file_with_one_bad_row_imports_the_rest(scoped: TestClient, sess
     assert written - before == 9, "the nine good rows were not imported"
 
 
-async def test_a_mostly_broken_file_is_still_refused(scoped: TestClient) -> None:
+async def test_a_mostly_broken_file_is_still_refused(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
     """The other half of the rule: a file this wrong is a bad export, not a typo.
 
     Six rows, three of them unrecoverable. Under a bare "more than 3 rows" floor
@@ -2340,5 +2340,9 @@ async def test_a_mostly_broken_file_is_still_refused(scoped: TestClient) -> None
     # The refusal says what to do, not just that it failed.
     assert "export itself looks wrong" in reasons, reasons
 
+    before = await _patient_count(session, scoped)
     refused = scoped.post(f"/onboarding/uploads/{session_id}/commit")
     assert refused.status_code == 409
+    # The status code is not the guarantee: a commit that wrote the three good
+    # rows and then answered 409 would satisfy it.
+    assert await _patient_count(session, scoped) == before
