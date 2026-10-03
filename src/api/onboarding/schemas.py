@@ -162,6 +162,11 @@ class ValidationOut(BaseModel):
         "which is the milestone's exit criterion."
     )
     blocking: list[str] = Field(description="Why it cannot be committed yet.")
+    tolerated: list[str] = Field(
+        default_factory=list,
+        description="Failures small enough that the rest of the file still imports. "
+        "Reported, never hidden: the rows themselves are in the review queue.",
+    )
 
 
 class CommitOut(BaseModel):

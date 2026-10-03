@@ -2244,3 +2244,71 @@ async def test_a_sheet_of_visits_imports_its_patients_and_stages_its_appointment
     # being counted as imported.
     conflicts = " ".join(committed.json()["conflicts"])
     assert "booking transaction" in conflicts, committed.json()
+
+
+async def test_a_file_with_one_bad_row_imports_the_rest(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
+    """The client's decision, end to end: a small clinic is not blocked by a typo.
+
+    One cédula has been mangled by Excel into scientific notation and cannot be
+    recovered. Before this rule that single row refused the whole file. It is
+    now imported around -- and the row is still named, with its reason, because
+    nothing is ever silently discarded.
+    """
+    from sqlalchemy import func, select
+
+    from src.registry.models import Patient
+
+    raw = b"TIPO DOC;IDENTIFICACION;NOMBRES;APELLIDOS;CELULAR\n" + b"".join(
+        f"CC;10{index:08d};Paciente{index};Perez Gomez;310123456{index % 10}\n".encode()
+        for index in range(9)
+    )
+    # The tenth row's identifier lost digits to Excel and is unrecoverable.
+    raw += b"CC;1.02E+09;Roto;Perez Gomez;3101234567\n"
+
+    body = _upload_bytes(scoped, "casi_limpio.csv", raw)
+    session_id = body["session_id"]
+    report = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
+
+    assert report["can_commit"] is True, report["blocking"]
+    # Named, not hidden: the client asked that staff always see the reasons.
+    assert report["tolerated"], "the failed row was not reported to the reviewer"
+    assert "1 of 10" in " ".join(report["tolerated"]), report["tolerated"]
+
+    before = await _patient_count(session, scoped)
+    committed = scoped.post(f"/onboarding/uploads/{session_id}/commit")
+    assert committed.status_code == 200, committed.text
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    written = await session.scalar(select(func.count()).select_from(Patient))
+    assert written - before == 9, "the nine good rows were not imported"
+
+
+async def test_a_mostly_broken_file_is_still_refused(scoped: TestClient) -> None:
+    """The other half of the rule: a file this wrong is a bad export, not a typo.
+
+    Six rows, three of them unrecoverable. Under a bare "more than 3 rows" floor
+    this would import, because 3 does not exceed 3 -- which is why the allowance
+    is capped at a fifth of the file.
+    """
+    raw = (
+        b"TIPO DOC;IDENTIFICACION;NOMBRES;APELLIDOS;CELULAR\n"
+        b"CC;1020304050;Ana;Perez Gomez;3101234567\n"
+        b"CC;1020304051;Luis;Gomez Diaz;3109876543\n"
+        b"CC;1020304052;Eva;Ruiz Mora;3201234567\n"
+        b"CC;1.02E+09;Roto1;Perez Gomez;3101234567\n"
+        b"CC;2.03E+09;Roto2;Perez Gomez;3101234567\n"
+        b"CC;3.04E+09;Roto3;Perez Gomez;3101234567\n"
+    )
+    body = _upload_bytes(scoped, "roto.csv", raw)
+    session_id = body["session_id"]
+    report = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
+
+    assert report["can_commit"] is False
+    reasons = " ".join(report["blocking"])
+    assert "3 of 6" in reasons, reasons
+    # The refusal says what to do, not just that it failed.
+    assert "export itself looks wrong" in reasons, reasons
+
+    refused = scoped.post(f"/onboarding/uploads/{session_id}/commit")
+    assert refused.status_code == 409

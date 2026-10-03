@@ -326,6 +326,18 @@ async def review_screen(
         scope.clinic_id,
     )
 
+    # Failures the file was allowed to carry. Shown whatever else the screen
+    # says, because "imported" without them reads as "all of it imported".
+    tolerated = stored.get("tolerated", [])
+    tolerated_note = (
+        '<div class="card warn"><strong>Some rows will not be imported.</strong>'
+        + "".join(f"<p>{_escape(t)}</p>" for t in tolerated)
+        + '<p class="note">They are listed below with the reason for each, so the '
+        "source file can be corrected.</p></div>"
+        if tolerated
+        else ""
+    )
+
     blocking = stored.get("blocking", [])
     if blocking:
         items = "".join(f"<li>{_escape(b)}</li>" for b in blocking)
@@ -386,7 +398,7 @@ async def review_screen(
   <h1>Confirm this import</h1>
   <p class="sub"><code>{_escape(record.filename)}</code> · status
      <strong>{_escape(record.status)}</strong></p>
-  {duplicate}{banner}{reused_note}{structure}
+  {duplicate}{banner}{tolerated_note}{reused_note}{structure}
   {sections}
   {needing_answers}
   <h2>When the mapping is right</h2>

@@ -654,6 +654,8 @@ async def validate(db: SessionDep, session_id: uuid.UUID, scope: ClinicScopeDep)
     skipped_sheets = stored_skips(record)
     summaries: list[service.SheetReport] = []
     blocking: list[str] = []
+    # Failures small enough to import around, reported rather than hidden.
+    tolerated: list[str] = []
     totals = {"valid": 0, "review": 0, "invalid": 0}
 
     # Converted rows per sheet, kept so the cross-row checks can run once every
@@ -693,9 +695,26 @@ async def validate(db: SessionDep, session_id: uuid.UUID, scope: ClinicScopeDep)
         totals["invalid"] += summary.invalid_rows
 
         if summary.invalid_rows:
-            blocking.append(
-                f"{summary.sheet}: {summary.invalid_rows} row(s) could not be converted."
-            )
+            # A few unconvertible rows no longer refuse the whole file. Above
+            # the allowance the export itself is wrong and a partial import
+            # would be worse than none: staff trust a schedule that looks
+            # populated. Below it, the valid rows import and every failed row is
+            # still listed with its reason, so nothing is silently discarded --
+            # which is what every other importer does here.
+            allowed = service.tolerable_invalid_rows(summary.total_rows)
+            if summary.invalid_rows > allowed:
+                blocking.append(
+                    f"{summary.sheet}: {summary.invalid_rows} of {summary.total_rows} row(s) "
+                    f"could not be converted, which is more than the {allowed} this file's "
+                    f"size allows. The export itself looks wrong. Each row is listed below "
+                    f"with the reason, so the source file can be corrected."
+                )
+            else:
+                tolerated.append(
+                    f"{summary.sheet}: {summary.invalid_rows} of {summary.total_rows} row(s) "
+                    f"could not be converted and will not be imported. Each one is listed "
+                    f"with its reason."
+                )
         if summary.missing_required:
             blocking.append(
                 f"{summary.sheet}: no column was mapped to {list(summary.missing_required)}."
@@ -737,7 +756,13 @@ async def validate(db: SessionDep, session_id: uuid.UUID, scope: ClinicScopeDep)
     record.valid_rows = totals["valid"]
     record.review_rows = totals["review"]
     record.invalid_rows = totals["invalid"]
-    _store_reports(record, summaries or reports, blocking=blocking, skipped_sheets=skipped_sheets)
+    _store_reports(
+        record,
+        summaries or reports,
+        blocking=blocking,
+        tolerated=tolerated,
+        skipped_sheets=skipped_sheets,
+    )
     await db.flush()
 
     return ValidationOut(
@@ -746,6 +771,7 @@ async def validate(db: SessionDep, session_id: uuid.UUID, scope: ClinicScopeDep)
         sheets=[SheetOut.build(s) for s in summaries],
         can_commit=not blocking,
         blocking=blocking,
+        tolerated=tolerated,
     )
 
 

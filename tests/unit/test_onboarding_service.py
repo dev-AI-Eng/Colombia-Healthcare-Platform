@@ -390,3 +390,40 @@ def test_an_unqualified_target_still_means_the_sheets_own_entity() -> None:
         Entity.PATIENT,
         "nonsense.thing",
     )
+
+
+# ----------------------------------- how many failures a file may carry
+# The client's rule, agreed in writing: a few unconvertible rows no longer
+# refuse the whole file. A flat share punishes a small clinic for one typo; a
+# flat count lets a broken export through; so the allowance is the larger of
+# the two, capped so it cannot become absurd on a tiny file.
+
+
+def test_a_small_clinic_is_not_refused_over_one_typo() -> None:
+    """The case the client raised: 18 doctors, one bad row, 6% of the file."""
+    assert service.tolerable_invalid_rows(18) >= 1
+    assert service.tolerable_invalid_rows(20) >= 3
+
+
+def test_a_large_export_is_held_to_the_share() -> None:
+    """80 bad rows in 4,000 is 2% and tolerable; 81 is not."""
+    assert service.tolerable_invalid_rows(4000) == 80
+
+
+def test_a_mostly_broken_small_file_is_still_refused() -> None:
+    """The hole the cap exists to close.
+
+    Under "more than 2% AND more than 3 rows" a 6-row file with 3 failures
+    imports: 3 does not exceed a floor of 3, so the share is never consulted and
+    a 50%-broken file passes. The cap means the allowance can never exceed a
+    fifth of the file.
+    """
+    assert service.tolerable_invalid_rows(6) < 3
+    assert service.tolerable_invalid_rows(10) < 3
+    assert service.tolerable_invalid_rows(4) == 0
+
+
+def test_the_allowance_never_exceeds_a_fifth_of_the_file() -> None:
+    for total in range(1, 500):
+        allowed = service.tolerable_invalid_rows(total)
+        assert allowed <= 0.20 * total, f"{allowed} of {total} is more than a fifth"

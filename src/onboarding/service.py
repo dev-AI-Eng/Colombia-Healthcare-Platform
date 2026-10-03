@@ -730,6 +730,39 @@ def find_dangling_references(
     return dangling
 
 
+#: How many unconvertible rows a sheet may carry and still import the rest.
+#: Agreed with the client in writing, and the shape matters more than the
+#: numbers:
+#:
+#:   * a flat share punishes a small file -- a clinic with 18 doctors is refused
+#:     over one typo, because 1 of 18 is 6%;
+#:   * a flat count lets a systematically broken export through -- 3 bad rows in
+#:     4,000 is noise, 3 in 6 is a file with the wrong column order;
+#:   * so the allowance is the larger of the two, and then capped, because
+#:     without the cap a 6-row file with 3 failures imports: 3 does not exceed a
+#:     floor of 3, and the share is never consulted.
+#:
+#: The cap is what keeps the rule honest at every size. Industrial acceptance
+#: sampling (ANSI/ASQ Z1.4) works the same way: the reject number scales with
+#: the lot rather than being one fixed percentage.
+INVALID_ROW_FLOOR: Final = 3
+INVALID_ROW_SHARE: Final = 0.02
+INVALID_ROW_CAP: Final = 0.20
+
+
+def tolerable_invalid_rows(total_rows: int) -> int:
+    """How many rows may fail before the sheet itself is refused.
+
+    Zero for an empty sheet: there is nothing to import, so nothing to tolerate.
+    """
+    if total_rows <= 0:
+        return 0
+    allowance = max(INVALID_ROW_FLOOR, round(INVALID_ROW_SHARE * total_rows))
+    # Never more than the cap, however small the file. `int` truncates, so a
+    # 6-row sheet allows 1, not 1.2.
+    return min(allowance, int(INVALID_ROW_CAP * total_rows))
+
+
 def summarise(
     rows: list[RowResult], report: SheetReport, columns: tuple[ColumnReport, ...]
 ) -> SheetReport:
