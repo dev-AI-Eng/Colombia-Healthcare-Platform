@@ -34,3 +34,5 @@ pgdata/
 # The zip bomb in particular must not be committed.
 tests/fixtures/onboarding/*.xlsx
 tests/fixtures/onboarding/*.csv
+testing results
+deliverable/

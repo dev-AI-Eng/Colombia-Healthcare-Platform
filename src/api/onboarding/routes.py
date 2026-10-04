@@ -43,7 +43,7 @@ from src.api.onboarding.schemas import (
     UploadOut,
     ValidationOut,
 )
-from src.onboarding import repository, service
+from src.onboarding import guidance, repository, service
 from src.onboarding.canonical import Entity
 from src.onboarding.matcher import SHARED_FIELDS
 from src.onboarding.models import ImportProfile
@@ -688,7 +688,17 @@ async def validate(db: SessionDep, session_id: uuid.UUID, scope: ClinicScopeDep)
             rows=rows,
         )
         converted.append((report, rows))
-        summary = service.summarise(rows, report, columns)
+        # Recomputed here, not taken from the stored report: that one is from
+        # upload time, so a question the reviewer has since answered would go on
+        # blocking the import with no way to clear it.
+        summary = service.summarise(
+            rows,
+            report,
+            columns,
+            questions=service.remaining_questions(
+                sheet, report.entity, mapping, _decisions_of(record, report.sheet)
+            ),
+        )
         summaries.append(summary)
         totals["valid"] += summary.valid_rows
         totals["review"] += summary.review_rows
@@ -846,20 +856,30 @@ async def transform_log(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Validate the import before reading its transform log."
         )
-    return [
-        CellOut(
-            row_number=e.row_number,
-            column=e.column_name,
-            target_field=e.target_field,
-            raw=e.raw_value or "",
-            corrected_from_review=e.corrected_from_review,
-            normalized=e.normalized_value,
-            rule=e.rule,
-            status=e.status,
-            message=e.message or "",
+    out: list[CellOut] = []
+    for e in entries:
+        # Guidance only where something was held back. A cell that converted
+        # needs no instruction, and explaining every successful rule would bury
+        # the handful that have to be acted on.
+        explanation = (
+            guidance.explain(e.rule, e.target_field or "") if e.status != "valid" else None
         )
-        for e in entries
-    ]
+        out.append(
+            CellOut(
+                row_number=e.row_number,
+                column=e.column_name,
+                target_field=e.target_field,
+                raw=e.raw_value or "",
+                corrected_from_review=e.corrected_from_review,
+                normalized=e.normalized_value,
+                rule=e.rule,
+                status=e.status,
+                message=e.message or "",
+                means=explanation.means if explanation else "",
+                action=explanation.action if explanation else "",
+            )
+        )
+    return out
 
 
 @router.post(

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from src.onboarding import service
 from src.onboarding.canonical import Entity
+from src.onboarding.reader import Sheet
 
 
 def _patient(number: int, **values: object) -> service.RowResult:
@@ -463,3 +464,136 @@ def test_a_patient_id_column_is_not_mistaken_for_the_patient_name() -> None:
     for heading in ("Nombre del paciente", "NOMBRE COMPLETO", "Paciente"):
         named = match_sheet((heading,), Entity.PATIENT).proposals[0]
         assert named.field is not None and named.field.name == "full_name", heading
+
+
+# ---------------------------------------------------------------- phone kind
+def _phone_sheet(heading: str, *numbers: str) -> Sheet:
+    return Sheet(
+        name="Pacientes",
+        headers=("documento", heading),
+        rows=tuple(("1045678901", number) for number in numbers),
+        header_row=1,
+    )
+
+
+def test_a_bare_phone_column_of_mobiles_is_questioned_not_filed_as_a_landline() -> None:
+    """The guess is invisible without this, and nothing downstream catches it.
+
+    "phone" and "telefono" are landline aliases, so an English export whose one
+    phone column holds mobiles maps every patient's reminder number to
+    `phone_fixed`. `normalizers.phone` validates a number against Colombia, not
+    against the field it landed in, so all of them convert as `valid`: the
+    import succeeds, and the reminders this product exists to send are simply
+    never delivered.
+    """
+    sheet = _phone_sheet("phone", "3001234567", "3119876543")
+    questions = service.remaining_questions(
+        sheet, Entity.PATIENT, {"documento": "document_number", "phone": "phone_fixed"}
+    )
+    assert any("phone" in q and "mobile" in q for q in questions), questions
+
+
+def test_a_phone_column_matching_its_heading_is_not_questioned() -> None:
+    """Asking anyway teaches reviewers to click past the question that matters."""
+    sheet = _phone_sheet("telefono fijo", "6012345678")
+    assert (
+        service.remaining_questions(
+            sheet, Entity.PATIENT, {"documento": "document_number", "telefono fijo": "phone_fixed"}
+        )
+        == ()
+    )
+
+    mobiles = _phone_sheet("celular", "3001234567")
+    assert (
+        service.remaining_questions(
+            mobiles, Entity.PATIENT, {"documento": "document_number", "celular": "phone_e164"}
+        )
+        == ()
+    )
+
+
+def test_the_reviewer_can_settle_a_phone_column_they_confirmed() -> None:
+    """A block that answering cannot clear is a file that can never import."""
+    sheet = _phone_sheet("phone", "3001234567")
+    mapping = {"documento": "document_number", "phone": "phone_fixed"}
+    assert service.remaining_questions(sheet, Entity.PATIENT, mapping)
+    assert service.remaining_questions(sheet, Entity.PATIENT, mapping, {"phone": "landline"}) == ()
+
+
+# ------------------------------------------------------- empty optional cells
+def test_a_blank_optional_cell_does_not_hold_the_patient_back() -> None:
+    """Most clinics leave the emergency contact blank for most patients.
+
+    Every normalizer reports an empty cell as `review`, which is right for a
+    required field. For an optional one it held the whole row back over a value
+    the clinic never recorded: 6 of 10 patients in the client's own export were
+    kept out of the import, 5 of them for this alone. There is nothing a
+    reviewer could decide, so the cell is skipped.
+    """
+    sheet = Sheet(
+        name="Patients",
+        headers=("id_type", "document_number", "full_name", "secondary_contact_phone"),
+        # Two words: an unambiguous given name and surname. A three-word name
+        # is a review in its own right and would mask what this test asserts.
+        rows=(("CC", "1045678901", "Ana Gomez", ""),),
+        header_row=1,
+    )
+    rows, _ = service.validate(
+        sheet,
+        Entity.PATIENT,
+        {
+            "id_type": "document_type",
+            "document_number": "document_number",
+            "full_name": "full_name",
+            "secondary_contact_phone": "secondary_contact_phone",
+        },
+    )
+    assert [r.status for r in rows] == [service.norm.Status.VALID], [r.reviews for r in rows]
+
+
+def test_a_wrong_value_in_an_optional_field_is_still_refused() -> None:
+    """Skipping the blank must not become skipping the check."""
+    sheet = Sheet(
+        name="Patients",
+        headers=("id_type", "document_number", "full_name", "secondary_contact_phone"),
+        rows=(("CC", "1045678901", "Ana Gomez Perez", "3099998877"),),
+        header_row=1,
+    )
+    rows, _ = service.validate(
+        sheet,
+        Entity.PATIENT,
+        {
+            "id_type": "document_type",
+            "document_number": "document_number",
+            "full_name": "full_name",
+            "secondary_contact_phone": "secondary_contact_phone",
+        },
+    )
+    assert rows[0].status is service.norm.Status.REVIEW
+    assert any("cannot be reached" in r for r in rows[0].reviews), rows[0].reviews
+
+
+def test_a_blank_required_cell_still_asks() -> None:
+    """The exemption is scoped to optional fields, not to every blank cell.
+
+    `document_type` is required and reports an empty cell as *review*, so it is
+    the one that catches an exemption widened to all fields. An empty
+    `document_number` would not: it is `invalid` either way, so a test built on
+    it passes whether the exemption is scoped or not.
+    """
+    sheet = Sheet(
+        name="Patients",
+        headers=("id_type", "document_number", "full_name"),
+        rows=(("", "1045678901", "Ana Gomez"),),
+        header_row=1,
+    )
+    rows, _ = service.validate(
+        sheet,
+        Entity.PATIENT,
+        {
+            "id_type": "document_type",
+            "document_number": "document_number",
+            "full_name": "full_name",
+        },
+    )
+    assert rows[0].status is not service.norm.Status.VALID

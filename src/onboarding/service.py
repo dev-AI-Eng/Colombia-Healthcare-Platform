@@ -19,10 +19,13 @@ re-running anything.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
+
+import phonenumbers
 
 from src.core.config import get_settings
 from src.onboarding import normalizers as norm
@@ -31,11 +34,13 @@ from src.onboarding.canonical import (
     FIELDS_BY_ENTITY,
     Entity,
     Field,
+    Requirement,
     field_for,
     required_fields,
 )
 from src.onboarding.matcher import (
     SHARED_FIELDS,
+    Confidence,
     Proposal,
     SheetMapping,
     guess_entity,
@@ -395,17 +400,111 @@ def _column_report(proposal: Proposal) -> ColumnReport:
     )
 
 
-def _column_questions(sheet: Sheet, mapping: SheetMapping) -> tuple[str, ...]:
+#: Fields a bare phone heading could mean. A column called just "phone" or
+#: "telefono" names neither kind, and the two are not interchangeable: reminders
+#: go to the mobile, so a mobile filed as a landline is never messaged.
+_PHONE_FIELDS: Final = {"phone_e164": "mobile", "phone_fixed": "landline"}
+
+
+def _phone_kind(value: str) -> str | None:
+    """`mobile`, `landline`, or None when the value settles nothing.
+
+    libphonenumber's metadata is the authority on which prefixes are which, the
+    same metadata `normalizers.phone` validates against. A number it cannot
+    place tells us nothing about the column and is left out of the count.
+    """
+    try:
+        parsed = phonenumbers.parse(re.sub(r"[^\d+]", "", value), "CO")
+    except phonenumbers.NumberParseException:
+        return None
+    kind = phonenumbers.number_type(parsed)
+    if kind == phonenumbers.PhoneNumberType.MOBILE:
+        return "mobile"
+    if kind == phonenumbers.PhoneNumberType.FIXED_LINE:
+        return "landline"
+    return None
+
+
+def remaining_questions(
+    sheet: Sheet,
+    entity: Entity,
+    mapping: dict[str, str | None],
+    decisions: ColumnDecisions | None = None,
+) -> tuple[str, ...]:
+    """The column questions still unanswered, under the reviewer's own mapping.
+
+    `_column_questions` works from a freshly matched sheet. By validate time the
+    reviewer may have re-mapped a column -- which is itself how a phone question
+    is answered -- so the questions are recomputed against what they confirmed
+    rather than against the upload-time guess.
+    """
+    proposals = tuple(
+        Proposal(
+            column=column,
+            field=field_for(*split_target(target, entity)) if target else None,
+            confidence=Confidence.EXACT,
+            score=1.0,
+            reason="Confirmed by the reviewer.",
+        )
+        for column, target in mapping.items()
+    )
+    return _column_questions(
+        sheet,
+        SheetMapping(entity=entity, proposals=proposals, missing_required=()),
+        decisions,
+    )
+
+
+def _column_questions(
+    sheet: Sheet, mapping: SheetMapping, decisions: ColumnDecisions | None = None
+) -> tuple[str, ...]:
     """Ask about anything the column as a whole cannot decide.
 
-    Only date order arises today: a column whose every value is ambiguous is
-    either day-first or month-first, and picking one silently would misdate
-    every row in it.
+    Two cases arise. A date column whose every value is ambiguous is either
+    day-first or month-first, and picking one silently would misdate every row.
+    A phone column whose heading names neither kind is guessed from the alias
+    dictionary, and the guess is only visible here: `phone` validates a number
+    against Colombia, not against the field it landed in, so a mobile filed as a
+    landline converts as `valid` and is simply never sent a reminder.
+
+    `decisions` are the reviewer's answers. A question they have answered is not
+    asked again: raising a block that answering cannot clear would leave the
+    file permanently unimportable.
     """
+    decisions = decisions or {}
     questions: list[str] = []
     index = _column_index(sheet)
     for proposal in mapping.proposals:
+        if proposal.field is None or proposal.field.name not in _PHONE_FIELDS:
+            continue
+        # The reviewer confirmed the heading was right after all. Their answer
+        # settles the column; it is not overridden by what the digits look like.
+        if decisions.get(proposal.column) in _PHONE_FIELDS.values():
+            continue
+        assumed = _PHONE_FIELDS[proposal.field.name]
+        kinds = {
+            kind
+            for value in (row[index[proposal.column]] for row in sheet.rows)
+            if value.strip() and (kind := _phone_kind(value)) is not None
+        }
+        # Only ask when the data contradicts the guess. A column of mobiles
+        # already mapped to the mobile field has nothing to decide, and asking
+        # anyway teaches reviewers to click past the question that matters.
+        if kinds and assumed not in kinds:
+            found = " and ".join(sorted(kinds))
+            other = "phone_e164" if assumed == "landline" else "phone_fixed"
+            questions.append(
+                f"{proposal.column}: this column was read as the {assumed}, but it "
+                f"holds {found} numbers. Reminders are only sent to the mobile, so "
+                f"confirm which it is by mapping the column to {other}, or leave it "
+                f"as it is if the heading is right."
+            )
+    for proposal in mapping.proposals:
         if proposal.field is None or proposal.field.normalizer != "date":
+            continue
+        # Answered, so settled. `validate` already reads the same answer to pick
+        # the order every row converts under.
+        if decisions.get(proposal.column) in {"day_first", "month_first"}:
             continue
         column_values = [row[index[proposal.column]] for row in sheet.rows]
         # Only ask when a value would actually be refused. An ISO column is
@@ -605,7 +704,18 @@ def _apply(canonical: Field, raw: str, order: norm.DayFirst) -> norm.Outcome[Any
 
     The binding lives in `canonical.py` and is fixed in code. Nothing here
     chooses a transform from the data, which is the whole point of ADR-08a.
+
+    An empty cell in an *optional* field is not a question. Every normalizer
+    reports one as `review`, which is right for a required field and wrong here:
+    a row is held back until a person answers each review, so one blank
+    emergency contact kept a whole patient out of the import, and most clinics
+    leave that column blank for most patients. There is nothing for a reviewer
+    to decide -- the clinic did not record the value -- so the cell is skipped
+    and the row is judged on the fields that do carry data. A non-empty value in
+    an optional field is still converted and still refused if it is wrong.
     """
+    if canonical.requirement is Requirement.OPTIONAL and not raw.strip():
+        return norm.Outcome(norm.Status.VALID, None, "optional.absent", "")
     match canonical.normalizer:
         case "document_type":
             return norm.document_type(raw)
@@ -801,9 +911,17 @@ def tolerable_invalid_rows(total_rows: int) -> int:
 
 
 def summarise(
-    rows: list[RowResult], report: SheetReport, columns: tuple[ColumnReport, ...]
+    rows: list[RowResult],
+    report: SheetReport,
+    columns: tuple[ColumnReport, ...],
+    questions: tuple[str, ...] | None = None,
 ) -> SheetReport:
-    """Fold row outcomes back into the sheet report the screen renders."""
+    """Fold row outcomes back into the sheet report the screen renders.
+
+    `questions` overrides the list the report was built with. The stored report
+    is from upload time, before the reviewer answered anything, so carrying it
+    through would leave an answered question blocking the import forever.
+    """
     tally = Counter(row.status.value for row in rows)
     return SheetReport(
         sheet=report.sheet,
@@ -816,7 +934,7 @@ def summarise(
         review_rows=tally[norm.Status.REVIEW.value],
         invalid_rows=tally[norm.Status.INVALID.value],
         warnings=report.warnings,
-        questions=report.questions,
+        questions=report.questions if questions is None else questions,
     )
 
 

@@ -143,7 +143,11 @@ async def test_measure_the_name_export_shapes(scoped: TestClient) -> None:
 #: change in any of them is either a regression or a figure to correct.
 EXPECTED = {
     "1_clean_ips.xlsx": {"sheets": 3, "rows": 20, "review": 4, "invalid": 0},
-    "3_excel_csv_es.csv": {"sheets": 1, "rows": 5, "review": 3, "invalid": 0},
+    # 2 in review, not 3: the last row stops after the name, so its optional
+    # columns are absent rather than wrong. An empty optional cell no longer
+    # holds a patient back -- there is nothing for a reviewer to decide about a
+    # value the clinic never recorded.
+    "3_excel_csv_es.csv": {"sheets": 1, "rows": 5, "review": 2, "invalid": 0},
     # 32, not 16: AGENDA is one row per visit, so each line yields a patient
     # and an appointment. Before multi-entity mapping its four patient columns
     # were silently dropped.

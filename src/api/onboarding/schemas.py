@@ -141,6 +141,16 @@ class CellOut(BaseModel):
     rule: str = Field(description="The named rule that produced this result.")
     status: str
     message: str = ""
+    means: str = Field(
+        default="",
+        description="What the rule means, in Spanish, for the receptionist acting on "
+        "it. Written against the rule name, so it never contains the cell's value.",
+    )
+    action: str = Field(
+        default="",
+        description="What to do about it. Never 'correct the value' for a document or "
+        "a phone number: the nearest valid one belongs to somebody else.",
+    )
 
 
 class RowOut(BaseModel):

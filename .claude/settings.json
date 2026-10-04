@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "ClaudeInChromeDomain(localhost:8010)",
+      "ClaudeInChromeDomain(127.0.0.1:8010)"
+    ]
+  }
+}

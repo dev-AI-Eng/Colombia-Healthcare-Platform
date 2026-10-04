@@ -33,13 +33,16 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import BaseModel, Field, ValidationError
 
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
 from src.onboarding.canonical import FIELDS_BY_ENTITY, Entity
+
+if TYPE_CHECKING:  # a runtime import would be circular: guidance imports this
+    from src.onboarding.guidance import Explanation
 
 log = get_logger(__name__)
 
@@ -265,6 +268,117 @@ def suggest(
     raise LLMUnavailable("; ".join(failures))
 
 
+#: The wording call's response shape. Two sentences, nothing structural: the
+#: model is supplying prose for a screen, not a decision.
+_WORDING_SCHEMA: Final = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "rule_wording",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"means": {"type": "string"}, "action": {"type": "string"}},
+            "required": ["means", "action"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def build_wording_messages(rule: str, field_means: str) -> list[dict[str, str]]:
+    """The exact payload for a wording call. Nothing else is transmitted.
+
+    Both inputs are ours: `rule` is a name from our own fixed vocabulary, and
+    `field_means` is the description written in `canonical.py`. Neither is the
+    clinic's heading and neither can be a cell.
+    """
+    return [
+        {
+            "role": "system",
+            "content": (
+                "A spreadsheet importer for Colombian medical clinics held a cell back "
+                "for review. Explain the named rule to the receptionist who has to act "
+                "on it, in Colombian Spanish, in two short sentences: what the rule "
+                "means, and what they should do. Never tell them to correct an identity "
+                "document or a phone number to a nearby valid value -- the corrected "
+                "value would belong to a different person. You are given no patient "
+                "data and must not ask for any."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {"rule_name": rule, "field_means": field_means}, ensure_ascii=False
+            ),
+        },
+    ]
+
+
+def explain_rule(rule: str, field_means: str, *, settings: Settings | None = None) -> Explanation:
+    """Word one refusal rule the guidance table has no entry for.
+
+    Returns a `guidance.Explanation`. Imported inside the function because
+    `guidance` imports this module for exactly this call, and the dependency
+    only exists at call time.
+
+    This decides nothing. The cell's status and the row's fate are settled
+    before it runs; a failure raises `LLMUnavailable` and the caller falls back
+    to the normalizer's own message.
+    """
+    from src.onboarding.guidance import Explanation
+
+    settings = settings or get_settings()
+    providers = _providers(settings)
+    if not providers:
+        raise LLMUnavailable("No model provider is configured.")
+
+    messages = build_wording_messages(rule, field_means)
+    digest = hashlib.sha256(
+        json.dumps(messages, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+    failures: list[str] = []
+    for index, provider in enumerate(providers):
+        started = time.monotonic()
+        try:
+            client = _openai_client(provider, settings)
+            response = client.chat.completions.create(
+                model=provider.model,
+                messages=messages,
+                response_format=_WORDING_SCHEMA,
+                temperature=0,
+            )
+            wording = json.loads(response.choices[0].message.content or "{}")
+            means, action = str(wording["means"]), str(wording["action"])
+        except Exception as error:  # provider errors are not ours to classify
+            failures.append(f"{provider.name}: {type(error).__name__}")
+            _log_call(
+                provider,
+                rule,
+                digest,
+                started,
+                "error",
+                str(error)[:200],
+                purpose="rule_wording",
+            )
+            continue
+
+        _log_call(
+            provider,
+            rule,
+            digest,
+            started,
+            "ok",
+            "",
+            usage=getattr(response, "usage", None),
+            attempt=index,
+            purpose="rule_wording",
+        )
+        return Explanation(rule=rule, means=means, action=action, source=provider.name)
+
+    raise LLMUnavailable("; ".join(failures))
+
+
 def _openai_client(provider: _Provider, settings: Settings) -> Any:
     """One SDK for both providers: Groq speaks the OpenAI protocol."""
     from openai import OpenAI
@@ -279,7 +393,7 @@ def _openai_client(provider: _Provider, settings: Settings) -> Any:
 
 def _log_call(
     provider: _Provider,
-    question: ColumnQuestion,
+    question: ColumnQuestion | str,
     payload_sha256: str,
     started: float,
     outcome: str,
@@ -287,6 +401,7 @@ def _log_call(
     *,
     usage: Any = None,
     attempt: int = 0,
+    purpose: str = "column_mapping",
 ) -> None:
     """Record the call for the audit trail.
 
@@ -298,8 +413,10 @@ def _log_call(
         "llm.call",
         provider=provider.name,
         model=provider.model,
-        purpose="column_mapping",
-        column=question.header,
+        purpose=purpose,
+        # A rule name for the wording call, a heading for the mapping call.
+        # Both are ours or the clinic's label, never a cell.
+        column=question if isinstance(question, str) else question.header,
         attempt=attempt,
         latency_ms=round((time.monotonic() - started) * 1000),
         outcome=outcome,

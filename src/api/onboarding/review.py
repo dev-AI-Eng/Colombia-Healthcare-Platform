@@ -418,17 +418,31 @@ async def review_screen(
 </main></body></html>""")
 
 
+def _read_page(name: str) -> str | None:
+    """A static page under `docs/`, read once at import rather than per request.
+
+    It cannot change while the process runs, and reading a file inside an async
+    handler blocks the event loop.
+    """
+    page = Path(__file__).resolve().parents[3] / "docs" / name
+    return page.read_text(encoding="utf-8") if page.exists() else None
+
+
 def _read_test_console() -> str | None:
     """The console page, read once at import rather than per request.
 
     It cannot change while the process runs, and reading a file inside an async
     handler blocks the event loop.
     """
-    page = Path(__file__).resolve().parents[3] / "docs" / "m1_test_console.html"
-    return page.read_text(encoding="utf-8") if page.exists() else None
+    return _read_page("m1_test_console.html")
 
 
 _TEST_CONSOLE: Final = _read_test_console()
+
+#: The client-facing walkthrough of the same API the console drives. The
+#: console reports every internal number; this one answers "what happened to my
+#: file" in the clinic's own language.
+_DEMO: Final = _read_page("m1_demo.html")
 
 
 #: Where the generated test files live. The console uploads them through the
@@ -487,6 +501,28 @@ async def test_console() -> HTMLResponse:
             "control, so a clone has the code without it.",
         )
     return HTMLResponse(_TEST_CONSOLE)
+
+
+@router.get(
+    "/demo",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    summary="The import, walked through in the clinic's own language",
+)
+async def demo() -> HTMLResponse:
+    """Serve `docs/m1_demo.html`, same-origin for the same reason as the console.
+
+    It drives exactly the routes above -- upload, structure, validate, commit --
+    and adds nothing of its own, so what it shows is what the API did. It sits
+    under the same synthetic-data gate as the rest of this router.
+    """
+    if _DEMO is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "docs/m1_demo.html is not present. `docs/` is outside version control, "
+            "so a clone has the code without it.",
+        )
+    return HTMLResponse(_DEMO)
 
 
 @router.get(

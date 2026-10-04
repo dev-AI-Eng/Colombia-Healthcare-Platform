@@ -578,6 +578,11 @@ _APPOINTMENT: Final = (
             "fecha de atencion",
             "appointment date",
             "dia de la cita",
+            # The bare English terms, to match the bare Spanish "fecha" above.
+            # An appointment or slot sheet exported in English names its column
+            # just "date"; the entity is what makes it unambiguous.
+            "date",
+            "slot date",
         ),
         normalizer="date",
         examples=("2026-10-15", "15/10/2026"),
@@ -597,6 +602,9 @@ _APPOINTMENT: Final = (
             # the appointment is booked for.
             "hora inicio",
             "hora de inicio",
+            # The bare English term, to match the bare Spanish "hora" above.
+            "time",
+            "slot time",
         ),
         normalizer="time",
         examples=("07:00", "8:30 a. m."),

@@ -205,6 +205,38 @@ async def test_commit_refuses_while_a_question_is_unanswered(scoped: TestClient,
     assert await _patient_count(session, scoped) == before
 
 
+async def test_answering_the_question_unblocks_the_import(scoped: TestClient) -> None:
+    """A question must be answerable, not merely raised.
+
+    The refusal above is only half the guarantee: a block a reviewer cannot
+    clear is a file they can never import. This drives the answer the way the
+    screen does — the decision travels with the mapping — and asserts the same
+    sheet stops reporting it.
+    """
+    body = _upload(scoped, "4_corrupted.xlsx")
+    session_id = body["session_id"]
+    first = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
+    asked = {s["sheet"]: s["questions"] for s in first["sheets"] if s["questions"]}
+    assert asked, "the fixture is supposed to raise a date-format question"
+
+    for sheet, questions in asked.items():
+        # The question names its column before the colon, which is how the
+        # screen knows which column the reviewer is answering about. A phone
+        # question is answered with the kind the column really holds, a date
+        # question with the order its values read in.
+        decisions = {
+            q.split(":")[0]: ("mobile" if "mobile" in q else "day_first") for q in questions
+        }
+        scoped.put(
+            f"/onboarding/uploads/{session_id}/mapping",
+            json={"sheet": sheet, "mapping": {}, "decisions": decisions},
+        )
+
+    after = scoped.post(f"/onboarding/uploads/{session_id}/validate").json()
+    still_asking = {s["sheet"]: s["questions"] for s in after["sheets"] if s["questions"]}
+    assert not still_asking, f"answered, but still blocked on {still_asking}"
+
+
 async def test_commit_refuses_before_validation_has_run(scoped: TestClient) -> None:
     body = _upload(scoped, "1_clean_ips.xlsx")
     response = scoped.post(f"/onboarding/uploads/{body['session_id']}/commit")
@@ -748,7 +780,11 @@ async def test_a_third_differently_structured_file_imports(scoped: TestClient, s
     # named, and what landed is checked against the field it belongs in.
     assert committed == {
         "1_clean_ips.xlsx": 12,
-        "3_excel_csv_es.csv": 2,
+        # 3, not 2: the last row of that file ends after the name, leaving its
+        # optional columns absent rather than wrong. A blank optional cell used
+        # to hold the whole patient back, which is a value the clinic never
+        # recorded blocking one it did.
+        "3_excel_csv_es.csv": 3,
         "2_receptionist.xlsx": 7,
     }, committed
 
