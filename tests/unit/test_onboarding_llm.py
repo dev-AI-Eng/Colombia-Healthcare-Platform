@@ -543,3 +543,71 @@ def test_an_ordinary_spanish_export_still_reaches_the_model(
 
     service.analyse(read(path))
     assert sent, "a file with a recognised heading asked the model nothing"
+
+
+# ------------------------------------------------- sampling the model accepts
+def test_a_reasoning_model_is_not_sent_a_temperature() -> None:
+    """OpenAI's reasoning models reject an explicit temperature.
+
+    `gpt-5-mini` -- the configured mapping model -- returns 400 "Unsupported
+    value: 'temperature' does not support 0 with this model" rather than
+    clamping it. Every call failed, so every ambiguous column fell back to the
+    human and every refusal fell back to the written table: the feature was
+    configured, paid for, and silently doing nothing.
+    """
+    assert llm._sampling("gpt-5-mini") == {}
+    assert llm._sampling("gpt-5") == {}
+    for reasoning in ("o1-preview", "o3-mini", "o4-mini"):
+        assert llm._sampling(reasoning) == {}, reasoning
+
+
+def test_every_other_model_still_gets_temperature_zero() -> None:
+    """Determinism is what makes an audited path reproducible.
+
+    Dropping it everywhere would have fixed the 400 and quietly made two
+    identical imports able to disagree. A model we do not recognise keeps it,
+    so a provider that refuses says so in one 400 rather than drifting.
+    """
+    assert llm._sampling("gpt-4o-mini") == {"temperature": 0}
+    # Groq names its models with a vendor prefix; the family is the last part.
+    assert llm._sampling("openai/gpt-oss-120b") == {"temperature": 0}
+    assert llm._sampling("llama-3.3-70b-versatile") == {"temperature": 0}
+
+
+def test_the_request_omits_temperature_for_the_configured_model() -> None:
+    """The end of the wire, not just the helper.
+
+    Asserted against the keyword arguments the client actually receives, so a
+    call site that stops consulting `_sampling` is caught.
+    """
+    sent: list[dict[str, object]] = []
+
+    class _Client:
+        class chat:  # mirrors the OpenAI client's shape
+            class completions:
+                @staticmethod
+                def create(**kwargs: object) -> object:
+                    sent.append(kwargs)
+                    raise RuntimeError("stop here; the request is what matters")
+
+    settings = Settings(
+        openai_api_key="sk-test-not-a-real-key",
+        groq_api_key="",
+        database_url="postgresql://u:p@localhost/x",
+        mapping_model_openai="gpt-5-mini",
+    )
+    question = llm.ColumnQuestion(
+        header="service_type",
+        shape="1 of 3 repeating values",
+        filled_percent=100,
+        distinct_count=3,
+        synthetic_examples=("AAA",),
+    )
+    with pytest.raises(llm.LLMUnavailable):
+        llm.suggest(
+            question,
+            Entity.AVAILABILITY,
+            settings=settings,
+            client_factory=lambda provider, settings: _Client(),
+        )
+    assert sent and "temperature" not in sent[0], sent

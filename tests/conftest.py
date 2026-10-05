@@ -23,6 +23,15 @@ os.environ["POSTGRES_DB"] = os.environ.get("TEST_POSTGRES_DB", "clinic_test")
 if not os.environ["POSTGRES_DB"].endswith("_test"):
     raise RuntimeError("Integration tests may only use a database whose name ends in '_test'.")
 
+# No test calls a live model provider (CLAUDE.md section 6). The keys are
+# cleared here rather than trusted to be absent: a developer with a working key
+# in `.env` would otherwise have every ambiguous column and every refusal make a
+# real, paid, non-deterministic call, and the suite would pass differently on
+# their machine than in CI. Tests that exercise these paths inject a fake client
+# or a Settings object of their own.
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["GROQ_API_KEY"] = ""
+
 from src.core.db import configure_event_loop_policy
 
 configure_event_loop_policy()

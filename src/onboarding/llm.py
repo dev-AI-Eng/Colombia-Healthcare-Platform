@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from src.core.config import Settings, get_settings
 from src.core.logging import get_logger
@@ -87,12 +87,48 @@ class Suggestion:
     model: str
 
 
+#: How much of the model's reason we keep. It is shown beside the column on
+#: the confirmation screen, where a paragraph would push the next column off
+#: the page, so it is bounded. The bound is also sent to the provider as
+#: `maxLength`, because a limit the model is not told about is one it breaks.
+REASON_LIMIT: Final = 200
+
+
 class _Proposal(BaseModel):
     """The shape the model must answer in."""
 
     target_field: str = Field(description="A canonical field name, or __NO_MATCH__.")
     confidence: float = Field(ge=0.0, le=1.0)
-    reason: str = Field(max_length=200)
+    # Truncated rather than rejected. A model that writes 220 characters has
+    # still chosen a field, and discarding a sound mapping over the length of
+    # its prose sends the column to a human for no reason -- which is what
+    # happened: every call failed validation and the feature did nothing.
+    reason: str = Field(max_length=REASON_LIMIT)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _shorten(cls, value: object) -> object:
+        if isinstance(value, str) and len(value) > REASON_LIMIT:
+            return value[: REASON_LIMIT - 1].rstrip() + "\u2026"
+        return value
+
+
+#: Model families that reject an explicit `temperature`. OpenAI's reasoning
+#: models accept only the default of 1: sending 0 returns a 400 rather than
+#: being clamped, so every call fails and the column falls back to the human.
+#:
+#: Matched on a prefix of the model name because the family is what decides
+#: this, not the exact snapshot. A name we do not recognise keeps `temperature=0`,
+#: which is the safer default: determinism is what makes an audited path
+#: reproducible, and a provider that rejects it tells us so in one 400 rather
+#: than drifting silently.
+_NO_TEMPERATURE: Final = ("gpt-5", "o1", "o3", "o4")
+
+
+def _sampling(model: str) -> dict[str, float]:
+    """`{"temperature": 0}`, or nothing when the model refuses it."""
+    name = model.rsplit("/", 1)[-1]
+    return {} if name.startswith(_NO_TEMPERATURE) else {"temperature": 0}
 
 
 @dataclass(slots=True)
@@ -186,7 +222,7 @@ def _schema(entity: Entity, candidates: tuple[str, ...]) -> dict[str, Any]:
                 "properties": {
                     "target_field": {"type": "string", "enum": allowed},
                     "confidence": {"type": "number"},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "maxLength": REASON_LIMIT},
                 },
                 "required": ["target_field", "confidence", "reason"],
                 "additionalProperties": False,
@@ -229,7 +265,7 @@ def suggest(
                 model=provider.model,
                 messages=messages,
                 response_format=_schema(entity, candidates),
-                temperature=0,
+                **_sampling(provider.model),
             )
             content = response.choices[0].message.content or ""
             proposal = _Proposal.model_validate_json(content)
@@ -346,7 +382,7 @@ def explain_rule(rule: str, field_means: str, *, settings: Settings | None = Non
                 model=provider.model,
                 messages=messages,
                 response_format=_WORDING_SCHEMA,
-                temperature=0,
+                **_sampling(provider.model),
             )
             wording = json.loads(response.choices[0].message.content or "{}")
             means, action = str(wording["means"]), str(wording["action"])
