@@ -597,3 +597,64 @@ def test_a_blank_required_cell_still_asks() -> None:
         },
     )
     assert rows[0].status is not service.norm.Status.VALID
+
+
+# ----------------------------------------------- ADR-08a, the named guarantee
+def test_a_mixed_phone_column_reviews_only_what_cannot_be_reached() -> None:
+    """The specific test ADR-08a names, and the reason the whole design exists.
+
+    `docs/ARCHITECTURE.md`: "a file whose phone column is 90 percent local
+    format and 10 percent international must produce a review queue containing
+    exactly those 10 percent, not a silently transformed column."
+
+    What must never happen is a value being *coerced* into a plausible one. A
+    local and an international spelling of the same reachable number converging
+    on one E.164 value is not that -- it is the same number written two ways,
+    and libphonenumber is what decides so. The failure the rule guards against
+    is the unreachable value being quietly rounded to a valid one, which would
+    send a reminder to a stranger.
+
+    So the assertion is on both halves: every reachable row converts, and the
+    one that cannot be reached is in review by itself, named, with the column's
+    percent-valid reported rather than a preview of the first few rows.
+    """
+    reachable = [
+        "3001234567",
+        "+573001234567",
+        "+57 311 987 6543",
+        "3204567890",
+        "3157778899",
+        "+57 320 111 2233",
+        "3101112233",
+        "3119876543",
+        "3002223344",
+    ]
+    unreachable = ["0057 3001234567"]
+    sheet = Sheet(
+        name="Pacientes",
+        headers=("documento", "nombre", "celular"),
+        rows=tuple(
+            (f"10{i:08d}", "Ana Gomez", value) for i, value in enumerate(reachable + unreachable)
+        ),
+        header_row=1,
+    )
+    rows, columns = service.validate(
+        sheet,
+        Entity.PATIENT,
+        {"documento": "document_number", "nombre": "full_name", "celular": "phone_e164"},
+    )
+
+    in_review = [r for r in rows if r.status is service.norm.Status.REVIEW]
+    assert len(in_review) == 1, [r.reviews for r in in_review]
+    assert "0057 3001234567" in in_review[0].reviews[0]
+    assert len(rows) - len(in_review) == len(reachable)
+
+    # The confirmation screen shows this, not a sample of the first rows.
+    celular = next(c for c in columns if c.column == "celular")
+    assert (celular.total, celular.valid, celular.review, celular.invalid) == (10, 9, 1, 0)
+    assert celular.percent_valid == 90.0
+
+    # Both spellings of one reachable number reach the same stored value: that
+    # is canonicalisation, not coercion. Nothing was invented for either.
+    stored = {r.values["phone_e164"] for r in rows if r.status is service.norm.Status.VALID}
+    assert "+573001234567" in stored
