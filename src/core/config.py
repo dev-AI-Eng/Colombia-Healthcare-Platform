@@ -75,6 +75,26 @@ class Settings(BaseSettings):
     # long (see src/conversation/checkpointer.py).
     checkpoint_retention_days: int = Field(default=30, ge=1)
 
+    # Column mapping may ask a model about a column the dictionary and fuzzy
+    # matcher could not resolve. Both keys are optional: with neither set the
+    # importer still works, and those columns go to the human instead. Nothing
+    # here ever carries a patient's value — see src/onboarding/llm.py.
+    openai_api_key: SecretStr = SecretStr("")
+    groq_api_key: SecretStr = SecretStr("")
+    # A small, cheap model is right for this: the task is picking one of about
+    # a dozen candidate fields, not reasoning.
+    mapping_model_openai: str = "gpt-5-mini"
+    mapping_model_groq: str = "openai/gpt-oss-120b"
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    # Per call. A mapping proposal that takes longer than this is not worth
+    # waiting for inside a request a person is watching.
+    mapping_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    @property
+    def mapping_llm_available(self) -> bool:
+        """Whether a model can be asked about an ambiguous column at all."""
+        return bool(self.openai_api_key.get_secret_value() or self.groq_api_key.get_secret_value())
+
     @property
     def synthetic_data_mode(self) -> bool:
         """True in local and CI while real patient data is disabled.

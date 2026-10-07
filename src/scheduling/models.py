@@ -24,6 +24,7 @@ from datetime import date, datetime, time
 from enum import StrEnum
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -166,6 +167,13 @@ class Appointment(Base):
         CheckConstraint(
             "(status = 'hold') = (expires_at IS NOT NULL)", name="expiry_only_for_holds"
         ),
+        Index(
+            "uq_appointments_clinic_id_external_ref",
+            "clinic_id",
+            "external_ref",
+            unique=True,
+            postgresql_where=text("external_ref IS NOT NULL"),
+        ),
         Index("ix_appointments_patient_id", "patient_id"),
         Index("ix_appointments_clinic_id_start", "clinic_id", func.lower(text("during"))),
         {"schema": "app"},
@@ -186,4 +194,17 @@ class Appointment(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Lets a retried request create at most one appointment.
     idempotency_key: Mapped[str | None] = mapped_column(String(120), unique=True)
+    # Fields the clinic's own export carries (migration 0005).
+    consultation_type: Mapped[str | None] = mapped_column(String(40))
+    source: Mapped[str | None] = mapped_column(String(60))
+    cancellation_reason: Mapped[str | None] = mapped_column(String(200))
+    # The client's files model a reschedule as cancelling one row and creating
+    # another that points back at it, so the link is an appointment, not a status.
+    rescheduled_from_appointment_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("app.appointments.id")
+    )
+    preferred_channel: Mapped[str | None] = mapped_column(String(30))
+    reminder_48h_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    external_ref: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

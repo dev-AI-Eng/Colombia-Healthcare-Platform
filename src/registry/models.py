@@ -90,13 +90,55 @@ class Location(Base):
 
 class Doctor(Base):
     __tablename__ = "doctors"
-    __table_args__ = (Index("ix_doctors_clinic_id", "clinic_id"), {"schema": "app"})
+    __table_args__ = (
+        Index(
+            "uq_doctors_clinic_id_external_ref",
+            "clinic_id",
+            "external_ref",
+            unique=True,
+            postgresql_where=text("external_ref IS NOT NULL"),
+        ),
+        Index("ix_doctors_clinic_id", "clinic_id"),
+        {"schema": "app"},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
     full_name: Mapped[str] = mapped_column(String(200))
+    # Free-text specialty as the clinic writes it. `specialty_id` points at the
+    # clinic's own catalogue when their file supplies one (migration 0005);
+    # both are kept because not every clinic has a catalogue.
     specialty: Mapped[str] = mapped_column(String(100))
+    specialty_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app.specialties.id"))
+    office_number: Mapped[str | None] = mapped_column(String(32))
+    external_ref: Mapped[str | None] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Specialty(Base):
+    """A clinic's own catalogue of specialties, as its export lists them.
+
+    `external_ref` is the clinic's code ("E01"). It resolves references inside
+    the uploaded file and matches the row again on a later import.
+    """
+
+    __tablename__ = "specialties"
+    __table_args__ = (
+        Index(
+            "uq_specialties_clinic_id_external_ref",
+            "clinic_id",
+            "external_ref",
+            unique=True,
+            postgresql_where=text("external_ref IS NOT NULL"),
+        ),
+        {"schema": "app"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
+    external_ref: Mapped[str | None] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -116,6 +158,13 @@ class Patient(Base):
             "document_type",
             "document_number_bidx",
             unique=True,
+        ),
+        Index(
+            "uq_patients_clinic_id_external_ref",
+            "clinic_id",
+            "external_ref",
+            unique=True,
+            postgresql_where=text("external_ref IS NOT NULL"),
         ),
         Index(
             "ix_patients_clinic_id_phone_e164_bidx",
@@ -140,6 +189,16 @@ class Patient(Base):
     phone_e164: Mapped[str | None] = mapped_column(EncryptedString)
     phone_e164_bidx: Mapped[bytes | None] = mapped_column(LargeBinary)
     email: Mapped[str | None] = mapped_column(EncryptedString)
+    # Fields the clinic's own export carries (migration 0005). `eps` is the
+    # insurer's name as written by the clinic: matched loosely, stored verbatim,
+    # because the official EPS list changes and historical rows name defunct ones.
+    eps: Mapped[str | None] = mapped_column(String(120))
+    secondary_contact_name: Mapped[str | None] = mapped_column(String(200))
+    # Encrypted like every other direct identifier.
+    secondary_contact_phone: Mapped[str | None] = mapped_column(EncryptedString)
+    telegram_chat_id: Mapped[str | None] = mapped_column(String(64))
+    # The clinic's own key for this row, so a re-import updates instead of duplicating.
+    external_ref: Mapped[str | None] = mapped_column(String(64))
     # Soft-deletion marker. Every repository query that returns patient details
     # (registry, scheduling, identity) excludes patients where it is set.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

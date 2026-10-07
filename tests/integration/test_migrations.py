@@ -31,7 +31,10 @@ from src import bootstrap
 from src.core.config import Settings
 from src.core.db import Base
 
-_SCHEMAS = {"app", "audit"}
+# Every schema whose tables are declared as models and created by a migration.
+# `conversation` is absent on purpose: LangGraph owns those tables and creates
+# them itself, so comparing them against our models would always differ.
+_SCHEMAS = {"app", "audit", "onboarding"}
 
 
 def _include_name(name: str | None, type_: str, parent_names: Any) -> bool:

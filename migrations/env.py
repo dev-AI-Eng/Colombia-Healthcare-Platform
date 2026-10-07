@@ -19,6 +19,7 @@ from sqlalchemy.pool import NullPool
 # Importing the model modules registers every table on Base.metadata.
 import src.audit.models
 import src.identity.models
+import src.onboarding.models
 import src.registry.models
 import src.scheduling.models  # noqa: F401
 from src.core.config import get_settings

@@ -23,12 +23,38 @@ dependencies = [
 seed = [
     "faker>=30",
 ]
+# Spreadsheet onboarding (src/onboarding). Parsing untrusted clinic files.
+onboarding = [
+    # Structure only (hidden sheets, merged ranges, true dimensions).
+    "openpyxl>=3.1",
+    # openpyxl does not guard billion-laughs/quadratic-blowup without this installed.
+    "defusedxml>=0.7",
+    # Detects a wrong decoding; never used to silently repair a patient's name.
+    "ftfy>=6.2",
+    "rapidfuzz>=3.10",
+    # libphonenumber metadata; a hand-rolled regex would not track the 2021 renumbering.
+    "phonenumbers>=8.13",
+]
+# Column mapping that calls a model. Optional: without it the pipeline still runs,
+# and ambiguous columns go to the human instead of to a model.
+mapping = [
+    "clinic-scheduler[onboarding]",
+    "openai>=1.54",
+]
 dev = [
     "clinic-scheduler[seed]",
+    "clinic-scheduler[mapping]",
     "httpx>=0.27",
     "mypy>=1.13",
+    # Stubs for the onboarding parsers, so mypy checks this code rather than
+    # treating every openpyxl call as Any.
+    "types-openpyxl>=3.1",
+    "types-defusedxml>=0.7",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    # Coverage is how untested refusal paths were found; they are the paths that
+    # matter most, because a refusal that silently succeeds corrupts data.
+    "pytest-cov>=6.0",
     # Pinned exactly: ruff's formatter changes between releases, so an unpinned
     # version makes pre-commit and CI disagree about the same file.
     "ruff==0.16.8",
@@ -50,6 +76,16 @@ select = ["E", "F", "I", "UP", "B", "S", "ASYNC", "SIM", "RUF"]
 ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
+# These files deliberately contain U+00A0 and U+202F: the Spanish 12-hour clock
+# format Excel writes ("8:30 a. m.") uses them, and a normalizer that splits on
+# an ordinary space silently fails on it. Removing them would remove the test.
+# U+00A0 and U+202F are the characters this module exists to handle: Spanish
+# Excel writes "8:30 a. m." with them, and a parser that splits on an ordinary
+# space fails silently on every time in the file.
+"src/onboarding/normalizers.py" = ["RUF001"]
+"tests/fixtures/onboarding/generate.py" = ["RUF001"]
+"tests/unit/test_onboarding_reader.py" = ["RUF001"]
+"tests/unit/test_onboarding_normalizers.py" = ["RUF001"]
 # Assertions and fixed test credentials are expected in tests.
 "tests/**" = ["S101", "S105", "S106"]
 # Synthetic data deliberately uses a non-cryptographic seeded generator.
@@ -68,6 +104,14 @@ warn_unused_ignores = true
 [[tool.mypy.overrides]]
 module = ["faker.*"]
 ignore_missing_imports = true
+
+# `resource` is POSIX only, and mypy type-checks one platform at a time. The
+# `attr-defined` ignores in `_limit_child` are required on Windows and unused on
+# Linux, so whichever platform CI runs on, strict `warn_unused_ignores` fails the
+# other. The suppression is scoped to the one module that imports `resource`.
+[[tool.mypy.overrides]]
+module = ["src.onboarding.reader"]
+warn_unused_ignores = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

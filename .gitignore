@@ -29,3 +29,10 @@ htmlcov/
 # Local data
 *.sqlite3
 pgdata/
+
+# Onboarding test fixtures are generated (tests/fixtures/onboarding/generate.py).
+# The zip bomb in particular must not be committed.
+tests/fixtures/onboarding/*.xlsx
+tests/fixtures/onboarding/*.csv
+testing results
+deliverable/

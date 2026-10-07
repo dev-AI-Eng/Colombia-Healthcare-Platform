@@ -27,6 +27,11 @@ from src.conversation.checkpointer import ensure_checkpoint_schema
 from src.core.config import Settings, get_settings
 
 _TABLES = (
+    # Onboarding first: its rows reference clinics and are cascaded from sessions.
+    "onboarding.transform_log",
+    "onboarding.staging_rows",
+    "onboarding.import_sessions",
+    "onboarding.import_profiles",
     "app.appointments",
     "app.availability_exceptions",
     "app.availability_rules",
@@ -35,6 +40,7 @@ _TABLES = (
     "app.phone_bindings",
     "app.patients",
     "app.doctors",
+    "app.specialties",
     "app.locations",
     "app.clinics",
     "audit.access_log",

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src.api import health
 from src.api.middleware import (
@@ -16,6 +17,7 @@ from src.api.middleware import (
     SecurityHeadersMiddleware,
     UnhandledErrorMiddleware,
 )
+from src.api.onboarding import router as onboarding_router
 from src.api.review import router as review_router
 from src.audit.service import anchor_chain
 from src.core.config import get_settings
@@ -23,7 +25,24 @@ from src.core.db import dispose_engine, get_sessionmaker
 from src.core.logging import configure_logging, get_logger
 from src.core.ratelimit import InProcessRateLimiter
 
+#: Sized for the JSON bodies the API accepts (a mapping, a correction). The
+#: upload route is exempt and enforces its own, larger limit while streaming.
 MAX_REQUEST_BODY_BYTES = 1_000_000
+
+#: The exact paths that receive a file rather than a JSON body. Matched exactly,
+#: so the JSON sub-routes under `/onboarding/uploads/...` stay bounded.
+UPLOAD_PATHS = ("/onboarding/uploads", "/onboarding/upload")
+
+#: Host headers the review surface answers to. A browser reaching loopback from
+#: another origin sends that origin's name, so the name is what rejects it.
+#: Ports are stripped by TrustedHostMiddleware before matching.
+#:
+#: `testserver` is Starlette's name for an in-process client. It is included
+#: because it resolves to nothing in DNS, so no browser can send it and no
+#: rebinding attack can use it -- a rebinding host has to resolve to 127.0.0.1
+#: to arrive at all. Leaving it out would make every test talk to a different
+#: app than the one that ships.
+LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "::1", "[::1]", "testserver"]
 
 log = get_logger(__name__)
 
@@ -78,11 +97,26 @@ def create_app() -> FastAPI:
     app.add_middleware(
         RateLimitMiddleware, limiter=InProcessRateLimiter(settings.rate_limit_per_minute)
     )
-    app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
+    app.add_middleware(
+        BodySizeLimitMiddleware,
+        max_bytes=MAX_REQUEST_BODY_BYTES,
+        # The upload endpoint bounds the file itself as it streams, so the
+        # JSON-sized limit must not also cap a spreadsheet.
+        exempt_paths=UPLOAD_PATHS,
+    )
     app.add_middleware(UnhandledErrorMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
+
+    if settings.synthetic_data_mode:
+        # The review and import screens are loopback-only, which `server.py`
+        # enforces for the socket. The socket is not the whole story: a page on
+        # another origin whose DNS resolves to 127.0.0.1 reaches us from the
+        # developer's own browser, carrying its own Host header. Requiring a
+        # loopback Host closes that, and these routes only exist here anyway.
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=LOOPBACK_HOSTS)
     app.add_middleware(RequestContextMiddleware)
 
     app.include_router(health.router)
     app.include_router(review_router)
+    app.include_router(onboarding_router)
     return app

@@ -7,9 +7,11 @@ and voice replies to confirm, cancel or reschedule, and offers new times from ea
 doctor's real availability. Every model-written message is checked by an independent
 evaluator before it reaches a patient.
 
-**Status: milestone M0 (foundations).** This repository contains the data model,
-encryption, audit logging, database provisioning, LangGraph checkpoint storage, a
-read-only review API over synthetic data, and CI. No patient messaging exists yet.
+**Status: milestone M1 (data onboarding).** This repository contains the data
+model, encryption, audit logging, database provisioning, LangGraph checkpoint
+storage, a read-only review API over synthetic data, CI, and the spreadsheet
+importer that brings a clinic's existing patients, doctors and specialties into
+the system. No patient messaging exists yet.
 
 ---
 
@@ -149,6 +151,63 @@ Safeguards while staff authentication does not exist (it arrives in M11):
 | Soft-deleted patients appear in no patient query | Repository filters | `tests/integration/test_review_api.py` |
 | The review API is unavailable outside synthetic-data mode | Access dependency; OpenAPI document not served | `tests/unit/test_review_access.py`, `tests/unit/test_error_handling.py` |
 | No secrets in source control | gitleaks in CI and pre-commit | CI job `Secret scan` |
+
+## M1: importing a clinic's spreadsheet
+
+Upload the export a clinic already keeps — any column names, Spanish or English,
+one sheet or eight — and the importer works out what each column is, converts
+every row, shows what it found, and writes nothing until a person approves it.
+
+Nothing is guessed and nothing is repaired. A value the file cannot settle
+becomes a question for a human. A damaged document number or an unreachable
+phone is flagged, never corrected: the nearest valid number belongs to somebody
+else, and a reminder sent there discloses an appointment to the wrong person.
+
+### Try it with three prepared files
+
+```bash
+python -m tests.fixtures.onboarding.generate_client_demo
+python main.py --reset-db
+```
+
+Then open **http://localhost:8000/onboarding/demo** and drag in each file from
+`tests/fixtures/onboarding/`. Each one shows a different thing the importer has
+to get right:
+
+| File | What it contains | What you should see |
+|---|---|---|
+| `A_mobiles_in_a_phone_column.xlsx` | 5 patients; one column headed `phone` holding mobile numbers | **Blocked**, with a question: the column was read as the landline but holds mobiles. Reminders only go to the mobile, so a person decides. One row is separately flagged for a number that is not assigned in Colombia. |
+| `B_blank_optional_columns.xlsx` | 5 patients; most optional columns empty, as real clinic data is | **4 of 5 import.** A blank optional column is not a question — the clinic did not record the value. The one held back has a contact number that is present and wrong. |
+| `C_english_headings.xlsx` | 3 sheets in English, with bare `date` and `time` columns | **All three sheets map with no corrections.** One row asks about a status that genuinely means different things in different clinics. |
+
+`--reset-db` matters on a second run: without it the same document numbers match
+existing records and you will see updates rather than new rows, which is correct
+behaviour but confusing to read.
+
+**On file C the commit writes `Appointments: 0`, and that is deliberate.**
+Appointment rows are read, mapped and validated, but writing them needs the
+booking transaction that arrives in M2 — writing them any other way would go
+around the database constraint that makes double-booking impossible. The screen
+says so rather than skipping them quietly.
+
+### More files, and the harder cases
+
+```bash
+python -m tests.fixtures.onboarding.generate                 # 14 files, tidy to hostile
+python -m tests.fixtures.onboarding.generate_name_shapes     # 4 name-export shapes
+python -m tests.fixtures.onboarding.generate_platform_exports # 4 real-system shapes
+```
+
+These are **not** in the repository and must be generated: one of them is a zip
+bomb, and generating them is what proves every value in them is invented. They
+include files the importer must refuse (a zip bomb, an XXE document, an
+executable renamed `.csv`) and files it must read anyway (a formula-injection
+attempt kept as text, a workbook whose declared size understates it by 4,999
+rows).
+
+Three surfaces drive the same API: `/onboarding/demo` for a clean walkthrough,
+`/onboarding/test-console` for diagnostics with every internal number, and
+`/docs` for the raw API.
 
 ## Tests and checks
 
