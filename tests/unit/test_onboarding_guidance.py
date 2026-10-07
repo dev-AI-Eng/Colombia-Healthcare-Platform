@@ -69,10 +69,12 @@ def test_the_table_explains_nothing_that_cannot_happen() -> None:
 #: guarantee: the action must say NOT to invent or alter the value.
 _REPAIR_VERBS: Final = (
     "corrij",  # corrija, corríjalo, corrijan
-    "corrig",  # corrige, corregir, corregido
+    "correg",  # corregir, corregido
+    "corrig",  # corrige, corrigió
     "arregl",  # arregle, arreglar
     "ajust",  # ajuste, ajustar
-    "modific",  # modifique, modificar
+    "modifiq",  # modifique, modifiquen -- the imperative the model reaches for
+    "modific",  # modificar, modificado
     "complet",  # "complete el número" -- inventing the missing digits
     "repar",  # repare, reparar
 )
@@ -98,17 +100,30 @@ def test_guidance_never_tells_anyone_to_repair_an_identifier() -> None:
     acts on it. Both halves are asserted: no repair verb, and an explicit
     warning not to invent the value.
 
-    Locale-independent by construction -- it reads whatever wording the
-    guidance layer produced rather than assuming a language. With no provider
-    configured that is the written Spanish table, which is what CI runs.
+    Read from `GUIDANCE` rather than through `explain`, deliberately. `explain`
+    asks a model first when a provider is configured, and a model writes new
+    wording on every call -- so a test over it asserts on text that changes
+    between runs, and fails or passes depending on whether the machine has a
+    key. The table is the fallback every provider failure lands on, so this is
+    the wording that must always be safe; the model's output is bounded by the
+    prompt and by `test_the_wording_payload_carries_no_cell_and_no_clinic_heading`.
     """
     for rule in ("phone.not_assigned", "document_number.scientific_notation"):
-        explanation = guidance.explain(rule)
-        assert explanation is not None, rule
-        text = f"{explanation.means} {explanation.action}".lower()
-        offending = [v for v in _REPAIR_VERBS if v in text]
+        assert rule in guidance.GUIDANCE, rule
+        means, action = guidance.GUIDANCE[rule]
+        text = f"{means} {action}".lower()
+
+        warned = [w for w in _DO_NOT_INVENT if w in text]
+        assert warned, (rule, "no warning against inventing the value", text)
+
+        # The warnings are themselves negated repair verbs -- "no modifique"
+        # contains "modifiq" -- so they come out before the scan. Removing them
+        # is what keeps "do not modify" from reading as "modify".
+        remainder = text
+        for phrase in warned:
+            remainder = remainder.replace(phrase, " ")
+        offending = [v for v in _REPAIR_VERBS if v in remainder]
         assert not offending, (rule, offending, text)
-        assert any(w in text for w in _DO_NOT_INVENT), (rule, text)
 
 
 def test_an_unknown_rule_is_not_invented() -> None:

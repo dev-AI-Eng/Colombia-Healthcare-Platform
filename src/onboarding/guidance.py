@@ -303,13 +303,21 @@ def explain(rule: str, field_name: str = "") -> Explanation | None:
     `field_name` is optional so a caller with only a rule still gets the table.
     """
     written = GUIDANCE.get(rule)
+    if written is None:
+        # No entry means no such refusal rule, so there is nothing to word. Asking
+        # a model here would get a fluent explanation of a rule the system never
+        # emits -- it has no way to know the name is unknown, and it will not say
+        # so. The table is what decides a rule exists; `missing_rules` is the
+        # test that keeps it complete.
+        return None
+
     field = next((f for f in ALL_FIELDS if f.name == field_name), None)
     # The field's own description when we know the field; the rule's written
     # explanation otherwise, which still tells the model what it is wording.
-    means = field.description if field else (written[0] if written else rule)
+    means = field.description if field else written[0]
     if get_settings().mapping_llm_available and (generated := _generated(rule, means)):
         return generated
-    return Explanation(rule, written[0], written[1]) if written else None
+    return Explanation(rule, written[0], written[1])
 
 
 def missing_rules(rules: set[str]) -> set[str]:
