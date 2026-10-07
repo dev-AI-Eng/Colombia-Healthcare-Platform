@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from typing import Final
 
 import pytest
 
@@ -61,17 +62,68 @@ def test_the_table_explains_nothing_that_cannot_happen() -> None:
     assert set(guidance.GUIDANCE) - rules == set()
 
 
+#: Telling a receptionist to repair an identifier, in the forms Spanish offers.
+#: Matching on a verb list is weaker than it looks -- a model that writes
+#: "ajuste el número" would pass a test that only knows "corrija" -- so the list
+#: covers the stems, and the positive assertion below is what carries the
+#: guarantee: the action must say NOT to invent or alter the value.
+_REPAIR_VERBS: Final = (
+    "corrij",  # corrija, corríjalo, corrijan
+    "correg",  # corregir, corregido
+    "corrig",  # corrige, corrigió
+    "arregl",  # arregle, arreglar
+    "ajust",  # ajuste, ajustar
+    "modifiq",  # modifique, modifiquen -- the imperative the model reaches for
+    "modific",  # modificar, modificado
+    "complet",  # "complete el número" -- inventing the missing digits
+    "repar",  # repare, reparar
+)
+
+#: What a safe action says instead. One of these must appear, so the test fails
+#: on wording that merely avoids the forbidden verbs without warning anybody.
+_DO_NOT_INVENT: Final = (
+    "no invente",
+    "no altere",
+    "no adivine",
+    "no lo aproxime",
+    "no modifique",
+    "no la reconstruya",
+    "no lo reconstruya",
+)
+
+
 def test_guidance_never_tells_anyone_to_repair_an_identifier() -> None:
     """The nearest valid cédula or phone number belongs to a stranger.
 
-    `normalizers.phone` refuses rather than corrects for this reason; guidance
-    that then said "fix it" would undo that in the one place a person acts.
+    `normalizers.phone` refuses rather than corrects for this reason, and
+    guidance that then said "fix it" would undo that in the one place a person
+    acts on it. Both halves are asserted: no repair verb, and an explicit
+    warning not to invent the value.
+
+    Read from `GUIDANCE` rather than through `explain`, deliberately. `explain`
+    asks a model first when a provider is configured, and a model writes new
+    wording on every call -- so a test over it asserts on text that changes
+    between runs, and fails or passes depending on whether the machine has a
+    key. The table is the fallback every provider failure lands on, so this is
+    the wording that must always be safe; the model's output is bounded by the
+    prompt and by `test_the_wording_payload_carries_no_cell_and_no_clinic_heading`.
     """
     for rule in ("phone.not_assigned", "document_number.scientific_notation"):
-        explanation = guidance.explain(rule)
-        assert explanation is not None
-        text = f"{explanation.means} {explanation.action}".lower()
-        assert "corrija" not in text and "corríjalo" not in text, (rule, text)
+        assert rule in guidance.GUIDANCE, rule
+        means, action = guidance.GUIDANCE[rule]
+        text = f"{means} {action}".lower()
+
+        warned = [w for w in _DO_NOT_INVENT if w in text]
+        assert warned, (rule, "no warning against inventing the value", text)
+
+        # The warnings are themselves negated repair verbs -- "no modifique"
+        # contains "modifiq" -- so they come out before the scan. Removing them
+        # is what keeps "do not modify" from reading as "modify".
+        remainder = text
+        for phrase in warned:
+            remainder = remainder.replace(phrase, " ")
+        offending = [v for v in _REPAIR_VERBS if v in remainder]
+        assert not offending, (rule, offending, text)
 
 
 def test_an_unknown_rule_is_not_invented() -> None:
