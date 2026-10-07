@@ -11,6 +11,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+from typing import Final
 
 import pytest
 
@@ -61,17 +62,53 @@ def test_the_table_explains_nothing_that_cannot_happen() -> None:
     assert set(guidance.GUIDANCE) - rules == set()
 
 
+#: Telling a receptionist to repair an identifier, in the forms Spanish offers.
+#: Matching on a verb list is weaker than it looks -- a model that writes
+#: "ajuste el número" would pass a test that only knows "corrija" -- so the list
+#: covers the stems, and the positive assertion below is what carries the
+#: guarantee: the action must say NOT to invent or alter the value.
+_REPAIR_VERBS: Final = (
+    "corrij",  # corrija, corríjalo, corrijan
+    "corrig",  # corrige, corregir, corregido
+    "arregl",  # arregle, arreglar
+    "ajust",  # ajuste, ajustar
+    "modific",  # modifique, modificar
+    "complet",  # "complete el número" -- inventing the missing digits
+    "repar",  # repare, reparar
+)
+
+#: What a safe action says instead. One of these must appear, so the test fails
+#: on wording that merely avoids the forbidden verbs without warning anybody.
+_DO_NOT_INVENT: Final = (
+    "no invente",
+    "no altere",
+    "no adivine",
+    "no lo aproxime",
+    "no modifique",
+    "no la reconstruya",
+    "no lo reconstruya",
+)
+
+
 def test_guidance_never_tells_anyone_to_repair_an_identifier() -> None:
     """The nearest valid cédula or phone number belongs to a stranger.
 
-    `normalizers.phone` refuses rather than corrects for this reason; guidance
-    that then said "fix it" would undo that in the one place a person acts.
+    `normalizers.phone` refuses rather than corrects for this reason, and
+    guidance that then said "fix it" would undo that in the one place a person
+    acts on it. Both halves are asserted: no repair verb, and an explicit
+    warning not to invent the value.
+
+    Locale-independent by construction -- it reads whatever wording the
+    guidance layer produced rather than assuming a language. With no provider
+    configured that is the written Spanish table, which is what CI runs.
     """
     for rule in ("phone.not_assigned", "document_number.scientific_notation"):
         explanation = guidance.explain(rule)
-        assert explanation is not None
+        assert explanation is not None, rule
         text = f"{explanation.means} {explanation.action}".lower()
-        assert "corrija" not in text and "corríjalo" not in text, (rule, text)
+        offending = [v for v in _REPAIR_VERBS if v in text]
+        assert not offending, (rule, offending, text)
+        assert any(w in text for w in _DO_NOT_INVENT), (rule, text)
 
 
 def test_an_unknown_rule_is_not_invented() -> None:
