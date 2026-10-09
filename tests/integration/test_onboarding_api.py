@@ -779,7 +779,11 @@ async def test_a_third_differently_structured_file_imports(scoped: TestClient, s
     # failure this milestone exists to prevent. Each file's expected total is
     # named, and what landed is checked against the field it belongs in.
     assert committed == {
-        "1_clean_ips.xlsx": 12,
+        # 15, not 12: the three appointments on the Citas sheet now book
+        # through the scheduling engine. Until M2 they staged and validated
+        # but were not written, because an appointment needs the booking
+        # transaction that makes double-booking impossible.
+        "1_clean_ips.xlsx": 15,
         # 3, not 2: the last row of that file ends after the name, leaving its
         # optional columns absent rather than wrong. A blank optional cell used
         # to hold the whole patient back, which is a value the clinic never
@@ -2268,13 +2272,12 @@ async def test_a_lone_profile_of_another_kind_is_not_borrowed(scoped: TestClient
 async def test_a_sheet_of_visits_imports_its_patients_and_stages_its_appointments(
     scoped: TestClient, session
 ) -> None:  # type: ignore[no-untyped-def]
-    """One row per visit: the patients are written, the appointments are staged.
+    """One row per visit: each line yields a patient and an appointment.
 
     The columns belonging to the other entity used to be dropped on the floor.
-    Now each line yields a patient and an appointment. Only the patients are
-    written -- an appointment needs M2's booking transaction, so it stages and
-    validates exactly as it does on a dedicated appointments sheet -- and the
-    commit says so rather than counting them as imported.
+    The patients are written. The appointments are recognised and checked, and
+    here they cannot be created because this sheet names no doctor -- the
+    commit says which rows and why, rather than counting them as imported.
     """
     from sqlalchemy import func, select
 
@@ -2306,10 +2309,12 @@ async def test_a_sheet_of_visits_imports_its_patients_and_stages_its_appointment
     written = await session.scalar(select(func.count()).select_from(Patient))
     assert written - before == 2, "the patients on a visits sheet were not written"
 
-    # The appointments were recognised and checked, and said so rather than
-    # being counted as imported.
+    # The appointments were recognised and checked. They name no doctor, so
+    # they cannot be booked, and each row is reported with that reason rather
+    # than being silently dropped or counted as imported.
     conflicts = " ".join(committed.json()["conflicts"])
-    assert "booking transaction" in conflicts, committed.json()
+    assert "names a doctor" in conflicts, committed.json()
+    assert "Row 2" in conflicts and "Row 3" in conflicts, committed.json()
 
 
 async def test_a_file_with_one_bad_row_imports_the_rest(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
@@ -2382,3 +2387,144 @@ async def test_a_mostly_broken_file_is_still_refused(scoped: TestClient, session
     # The status code is not the guarantee: a commit that wrote the three good
     # rows and then answered 409 would satisfy it.
     assert await _patient_count(session, scoped) == before
+
+
+# ------------------------------------- the M1 promise, closed by M2
+async def test_an_appointments_sheet_now_books_through_the_scheduling_engine(
+    scoped: TestClient, session
+) -> None:  # type: ignore[no-untyped-def]
+    """The deferral M1 shipped with: appointments staged, waiting for M2.
+
+    They now go through `booking.book`, never a plain insert, so an import
+    cannot create the overlap the exclusion constraint exists to prevent. This
+    imports patients and doctors first, then an appointments sheet naming them,
+    and asserts rows land in `appointments`.
+    """
+    from sqlalchemy import func, select
+
+    from src.scheduling.models import Appointment
+
+    people = (
+        b"TIPO DOC;IDENTIFICACION;NOMBRES;APELLIDOS;CELULAR\n"
+        b"CC;1088001;Ana;Perez Gomez;3101234567\n"
+        b"CC;1088002;Luis;Gomez Ruiz;3109876543\n"
+    )
+    first = _upload_bytes(scoped, "pacientes.csv", people)
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/validate")
+    assert scoped.post(f"/onboarding/uploads/{first['session_id']}/commit").status_code == 200
+
+    doctors = b"CODIGO;PROFESIONAL;ESPECIALIDAD\nM01;Patricia Gomez;Ortopedia\n"
+    second = _upload_bytes(scoped, "medicos.csv", doctors)
+    scoped.post(f"/onboarding/uploads/{second['session_id']}/validate")
+    assert scoped.post(f"/onboarding/uploads/{second['session_id']}/commit").status_code == 200
+
+    visits = (
+        b"DOCUMENTO PACIENTE;PROFESIONAL;FECHA CITA;HORA;ESTADO\n"
+        b"1088001;M01;2027-03-15;09:00;confirmada\n"
+        b"1088002;M01;2027-03-15;10:00;confirmada\n"
+    )
+    third = _upload_bytes(scoped, "citas.csv", visits)
+    report = scoped.post(f"/onboarding/uploads/{third['session_id']}/validate").json()
+    assert report["can_commit"], report["blocking"]
+
+    committed = scoped.post(f"/onboarding/uploads/{third['session_id']}/commit")
+    assert committed.status_code == 200, committed.text
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    booked = await session.scalar(select(func.count()).select_from(Appointment))
+    assert booked == 2, committed.json()
+
+
+async def test_an_import_cannot_double_book_a_doctor(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
+    """Two rows for one doctor at one time: the second is reported, not forced.
+
+    A spreadsheet has nothing stopping a clinic recording the same hour twice.
+    Writing both would put the database in a state the exclusion constraint
+    exists to prevent, so the import takes the first and names the second
+    rather than dropping it silently.
+    """
+    from sqlalchemy import func, select
+
+    from src.scheduling.models import Appointment
+
+    people = b"TIPO DOC;IDENTIFICACION;NOMBRES;APELLIDOS\nCC;1099001;Ana;Perez Gomez\n"
+    first = _upload_bytes(scoped, "pacientes.csv", people)
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/validate")
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/commit")
+
+    doctors = b"CODIGO;PROFESIONAL;ESPECIALIDAD\nM01;Patricia Gomez;Ortopedia\n"
+    second = _upload_bytes(scoped, "medicos.csv", doctors)
+    scoped.post(f"/onboarding/uploads/{second['session_id']}/validate")
+    scoped.post(f"/onboarding/uploads/{second['session_id']}/commit")
+
+    clashing = (
+        b"DOCUMENTO PACIENTE;PROFESIONAL;FECHA CITA;HORA\n"
+        b"1099001;M01;2027-04-01;09:00\n"
+        b"1099001;M01;2027-04-01;09:00\n"
+    )
+    third = _upload_bytes(scoped, "citas.csv", clashing)
+    scoped.post(f"/onboarding/uploads/{third['session_id']}/validate")
+    committed = scoped.post(f"/onboarding/uploads/{third['session_id']}/commit")
+    assert committed.status_code == 200, committed.text
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    booked = await session.scalar(select(func.count()).select_from(Appointment))
+    assert booked == 1, "the overlap must not have been written"
+    conflicts = " ".join(committed.json()["conflicts"])
+    assert "already has an appointment" in conflicts, committed.json()
+    assert "Row 3" in conflicts, committed.json()
+
+
+async def test_an_availability_sheet_now_writes_its_rules(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
+    """The other half of the M1 deferral.
+
+    Availability waited on the location a rule applies to, which a spreadsheet
+    never carries. A clinic with exactly one location has no ambiguity, so the
+    rules import and the scheduling engine can compute slots from them.
+    """
+    from sqlalchemy import func, select
+
+    from src.scheduling.models import AvailabilityRule
+
+    doctors = b"CODIGO;PROFESIONAL;ESPECIALIDAD\nM01;Patricia Gomez;Ortopedia\n"
+    first = _upload_bytes(scoped, "medicos.csv", doctors)
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/validate")
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/commit")
+
+    hours = b"PROFESIONAL;DIA;HORA INICIO;HORA FIN\nM01;lunes;08:00;12:00\nM01;martes;08:00;12:00\n"
+    second = _upload_bytes(scoped, "horarios.csv", hours)
+    scoped.post(f"/onboarding/uploads/{second['session_id']}/validate")
+    committed = scoped.post(f"/onboarding/uploads/{second['session_id']}/commit")
+    assert committed.status_code == 200, committed.text
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    rules = await session.scalar(select(func.count()).select_from(AvailabilityRule))
+    assert rules == 2, committed.json()
+
+
+async def test_re_importing_the_same_hours_does_not_duplicate_them(
+    scoped: TestClient, session
+) -> None:  # type: ignore[no-untyped-def]
+    """A doctor's Tuesday recorded twice would be counted twice by the engine."""
+    from sqlalchemy import func, select
+
+    from src.scheduling.models import AvailabilityRule
+
+    doctors = b"CODIGO;PROFESIONAL;ESPECIALIDAD\nM01;Patricia Gomez;Ortopedia\n"
+    first = _upload_bytes(scoped, "medicos.csv", doctors)
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/validate")
+    scoped.post(f"/onboarding/uploads/{first['session_id']}/commit")
+
+    hours = b"PROFESIONAL;DIA;HORA INICIO;HORA FIN\nM01;lunes;08:00;12:00\n"
+    for name in ("horarios.csv", "horarios-again.csv"):
+        body = _upload_bytes(scoped, name, hours)
+        scoped.post(f"/onboarding/uploads/{body['session_id']}/validate")
+        assert scoped.post(f"/onboarding/uploads/{body['session_id']}/commit").status_code == 200
+
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=_clinic_of(scoped)))
+    rules = await session.scalar(select(func.count()).select_from(AvailabilityRule))
+    assert rules == 1, "the second import must not have duplicated the rule"

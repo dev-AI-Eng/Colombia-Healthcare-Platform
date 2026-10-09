@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from sqlalchemy import delete, select
+from sqlalchemy import func as sa_func
+from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AccessAction
@@ -40,7 +42,15 @@ from src.onboarding.canonical import Entity
 from src.onboarding.matcher import normalize_header
 from src.onboarding.models import ImportProfile, ImportSession, StagingRow, TransformLogEntry
 from src.onboarding.service import RowResult
-from src.registry.models import Doctor, DocumentType, Patient, Specialty
+from src.registry.models import Doctor, DocumentType, Location, Patient, Specialty
+from src.scheduling import booking
+from src.scheduling.models import (
+    ACTIVE_STATUSES,
+    Appointment,
+    AppointmentStatus,
+    AppointmentType,
+    AvailabilityRule,
+)
 
 
 def header_fingerprint(headers: tuple[str, ...], entity: str) -> str:
@@ -390,32 +400,9 @@ async def apply_rows(
         case Entity.DOCTOR:
             return await _apply_doctors(session, clinic_id=clinic_id, rows=rows)
         case Entity.APPOINTMENT:
-            # An appointment written as a plain insert goes around the exclusion
-            # constraint that prevents double-booking, so it needs the scheduling
-            # engine's booking transaction (M2) rather than this path.
-            return ApplyResult(
-                skipped=len(rows),
-                conflicts=(
-                    "appointment rows are staged but not applied: they need the "
-                    "scheduling engine's booking transaction (M2).",
-                ),
-            )
+            return await _apply_appointments(session, clinic_id=clinic_id, rows=rows)
         case _:
-            # Availability is a plain insert -- `availability_rules` has only
-            # CHECK constraints, so no booking transaction is involved. What
-            # blocks it is `location_id`, which is NOT NULL on the model and has
-            # no canonical field feeding it: a rule has to say which sede it
-            # applies to, and whether a clinic has one location or several is an
-            # open question with the client. Staged and validated meanwhile, so
-            # the rows and their refusals are visible.
-            return ApplyResult(
-                skipped=len(rows),
-                conflicts=(
-                    f"{entity.value} rows are staged and validated but not applied: "
-                    "each rule needs the location it applies to, which this export "
-                    "does not carry.",
-                ),
-            )
+            return await _apply_availability(session, clinic_id=clinic_id, rows=rows)
 
 
 async def _apply_patients(
@@ -746,3 +733,307 @@ def _jsonable(value: Any) -> Any:
     if hasattr(value, "given_names"):
         return {"given_names": value.given_names, "family_names": value.family_names}
     return str(value)
+
+
+async def _sole_location(session: AsyncSession, *, clinic_id: uuid.UUID) -> uuid.UUID | None:
+    """The clinic's location, when it has exactly one.
+
+    A spreadsheet never says which sede a doctor works at, and the column does
+    not exist to carry it. For a single-site clinic the answer is not
+    ambiguous, so the rows import. For a clinic with several, guessing would
+    put a doctor's whole week at the wrong address, and for one with none there
+    is nothing to point at -- both refuse and say so.
+    """
+    found = (
+        await session.scalars(select(Location.id).where(Location.clinic_id == clinic_id).limit(2))
+    ).all()
+    return found[0] if len(found) == 1 else None
+
+
+async def _default_appointment_type(
+    session: AsyncSession, *, clinic_id: uuid.UUID
+) -> AppointmentType | None:
+    """The appointment type to book imported rows against.
+
+    An export says what kind of consultation it was in its own words
+    ("Primera vez", "Control"), not how long it lasts, and the duration is what
+    `during` needs. The clinic's own catalogue is the only place that knows, so
+    a matching type is used where the name lines up and the shortest configured
+    type otherwise -- an imported appointment occupying less time than it
+    really did can be corrected, whereas one occupying more would block a slot
+    that is actually free.
+    """
+    types = (
+        await session.scalars(
+            select(AppointmentType)
+            .where(AppointmentType.clinic_id == clinic_id)
+            .order_by(AppointmentType.duration_minutes)
+        )
+    ).all()
+    return types[0] if types else None
+
+
+def _appointment_status(raw: object) -> AppointmentStatus:
+    """The status an imported row lands in.
+
+    Anything the normalizers could not place has already been sent to review,
+    so a value arriving here is one of ours. `hold` is never imported: a hold
+    is a live offer with an expiry, and a row from a spreadsheet is not one.
+    """
+    try:
+        status = AppointmentStatus(str(raw))
+    except ValueError:
+        return AppointmentStatus.SCHEDULED
+    return AppointmentStatus.SCHEDULED if status is AppointmentStatus.HOLD else status
+
+
+async def _apply_appointments(
+    session: AsyncSession, *, clinic_id: uuid.UUID, rows: list[RowResult]
+) -> ApplyResult:
+    """Write staged appointments through the booking transaction.
+
+    Never a plain insert. `booking.book` is what works with the exclusion
+    constraint, so an import cannot create the overlap the constraint exists to
+    prevent -- which is exactly why these rows waited for M2.
+
+    A row whose time is already taken is reported, not forced. Two appointments
+    in a clinic's own export can genuinely overlap, because the spreadsheet had
+    nothing stopping them, and the honest outcome is to import what fits and
+    name what did not.
+    """
+    location_id = await _sole_location(session, clinic_id=clinic_id)
+    if location_id is None:
+        return ApplyResult(
+            skipped=len(rows),
+            conflicts=(
+                "appointment rows were not applied: the clinic must have exactly one "
+                "location for an import to know where they happen.",
+            ),
+        )
+    appointment_type = await _default_appointment_type(session, clinic_id=clinic_id)
+    if appointment_type is None:
+        return ApplyResult(
+            skipped=len(rows),
+            conflicts=(
+                "appointment rows were not applied: the clinic has no appointment type, "
+                "so there is no duration to book them for.",
+            ),
+        )
+
+    doctors = {
+        value: row_id
+        for row_id, external_ref, full_name in (
+            await session.execute(
+                select(Doctor.id, Doctor.external_ref, Doctor.full_name).where(
+                    Doctor.clinic_id == clinic_id
+                )
+            )
+        ).all()
+        for value in (external_ref, full_name)
+        if value
+    }
+    patients = {
+        bidx: patient_id
+        for patient_id, bidx in (
+            await session.execute(
+                select(Patient.id, Patient.document_number_bidx).where(
+                    Patient.clinic_id == clinic_id, Patient.deleted_at.is_(None)
+                )
+            )
+        ).all()
+    }
+
+    # What the clinic already holds, so re-importing the same export does not
+    # record every visit twice. Keyed on the doctor and the start, which is
+    # what identifies an appointment in a file that carries no stable id --
+    # `external_ref` is optional and most exports omit it.
+    already = {
+        (row_doctor, row_start)
+        for row_doctor, row_start in (
+            await session.execute(
+                select(Appointment.doctor_id, sa_func.lower(Appointment.during)).where(
+                    Appointment.clinic_id == clinic_id
+                )
+            )
+        ).all()
+    }
+
+    created = skipped = 0
+    conflicts: list[str] = []
+    duration = dt.timedelta(minutes=appointment_type.duration_minutes)
+
+    for row in rows:
+        if row.status.value != "valid":
+            skipped += 1
+            continue
+        values = row.values
+        doctor_id = doctors.get(str(values.get("doctor_ref") or ""))
+        document = values.get("patient_document")
+        patient_id = patients.get(blind_index(str(document))) if document else None
+        on_date = values.get("appointment_date")
+        at_time = values.get("appointment_time")
+
+        if doctor_id is None or patient_id is None or on_date is None or at_time is None:
+            skipped += 1
+            conflicts.append(
+                f"Row {row.row_number}: the appointment names a doctor, patient, date or "
+                "time this clinic does not have."
+            )
+            continue
+
+        start = dt.datetime.combine(on_date, at_time, tzinfo=BOGOTA)
+        status = _appointment_status(values.get("status"))
+
+        if (doctor_id, start) in already:
+            # Either the clinic already holds it, or the file lists it twice.
+            # Both are duplicates rather than clashes, and both are reported:
+            # a row that vanishes without a word is how an import quietly
+            # loses data nobody notices.
+            skipped += 1
+            conflicts.append(
+                f"Row {row.row_number}: that doctor already has an appointment at "
+                f"{start:%d/%m/%Y %H:%M}, so this row was not imported again."
+            )
+            continue
+
+        if status not in ACTIVE_STATUSES:
+            # A completed, cancelled or missed appointment is history, not a
+            # claim on the doctor's time: it sits outside the exclusion
+            # constraint, so two of them may share an hour and neither blocks a
+            # live booking. It is written directly, because the booking
+            # transaction exists to arbitrate time nobody is claiming here.
+            session.add(
+                Appointment(
+                    clinic_id=clinic_id,
+                    patient_id=patient_id,
+                    doctor_id=doctor_id,
+                    location_id=location_id,
+                    appointment_type_id=appointment_type.id,
+                    during=Range(start, start + duration),
+                    status=status,
+                    consultation_type=str(consultation)
+                    if (consultation := values.get("consultation_type"))
+                    else None,
+                    source=str(origin) if (origin := values.get("source")) else None,
+                    cancellation_reason=str(why)
+                    if (why := values.get("cancellation_reason"))
+                    else None,
+                    external_ref=str(ref) if (ref := values.get("external_ref")) else None,
+                )
+            )
+            await session.flush()
+            already.add((doctor_id, start))
+            created += 1
+            continue
+
+        result = await booking.book(
+            session,
+            clinic_id=clinic_id,
+            patient_id=patient_id,
+            doctor_id=doctor_id,
+            location_id=location_id,
+            appointment_type_id=appointment_type.id,
+            start=start,
+            end=start + duration,
+            status=status,
+        )
+        if result.ok:
+            already.add((doctor_id, start))
+            created += 1
+        else:
+            skipped += 1
+            conflicts.append(
+                f"Row {row.row_number}: {start:%d/%m/%Y %H:%M} is already taken for that "
+                "doctor, so the appointment was not created."
+            )
+
+    return ApplyResult(created=created, skipped=skipped, conflicts=tuple(conflicts))
+
+
+async def _apply_availability(
+    session: AsyncSession, *, clinic_id: uuid.UUID, rows: list[RowResult]
+) -> ApplyResult:
+    """Write staged availability rules.
+
+    A plain insert: `availability_rules` carries only CHECK constraints, so no
+    booking transaction is involved. What held these back was the location,
+    which `_sole_location` now answers for a single-site clinic.
+
+    A rule the clinic already has is left alone rather than duplicated. The
+    same export is often re-imported, and a doctor with the same Tuesday window
+    recorded twice would have it counted twice by anything reading the rules.
+    """
+    location_id = await _sole_location(session, clinic_id=clinic_id)
+    if location_id is None:
+        return ApplyResult(
+            skipped=len(rows),
+            conflicts=(
+                "availability rows were not applied: the clinic must have exactly one "
+                "location for a rule to say where it applies.",
+            ),
+        )
+
+    doctors = {
+        value: row_id
+        for row_id, external_ref, full_name in (
+            await session.execute(
+                select(Doctor.id, Doctor.external_ref, Doctor.full_name).where(
+                    Doctor.clinic_id == clinic_id
+                )
+            )
+        ).all()
+        for value in (external_ref, full_name)
+        if value
+    }
+    existing = {
+        (rule.doctor_id, rule.weekday, rule.start_time, rule.end_time)
+        for rule in (
+            await session.scalars(
+                select(AvailabilityRule).where(AvailabilityRule.clinic_id == clinic_id)
+            )
+        ).all()
+    }
+
+    created = skipped = 0
+    conflicts: list[str] = []
+    for row in rows:
+        if row.status.value != "valid":
+            skipped += 1
+            continue
+        values = row.values
+        doctor_id = doctors.get(str(values.get("doctor_ref") or ""))
+        weekday = values.get("weekday")
+        start_time = values.get("start_time")
+        end_time = values.get("end_time")
+
+        if doctor_id is None or weekday is None or start_time is None or end_time is None:
+            skipped += 1
+            conflicts.append(
+                f"Row {row.row_number}: the rule names a doctor this clinic does not have, "
+                "or is missing its day or hours."
+            )
+            continue
+
+        key = (doctor_id, int(weekday), start_time, end_time)
+        if key in existing:
+            skipped += 1
+            continue  # already recorded; re-importing must not duplicate it
+
+        session.add(
+            AvailabilityRule(
+                clinic_id=clinic_id,
+                doctor_id=doctor_id,
+                location_id=location_id,
+                weekday=int(weekday),
+                start_time=start_time,
+                end_time=end_time,
+                valid_from=values.get("valid_from") or dt.date.today(),
+                valid_until=values.get("valid_to"),
+            )
+        )
+        existing.add(key)
+        created += 1
+
+    if created:
+        await session.flush()
+    return ApplyResult(created=created, skipped=skipped, conflicts=tuple(conflicts))
