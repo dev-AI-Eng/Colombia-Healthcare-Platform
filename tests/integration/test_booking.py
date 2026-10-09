@@ -351,6 +351,7 @@ async def test_an_appointment_must_end_after_it_starts(session: AsyncSession) ->
 
 
 # ------------------------------------------------- the headline guarantee
+@pytest.mark.concurrency
 async def test_concurrent_bookings_through_the_service_admit_exactly_one(
     session: AsyncSession, settings: Settings
 ) -> None:

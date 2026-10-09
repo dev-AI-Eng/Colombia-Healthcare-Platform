@@ -107,6 +107,7 @@ async def test_deleted_entry_is_detected(
     assert result.first_broken_id == 3  # the entry after the gap no longer links
 
 
+@pytest.mark.concurrency
 async def test_concurrent_writers_keep_one_unbroken_chain(
     staff_context: AuditContext, settings: Settings, session: AsyncSession
 ) -> None:

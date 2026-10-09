@@ -130,3 +130,10 @@ testpaths = ["tests"]
 filterwarnings = [
     "error::DeprecationWarning:src.*",
 ]
+markers = [
+    # M2's first exit criterion, which the architecture names as a path. The
+    # tests live beside the code they cover rather than in a directory of
+    # their own, so the marker is what makes the criterion runnable on its
+    # own: `pytest -m concurrency`.
+    "concurrency: races two or more connections for the same row",
+]

@@ -90,6 +90,7 @@ async def test_availability_window_must_be_ordered(session: AsyncSession) -> Non
         await session.flush()
 
 
+@pytest.mark.concurrency
 async def test_concurrent_bookings_of_one_slot_admit_exactly_one(
     session: AsyncSession, settings: Settings
 ) -> None:
