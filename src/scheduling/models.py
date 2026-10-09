@@ -22,6 +22,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, time
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import (
     Boolean,
@@ -38,7 +39,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import TSTZRANGE, ExcludeConstraint, Range
+from sqlalchemy.dialects.postgresql import JSONB, TSTZRANGE, ExcludeConstraint, Range
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, string_enum
@@ -208,3 +209,59 @@ class Appointment(Base):
     reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     external_ref: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EscalationReason(StrEnum):
+    """Why the system handed a patient to a human.
+
+    A closed set, because an escalation queue sorted by free-form text is a
+    queue nobody triages. `no_acceptable_slot` is the scheduling one and the
+    only one M2 raises; the rest are declared here so M3's conversation graph
+    writes into the same table rather than inventing a second one.
+    """
+
+    NO_ACCEPTABLE_SLOT = "no_acceptable_slot"
+    MISSING_CONSENT = "missing_consent"
+    UNRECOGNISED_SENDER = "unrecognised_sender"
+    CLINICAL_CONCERN = "clinical_concern"
+    EVALUATOR_EXHAUSTED = "evaluator_exhausted"
+    PATIENT_ASKED_FOR_A_HUMAN = "patient_asked_for_a_human"
+
+
+class EscalationStatus(StrEnum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+
+
+class Escalation(Base):
+    """One thing a human has to deal with.
+
+    Raised when the system reaches a state it must not resolve on its own.
+    Scheduling raises exactly one kind -- no slot the patient can accept --
+    and that is PDF criterion 2 for M2: the fallback has to produce a record
+    staff can act on, not a silent dead end.
+
+    `detail_es` is Spanish because a receptionist reads it. `context` carries
+    whatever the raising code knows in machine-readable form, so a later
+    screen can show the search that failed without re-running it.
+    """
+
+    __tablename__ = "escalations"
+    __table_args__ = (
+        Index("ix_escalations_clinic_id_status", "clinic_id", "status"),
+        {"schema": "app"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
+    # Null when the sender could not be identified, which is itself a reason.
+    patient_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app.patients.id"))
+    appointment_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app.appointments.id"))
+    reason: Mapped[EscalationReason] = mapped_column(string_enum(EscalationReason, "reason_valid"))
+    status: Mapped[EscalationStatus] = mapped_column(
+        string_enum(EscalationStatus, "status_valid"), server_default=EscalationStatus.OPEN.value
+    )
+    detail_es: Mapped[str] = mapped_column(String(500))
+    context: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
