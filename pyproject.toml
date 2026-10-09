@@ -19,6 +19,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Scheduling (src/scheduling). Colombian public holidays, which close a clinic
+# and so remove a day from every doctor's availability.
+scheduling = [
+    # Ley 51 de 1983 ("Emiliani") moves most Colombian holidays to the following
+    # Monday, and which ones move is not a rule you can derive -- Reyes Magos
+    # moves, Jueves Santo does not. A maintained library tracks that; a
+    # hard-coded list is wrong the first time the rule changes.
+    "holidays>=0.60",
+]
 # Synthetic data generation (src/devdata). Not needed where real data is served.
 seed = [
     "faker>=30",
@@ -44,6 +53,7 @@ mapping = [
 dev = [
     "clinic-scheduler[seed]",
     "clinic-scheduler[mapping]",
+    "clinic-scheduler[scheduling]",
     "httpx>=0.27",
     "mypy>=1.13",
     # Stubs for the onboarding parsers, so mypy checks this code rather than
