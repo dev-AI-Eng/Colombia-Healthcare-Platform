@@ -385,3 +385,58 @@ async def test_concurrent_bookings_through_the_service_admit_exactly_one(
 
     await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
     assert await _count(session) == 1
+
+
+@pytest.mark.concurrency
+async def test_a_second_conversation_cannot_book_a_held_slot(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """ADR-17, across connections rather than within one session.
+
+    The other hold tests share a session, so they prove the service agrees
+    with itself. This proves the database does: one conversation holds a slot
+    and commits, a second connection tries to book it and is refused. That is
+    the situation the hold exists for -- minutes pass while a patient reads a
+    WhatsApp message, and another patient must not take the time meanwhile.
+    """
+    graph = await create_graph(session)
+    held = await _hold(session, graph)
+    assert held.ok
+    await session.commit()
+
+    engine = create_async_engine(settings.app_database_url, poolclass=NullPool)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as other:
+            await apply_clinic_scope(other, ClinicScope(clinic_id=graph.clinic_id))
+            attempt = await _book(other, graph)
+            assert attempt.outcome is Outcome.TAKEN, "a live hold must block another booking"
+            await other.rollback()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.concurrency
+async def test_expiry_releases_a_hold_to_another_conversation(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """The other half: once the hold lapses, the next patient can have it."""
+    graph = await create_graph(session)
+    held = await _hold(session, graph, minutes=15)  # lapses at 08:15
+    assert held.appointment is not None
+    await session.commit()
+
+    engine = create_async_engine(settings.app_database_url, poolclass=NullPool)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with maker() as other:
+            await apply_clinic_scope(other, ClinicScope(clinic_id=graph.clinic_id))
+            removed = await booking.sweep_expired_holds(
+                other, clinic_id=graph.clinic_id, now=at(5, 9)
+            )
+            assert removed == 1
+            freed = await _book(other, graph)
+            assert freed.outcome is Outcome.BOOKED, "the lapsed hold should have freed the slot"
+            await other.rollback()
+    finally:
+        await engine.dispose()
