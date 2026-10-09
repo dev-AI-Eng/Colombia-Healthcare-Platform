@@ -39,12 +39,9 @@ import datetime as dt
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import Final, Protocol
 
 from src.core.timezones import BOGOTA
-
-if TYPE_CHECKING:  # imported for types only; this module stays free of the ORM
-    pass
 
 #: How far ahead a caller may ask for slots. A request for "the next two years"
 #: is a mistake or an attack, not a scheduling question, and computing it would

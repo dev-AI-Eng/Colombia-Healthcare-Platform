@@ -12,10 +12,12 @@ should be weakened to make a change pass.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import timedelta
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -440,3 +442,29 @@ async def test_expiry_releases_a_hold_to_another_conversation(
             await other.rollback()
     finally:
         await engine.dispose()
+
+
+async def test_an_unexpected_database_error_is_not_swallowed(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a lost race and a replayed key are handled; everything else raises.
+
+    The handler matches on SQLSTATE, and a constraint violation it does not
+    recognise must reach the caller rather than being reported as TAKEN. A
+    booking that silently failed for an unrelated reason would look to a
+    conversation exactly like a slot somebody else had won.
+    """
+    graph = await create_graph(session)
+    # A foreign key that does not resolve: 23503, which is neither a lost race
+    # nor a replayed idempotency key.
+    with pytest.raises(DBAPIError):
+        await booking.book(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=uuid.uuid4(),  # no such doctor
+            location_id=graph.location_id,
+            appointment_type_id=graph.appointment_type_id,
+            start=SLOT,
+            end=SLOT + timedelta(minutes=20),
+        )

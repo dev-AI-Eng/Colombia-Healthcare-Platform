@@ -58,9 +58,6 @@ from src.scheduling.models import (
 #: from somebody else, so more is not better.
 DEFAULT_OFFER_COUNT: Final = 3
 
-#: How far ahead to look when a patient needs a new time.
-DEFAULT_SEARCH_DAYS: Final = 21
-
 
 @dataclass(frozen=True, slots=True)
 class SlotSearch:
