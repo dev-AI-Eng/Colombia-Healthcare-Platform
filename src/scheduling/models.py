@@ -215,12 +215,17 @@ class EscalationReason(StrEnum):
     """Why the system handed a patient to a human.
 
     A closed set, because an escalation queue sorted by free-form text is a
-    queue nobody triages. `no_acceptable_slot` is the scheduling one and the
-    only one M2 raises; the rest are declared here so M3's conversation graph
-    writes into the same table rather than inventing a second one.
+    queue nobody triages. M2 raises two: `no_acceptable_slot` when no slot the
+    patient can take exists, and `attendance_unrecorded` when a past
+    appointment has no outcome against it. The rest are declared here so M3's
+    conversation graph writes into the same table rather than inventing a
+    second one.
     """
 
     NO_ACCEPTABLE_SLOT = "no_acceptable_slot"
+    #: A past appointment nobody marked attended, completed or missed. The
+    #: system cannot tell which: it only knows the question was never answered.
+    ATTENDANCE_UNRECORDED = "attendance_unrecorded"
     MISSING_CONSENT = "missing_consent"
     UNRECOGNISED_SENDER = "unrecognised_sender"
     CLINICAL_CONCERN = "clinical_concern"

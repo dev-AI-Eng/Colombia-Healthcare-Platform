@@ -1,4 +1,4 @@
-"""Periodic housekeeping: expired holds, and conversation checkpoints.
+"""Periodic housekeeping: expired holds, checkpoints, reminders and attendance.
 
     python -m src.scheduling.sweeper
 
@@ -13,12 +13,13 @@ right call for the one thing that genuinely needs it: a transactional outbox,
 where a dispatch must be retried until it succeeds and must not be lost if the
 process dies mid-send. That arrives with the channel layer.
 
-What M2 actually has is two sweeps that delete rows nobody is waiting on. A
-missed run costs nothing -- the next one catches up, and neither sweep is load
-bearing, because `availability` already treats an expired hold as free and the
-retention window is measured in days. Adding a worker process, its tables and
-its migration to delete rows on a timer would be more moving parts than the
-problem has.
+What M2 actually has is four sweeps that no caller is waiting on. A missed run
+costs nothing -- the next one catches up, and none of them is load bearing:
+`availability` already treats an expired hold as free, the retention window is
+measured in days, a reminder due window is 24 hours wide, and an unrecorded
+attendance stays unrecorded until a human says otherwise. Adding a worker
+process, its tables and its migration to run four queries on a timer would be
+more moving parts than the problem has.
 
 WHAT THIS IS NOT
 ----------------
@@ -45,6 +46,7 @@ from src.core.db import configure_event_loop_policy, get_sessionmaker
 from src.core.logging import get_logger
 from src.core.tenancy import ClinicScope, apply_clinic_scope
 from src.registry.models import Clinic
+from src.scheduling import reminders
 from src.scheduling.booking import sweep_expired_holds
 
 log = get_logger(__name__)
@@ -52,17 +54,23 @@ log = get_logger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class SweepReport:
-    """What one run removed."""
+    """What one run did.
+
+    `reminders_due` is a count of work found, not work done: dispatch is M4's,
+    so this run reports what is waiting rather than claiming to have sent it.
+    """
 
     holds: int
     threads: int
     clinics: int
+    reminders_due: int = 0
+    attendance_flagged: int = 0
 
 
-async def sweep_holds_for_every_clinic(
+async def sweep_every_clinic(
     session: AsyncSession, *, now: dt.datetime
-) -> tuple[int, int]:
-    """Clear expired holds across every clinic. Returns (holds, clinics).
+) -> tuple[int, int, int, int]:
+    """Run every per-clinic sweep. Returns (holds, clinics, due, flagged).
 
     Row-level security scopes each delete to one clinic, so the clinics are
     walked rather than swept in a single statement: a job that could reach
@@ -76,11 +84,14 @@ async def sweep_holds_for_every_clinic(
     repeats it, which costs nothing -- these rows are already past their time.
     """
     clinic_ids = list((await session.scalars(select(Clinic.id))).all())
-    removed = 0
+    removed = due = flagged = 0
     for clinic_id in clinic_ids:
         await apply_clinic_scope(session, ClinicScope(clinic_id=clinic_id))
         removed += await sweep_expired_holds(session, clinic_id=clinic_id, now=now)
-    return removed, len(clinic_ids)
+        # Reported, not sent: the channel layer that could send is M4's.
+        due += len(await reminders.reminders_due(session, clinic_id=clinic_id, now=now))
+        flagged += await reminders.flag_unrecorded_attendance(session, clinic_id=clinic_id, now=now)
+    return removed, len(clinic_ids), due, flagged
 
 
 async def run_once(
@@ -93,19 +104,27 @@ async def run_once(
     )
     with audit_context(context):
         async with get_sessionmaker()() as session:
-            holds, clinics = await sweep_holds_for_every_clinic(session, now=moment)
+            holds, clinics, due, flagged = await sweep_every_clinic(session, now=moment)
             await session.commit()
 
     # Checkpoints are keyed by thread, not by clinic, and the checkpointer owns
     # its own connection; it is swept outside the ORM session for that reason.
     threads = 0 if holds_only else await sweep_expired_threads(settings)
 
-    report = SweepReport(holds=holds, threads=threads, clinics=clinics)
+    report = SweepReport(
+        holds=holds,
+        threads=threads,
+        clinics=clinics,
+        reminders_due=due,
+        attendance_flagged=flagged,
+    )
     log.info(
         "sweeper.run",
         expired_holds_removed=report.holds,
         checkpoint_threads_removed=report.threads,
         clinics=report.clinics,
+        reminders_due=report.reminders_due,
+        attendance_flagged=report.attendance_flagged,
     )
     return report
 
@@ -113,7 +132,11 @@ async def run_once(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.scheduling.sweeper",
-        description="Remove expired slot holds and conversation checkpoints past retention.",
+        description=(
+            "Clear expired slot holds and old conversation checkpoints, report the "
+            "reminders that are due, and flag past appointments whose attendance "
+            "nobody recorded."
+        ),
     )
     parser.add_argument(
         "--holds-only",
@@ -130,6 +153,11 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Removed {report.holds} expired hold(s) across {report.clinics} clinic(s) "
         f"and {report.threads} conversation thread(s) past retention."
+    )
+    print(
+        f"{report.reminders_due} reminder(s) due (dispatch arrives with the channel "
+        f"layer in M4); flagged {report.attendance_flagged} appointment(s) whose "
+        f"attendance nobody recorded."
     )
     return 0
 

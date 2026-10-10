@@ -55,8 +55,8 @@ async def test_the_sweep_removes_a_lapsed_hold(session: AsyncSession) -> None:
     graph = await create_graph(session)
     await _hold(session, graph, SLOT, minutes=15)  # lapses 08:15
 
-    removed = await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
-    assert removed == (1, 1)
+    holds, clinics, _due, _flagged = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
+    assert (holds, clinics) == (1, 1)
     assert await _count(session) == 0
 
 
@@ -65,7 +65,7 @@ async def test_the_sweep_leaves_a_live_hold_alone(session: AsyncSession) -> None
     graph = await create_graph(session)
     await _hold(session, graph, SLOT, minutes=120)  # lapses 10:00
 
-    removed, _ = await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
+    removed, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
     assert removed == 0
     assert await _count(session) == 1
 
@@ -83,7 +83,7 @@ async def test_the_sweep_never_touches_a_real_booking(session: AsyncSession) -> 
         start=SLOT,
         end=SLOT + timedelta(minutes=20),
     )
-    removed, _ = await sweeper.sweep_holds_for_every_clinic(
+    removed, *_ = await sweeper.sweep_every_clinic(
         session,
         now=at(8, 9),  # a day later
     )
@@ -96,8 +96,8 @@ async def test_running_the_sweep_twice_is_harmless(session: AsyncSession) -> Non
     graph = await create_graph(session)
     await _hold(session, graph, SLOT, minutes=15)
 
-    first, _ = await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
-    second, _ = await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
+    first, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
+    second, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
     assert (first, second) == (1, 0)
 
 
@@ -116,7 +116,7 @@ async def test_the_sweep_covers_every_clinic(session: AsyncSession) -> None:
     await _hold(session, second, SLOT, minutes=15)
     await session.commit()
 
-    removed, clinics = await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
+    removed, clinics, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
     assert clinics >= 2
     assert removed == 2, "both clinics' lapsed holds should have gone"
 
@@ -129,7 +129,7 @@ async def test_the_slot_is_bookable_again_after_a_sweep(session: AsyncSession) -
     """The visible outcome: the time a lapsed hold occupied comes back."""
     graph = await create_graph(session)
     await _hold(session, graph, SLOT, minutes=15)
-    await sweeper.sweep_holds_for_every_clinic(session, now=AFTER_THE_FIRST)
+    await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
 
     booked = await booking.book(
         session,
