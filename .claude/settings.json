@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "ClaudeInChromeDomain(localhost:8010)",
-      "ClaudeInChromeDomain(127.0.0.1:8010)"
+      "ClaudeInChromeDomain(127.0.0.1:8010)",
+      "ClaudeInChromeDomain(localhost:8000)",
+      "mcp__claude-in-chrome__tabs_create_mcp",
+      "ClaudeInChromeDomain(localhost:8020)"
     ]
   }
 }
