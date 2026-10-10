@@ -27,6 +27,12 @@ scheduling = [
     # moves, Jueves Santo does not. A maintained library tracks that; a
     # hard-coded list is wrong the first time the rule changes.
     "holidays>=0.60",
+    # The background scheduler (src/scheduling/jobs.py). Keeps its queue and its
+    # schedule in the PostgreSQL database we already run, so there is no broker
+    # to deploy, and it speaks psycopg 3, the one driver this project uses.
+    # APScheduler holds its schedule in memory unless given a store; Celery
+    # needs Redis or RabbitMQ.
+    "procrastinate>=3.10",
 ]
 # Synthetic data generation (src/devdata). Not needed where real data is served.
 seed = [
