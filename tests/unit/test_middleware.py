@@ -13,6 +13,7 @@ from src.api.middleware import (
     SecurityHeadersMiddleware,
 )
 from src.audit.context import get_context
+from src.core.config import Settings
 from src.core.ratelimit import InProcessRateLimiter
 
 
@@ -121,3 +122,73 @@ async def test_idle_keys_are_swept(monkeypatch: pytest.MonkeyPatch) -> None:
     await limiter.check("203.0.113.1")
 
     assert "198.51.100.7" not in limiter._hits
+
+
+# ------------------------------------------------- the limit the mode implies
+
+
+def test_production_gets_the_strict_limit_with_nothing_configured() -> None:
+    """What faces the network is sized for patients messaging a clinic."""
+    settings = Settings(
+        app_env="production",
+        phi_encryption_key="p" * 40,
+        phi_blind_index_key="b" * 40,
+        audit_chain_key="a" * 40,
+    )
+
+    assert settings.synthetic_data_mode is False
+    assert settings.effective_rate_limit_per_minute == Settings.PRODUCTION_RATE_LIMIT
+
+
+def test_synthetic_mode_is_not_throttled_to_the_production_number() -> None:
+    """The callers on a developer's machine are tools, not patients.
+
+    The dashboard renders server-side and makes several API calls per page, and
+    the browser test suite makes hundreds. At 60 a minute the suite answers
+    "Too many requests" and looks broken, which is what happened before this
+    existed -- the workaround was to tell whoever ran it to set an environment
+    variable, and a suite that needs production settings changed to pass is a
+    trap for the next person.
+    """
+    settings = Settings(app_env="local")
+
+    assert settings.synthetic_data_mode is True
+    assert settings.effective_rate_limit_per_minute == Settings.SYNTHETIC_RATE_LIMIT
+    assert settings.effective_rate_limit_per_minute > Settings.PRODUCTION_RATE_LIMIT
+
+
+def test_a_limit_that_is_set_wins_in_either_mode() -> None:
+    """A deployment behind a proxy pins its own number, and that is final."""
+    local = Settings(app_env="local", rate_limit_per_minute=7)
+    production = Settings(
+        app_env="production",
+        rate_limit_per_minute=7,
+        phi_encryption_key="p" * 40,
+        phi_blind_index_key="b" * 40,
+        audit_chain_key="a" * 40,
+    )
+
+    assert local.effective_rate_limit_per_minute == 7
+    assert production.effective_rate_limit_per_minute == 7
+
+
+def test_enabling_real_patient_data_restores_the_strict_limit() -> None:
+    """The gate is the data, not the environment name.
+
+    `app_env=local` with real patient data enabled is no longer a developer's
+    sandbox, so it must not keep the sandbox's limit.
+    """
+    settings = Settings(app_env="local", allow_real_patient_data=True)
+
+    assert settings.synthetic_data_mode is False
+    assert settings.effective_rate_limit_per_minute == Settings.PRODUCTION_RATE_LIMIT
+
+
+def test_synthetic_mode_still_has_a_limit() -> None:
+    """Raised, not removed: a runaway loop must still be stopped."""
+    settings = Settings(app_env="local")
+
+    assert settings.effective_rate_limit_per_minute < 1_000_000
+    with TestClient(_app(rate_limit=3)) as limited:
+        statuses = [limited.get("/thing").status_code for _ in range(5)]
+    assert 429 in statuses

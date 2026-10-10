@@ -95,7 +95,8 @@ def create_app() -> FastAPI:
 
     # add_middleware wraps previously added middleware, so the last added runs first.
     app.add_middleware(
-        RateLimitMiddleware, limiter=InProcessRateLimiter(settings.rate_limit_per_minute)
+        RateLimitMiddleware,
+        limiter=InProcessRateLimiter(settings.effective_rate_limit_per_minute),
     )
     app.add_middleware(
         BodySizeLimitMiddleware,
