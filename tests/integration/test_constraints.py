@@ -7,6 +7,7 @@ import asyncio
 from datetime import time, timedelta
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -127,3 +128,43 @@ async def test_concurrent_bookings_of_one_slot_admit_exactly_one(
 
     assert outcomes.count(None) == 1
     assert set(outcomes) - {None} <= LOST_RACE_SQLSTATES
+
+
+async def test_raw_sql_insert_cannot_double_book(session: AsyncSession) -> None:
+    """The constraint holds against SQL that never passes through the ORM.
+
+    The scope's exit criterion names "direct database inserts that bypass the
+    service layer". The ORM tests above already bypass `book()`, but they still
+    go through SQLAlchemy's mapper; this one writes the row with literal SQL, so
+    a reader does not have to trust that the mapper adds nothing. Anyone with a
+    psql prompt and the runtime role gets the same refusal.
+    """
+    graph = await create_graph(session)
+    await session.flush()
+
+    insert = text(
+        """
+        INSERT INTO app.appointments (
+            id, clinic_id, patient_id, doctor_id, location_id,
+            appointment_type_id, during, status
+        ) VALUES (
+            gen_random_uuid(), :clinic_id, :patient_id, :doctor_id, :location_id,
+            :type_id, tstzrange(:start, :end, '[)'), 'scheduled'
+        )
+        """
+    )
+    params = {
+        "clinic_id": graph.clinic_id,
+        "patient_id": graph.patient_id,
+        "doctor_id": graph.doctor_id,
+        "location_id": graph.location_id,
+        "type_id": graph.appointment_type_id,
+    }
+    start = at(5, 9)
+    await session.execute(insert, {**params, "start": start, "end": start + timedelta(minutes=20)})
+
+    overlap = start + timedelta(minutes=10)
+    with pytest.raises(IntegrityError, match="no_overlapping_active_appointments"):
+        await session.execute(
+            insert, {**params, "start": overlap, "end": overlap + timedelta(minutes=20)}
+        )
