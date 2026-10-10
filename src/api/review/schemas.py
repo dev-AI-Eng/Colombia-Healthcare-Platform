@@ -156,22 +156,37 @@ class PatientOut(BaseModel):
     email_masked: str | None
     created_at: datetime
 
+    #: False when the three identifier fields carry real values rather than
+    #: masked ones. The field names keep their `_masked` suffix because they
+    #: are a published wire contract, and renaming them would break every
+    #: existing caller; this flag is how a caller knows which it received.
+    identifiers_masked: bool = True
+
     @classmethod
-    def build(cls, patient: Patient, *, today: date) -> PatientOut:
+    def build(cls, patient: Patient, *, today: date, unmasked: bool = False) -> PatientOut:
+        """A patient, masked unless the caller is allowed otherwise.
+
+        `unmasked` defaults to False so a new route gets masking without having
+        to ask for it. Unmasking is the exception and has to be requested
+        explicitly, by a caller that has already checked the role.
+        """
         age = _age_on(patient.birth_date, today)
         return cls(
             id=patient.id,
             clinic_id=patient.clinic_id,
             document_type=patient.document_type,
-            document_number_masked=mask_tail(patient.document_number),
+            document_number_masked=(
+                patient.document_number if unmasked else mask_tail(patient.document_number)
+            ),
             given_names=patient.given_names,
             family_names=patient.family_names,
             birth_date=patient.birth_date,
             age=age,
             is_minor=None if age is None else age < 18,
-            phone_masked=mask_tail(patient.phone_e164),
-            email_masked=mask_email(patient.email),
+            phone_masked=patient.phone_e164 if unmasked else mask_tail(patient.phone_e164),
+            email_masked=patient.email if unmasked else mask_email(patient.email),
             created_at=patient.created_at,
+            identifiers_masked=not unmasked,
         )
 
 

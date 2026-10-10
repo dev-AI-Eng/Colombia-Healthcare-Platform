@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     # password: an attacker with database write access must not also hold it.
     audit_chain_key: SecretStr = SecretStr("")
 
+    # Unlocks the admin role on the review surface, which sees patient
+    # identifiers unmasked (ADR-13). Unset means no admin sign-in is possible at
+    # all, which is the right default: a deployment that forgot to configure one
+    # must not get an open door. Never written to source -- it comes from the
+    # environment, `.env`, or a file in SECRETS_DIR like every other secret.
+    review_admin_password: SecretStr = SecretStr("")
+
     # ADR-11 / ADR-15 gate. While false, only synthetic data may be processed.
     allow_real_patient_data: bool = False
 
