@@ -150,18 +150,29 @@ async def test_no_admin_password_configured_means_no_admin_sign_in(
     assert client.post("/review/session", json={"password": "cualquiera"}).status_code == 401
 
 
-def test_an_empty_password_never_matches_an_unset_one(settings: Settings) -> None:
+def test_an_empty_password_never_matches_an_unset_one(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The case that makes the unset-password guard load bearing.
 
     `compare_digest(b"", b"")` is True, so without an explicit check for an
     unset password, submitting an empty one would unlock the admin role on any
-    deployment that never configured it. The route's `min_length=1` stops an
+    deployment that never configured one. The route's `min_length=1` stops an
     empty body reaching here over HTTP, but a second caller of
     `verify_password` would not have that -- so the guard belongs in the
     function and is tested at the function.
+
+    The unset password is set up here rather than assumed from the environment.
+    An earlier version asserted that `.env` configured none, which was true
+    when it was written and false the moment a development password was added
+    for the dashboard's sign-in -- a test that reads ambient configuration
+    fails for a reason that has nothing to do with the code it guards.
     """
-    assert settings.review_admin_password.get_secret_value() == "", (
-        "this test is only meaningful with no password configured"
+    monkeypatch.setattr(
+        type(settings),
+        "review_admin_password",
+        property(lambda _self: _Secret("")),
+        raising=False,
     )
 
     assert verify_password("", settings) is False
