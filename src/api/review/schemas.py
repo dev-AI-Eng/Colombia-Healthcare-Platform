@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, time
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -23,7 +24,7 @@ from src.identity.models import Consent, PhoneBinding
 from src.identity.repository import SharedHandset
 from src.registry.models import Clinic, Doctor, Location, Patient
 from src.scheduling.models import AppointmentType, AvailabilityException, AvailabilityRule
-from src.scheduling.repository import AppointmentView
+from src.scheduling.repository import AppointmentView, EscalationView
 
 WEEKDAY_NAMES_ES = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
 
@@ -350,3 +351,49 @@ def _age_on(birth_date: date | None, today: date) -> int | None:
         return None
     before_birthday = (today.month, today.day) < (birth_date.month, birth_date.day)
     return today.year - birth_date.year - before_birthday
+
+
+class EscalationOut(BaseModel):
+    """One thing a human has to deal with.
+
+    `detail_es` is the Spanish sentence a receptionist reads and acts on; the
+    reason code is what the queue is sorted and filtered by. The patient's name
+    is shown in full, as on every other screen -- it is the document, phone and
+    email that are masked, and an escalation carries none of those.
+    """
+
+    id: uuid.UUID
+    clinic_id: uuid.UUID
+    reason: str
+    status: str
+    detail_es: str
+    context: dict[str, Any]
+    created_at: datetime
+    resolved_at: datetime | None
+    patient_id: uuid.UUID | None
+    #: None when the escalation names no patient, which is itself a reason to
+    #: escalate: somebody messaged the clinic and nobody knows who.
+    patient_name: str | None
+    appointment_id: uuid.UUID | None
+
+    @classmethod
+    def build(cls, view: EscalationView) -> EscalationOut:
+        row = view.escalation
+        name = None
+        if view.patient_given_names or view.patient_family_names:
+            name = " ".join(
+                part for part in (view.patient_given_names, view.patient_family_names) if part
+            )
+        return cls(
+            id=row.id,
+            clinic_id=row.clinic_id,
+            reason=str(row.reason),
+            status=str(row.status),
+            detail_es=row.detail_es,
+            context=dict(row.context or {}),
+            created_at=row.created_at,
+            resolved_at=row.resolved_at,
+            patient_id=row.patient_id,
+            patient_name=name,
+            appointment_id=row.appointment_id,
+        )

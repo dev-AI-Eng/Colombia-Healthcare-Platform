@@ -27,6 +27,8 @@ from src.scheduling.models import (
     AppointmentType,
     AvailabilityException,
     AvailabilityRule,
+    Escalation,
+    EscalationStatus,
 )
 
 
@@ -213,3 +215,153 @@ async def list_patient_appointments(
     views = [_to_view(row) for row in rows.all()]
     await _record_views(session, views)
     return views
+
+
+@dataclass(frozen=True, slots=True)
+class EscalationView:
+    """An escalation with the patient's name, when it has a patient.
+
+    The name is denormalised here for the same reason appointments carry it: the
+    queue is read as a list, and a screen that joined per row would issue one
+    query per line.
+    """
+
+    escalation: Escalation
+    patient_given_names: str | None
+    patient_family_names: str | None
+
+
+def _escalation_statement(clinic_id: uuid.UUID) -> Select[Any]:
+    """Open escalations first, then newest first within each status.
+
+    A receptionist works the open ones; the resolved ones are history. Patients
+    are joined outer because an escalation may have none -- an unrecognised
+    sender is itself a reason to escalate, and nobody knows who it was.
+    Soft-deleted patients are excluded from the join, as everywhere else.
+    """
+    return (
+        select(
+            Escalation,
+            Patient.given_names,
+            Patient.family_names,
+        )
+        .outerjoin(
+            Patient,
+            (Patient.id == Escalation.patient_id) & Patient.deleted_at.is_(None),
+        )
+        .where(Escalation.clinic_id == clinic_id)
+        .order_by(
+            # `open` sorts before `resolved` alphabetically, which is the order
+            # wanted, but relying on that would break if a status were renamed.
+            (Escalation.status != EscalationStatus.OPEN),
+            Escalation.created_at.desc(),
+            Escalation.id,
+        )
+    )
+
+
+def _to_escalation_view(row: Any) -> EscalationView:
+    escalation, given, family = row
+    return EscalationView(
+        escalation=escalation,
+        patient_given_names=given,
+        patient_family_names=family,
+    )
+
+
+async def _record_escalation_views(session: AsyncSession, views: list[EscalationView]) -> None:
+    """One audit entry per escalation that names a patient.
+
+    An escalation row carries a patient's name and the reason a human is needed,
+    so reading the queue is reading patient data. Rows with no patient are not
+    patient data and are not recorded as such.
+    """
+    accesses = [
+        Access(
+            resource="escalations",
+            resource_id=str(view.escalation.id),
+            patient_id=view.escalation.patient_id,
+        )
+        for view in views
+        if view.escalation.patient_id is not None
+    ]
+    if accesses:
+        await record_accesses(session, AccessAction.READ, accesses)
+
+
+async def list_escalations(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    page: PageRequest,
+    status: EscalationStatus | None = None,
+) -> PageResult[EscalationView]:
+    """The queue staff work from. Open first, newest first."""
+    statement = _escalation_statement(clinic_id)
+    if status is not None:
+        statement = statement.where(Escalation.status == status)
+
+    rows, total = await fetch_page(session, statement, page)
+    views = [_to_escalation_view(row) for row in rows]
+    await _record_escalation_views(session, views)
+    return PageResult(items=views, total=total, limit=page.limit, offset=page.offset)
+
+
+async def count_open_escalations(session: AsyncSession, *, clinic_id: uuid.UUID) -> int:
+    """How many things are waiting for a person. For a badge, so no names load."""
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(Escalation)
+            .where(
+                Escalation.clinic_id == clinic_id,
+                Escalation.status == EscalationStatus.OPEN,
+            )
+        )
+    ) or 0
+
+
+async def resolve_escalation(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    escalation_id: uuid.UUID,
+    now: datetime,
+) -> EscalationView | None:
+    """Mark one escalation dealt with. Returns None if there is nothing open.
+
+    Resolving is the only change a human can make to the row: it is never
+    deleted, so nothing leaves the queue without a record of who closed it and
+    when. Re-resolving an already-resolved row returns None rather than moving
+    `resolved_at`, because the first person dealt with it and that is the time
+    that matters.
+    """
+    escalation = await session.scalar(
+        select(Escalation).where(
+            Escalation.id == escalation_id,
+            Escalation.clinic_id == clinic_id,
+            Escalation.status == EscalationStatus.OPEN,
+        )
+    )
+    if escalation is None:
+        return None
+
+    escalation.status = EscalationStatus.RESOLVED
+    escalation.resolved_at = now
+    await record_access(
+        session,
+        AccessAction.UPDATE,
+        Access(
+            resource="escalations",
+            resource_id=str(escalation.id),
+            patient_id=escalation.patient_id,
+        ),
+    )
+    await session.flush()
+
+    row = (
+        await session.execute(
+            _escalation_statement(clinic_id).where(Escalation.id == escalation_id)
+        )
+    ).first()
+    return None if row is None else _to_escalation_view(row)

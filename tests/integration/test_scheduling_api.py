@@ -19,7 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.models import AccessLogEntry
 from src.core.tenancy import ClinicScope, apply_clinic_scope
-from src.scheduling.models import Appointment, AppointmentStatus
+from src.scheduling.models import (
+    Appointment,
+    AppointmentStatus,
+    Escalation,
+    EscalationReason,
+    EscalationStatus,
+)
 from tests.integration.factories import Graph, appointment, at, create_graph, scope_client
 
 #: Well clear of the seeded data, on a Tuesday.
@@ -411,3 +417,118 @@ async def test_a_write_route_renders_before_the_scope_is_cleared(
         "Committing before the read should clear the clinic scope and hide the "
         "row. It did not, so this test no longer guards the ordering."
     )
+
+
+# ---------------------------------------------------------------- escalations
+
+
+async def _escalate(
+    session: AsyncSession, graph: Graph, *, detail: str = "No hay citas disponibles."
+) -> Escalation:
+    row = Escalation(
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        reason=EscalationReason.NO_ACCEPTABLE_SLOT,
+        status=EscalationStatus.OPEN,
+        detail_es=detail,
+        context={},
+    )
+    session.add(row)
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
+    return row
+
+
+async def test_the_queue_lists_an_open_escalation_with_its_spanish_message(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    """What a receptionist reads. The Spanish sentence is the actionable part."""
+    client, graph = scoped
+    await _escalate(session, graph, detail="No hay citas disponibles esta semana.")
+
+    body = client.get("/review/escalations").json()
+
+    assert body["total"] == 1
+    (row,) = body["items"]
+    assert row["status"] == "open"
+    assert row["reason"] == EscalationReason.NO_ACCEPTABLE_SLOT
+    assert row["detail_es"] == "No hay citas disponibles esta semana."
+    assert row["patient_name"], "a receptionist needs to know who it is about"
+
+
+async def test_resolving_an_escalation_closes_it_and_records_when(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    client, graph = scoped
+    row = await _escalate(session, graph)
+
+    resolved = client.post(f"/review/escalations/{row.id}/resolve")
+
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["status"] == "resolved"
+    assert body["resolved_at"] is not None
+
+
+async def test_an_escalation_is_never_deleted_by_resolving_it(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    """Nothing leaves the queue without a record of who closed it and when."""
+    client, graph = scoped
+    row = await _escalate(session, graph)
+
+    client.post(f"/review/escalations/{row.id}/resolve")
+
+    still_there = client.get("/review/escalations").json()
+    assert still_there["total"] == 1
+    assert still_there["items"][0]["status"] == "resolved"
+
+
+async def test_resolving_the_same_escalation_twice_answers_404(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    """The first person dealt with it; that is the time that matters."""
+    client, graph = scoped
+    row = await _escalate(session, graph)
+
+    first = client.post(f"/review/escalations/{row.id}/resolve")
+    second = client.post(f"/review/escalations/{row.id}/resolve")
+
+    assert first.status_code == 200
+    assert second.status_code == 404, second.text
+
+
+async def test_the_queue_can_be_filtered_to_what_is_still_open(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    client, graph = scoped
+    done = await _escalate(session, graph, detail="Ya resuelta.")
+    await _escalate(session, graph, detail="Todavía pendiente.")
+    client.post(f"/review/escalations/{done.id}/resolve")
+
+    open_only = client.get("/review/escalations", params={"status": "open"}).json()
+
+    assert open_only["total"] == 1
+    assert open_only["items"][0]["detail_es"] == "Todavía pendiente."
+
+
+async def test_one_clinic_cannot_resolve_another_clinics_escalation(
+    session: AsyncSession, client: TestClient
+) -> None:
+    theirs = await create_graph(session)
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=theirs.clinic_id))
+    row = await _escalate(session, theirs)
+
+    mine = await create_graph(session, name="Clínica Mía")
+    await session.commit()
+    scoped = scope_client(client, mine)
+
+    response = scoped.post(f"/review/escalations/{row.id}/resolve")
+
+    assert response.status_code == 404, response.text

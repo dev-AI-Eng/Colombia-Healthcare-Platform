@@ -37,20 +37,22 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
-from src.api.dependencies import ClinicScopeDep, SessionDep, require_found
+from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
 from src.api.review.scheduling_schemas import (
     BookIn,
     CancelIn,
     HoldIn,
     RescheduleIn,
 )
-from src.api.review.schemas import AppointmentOut
+from src.api.review.schemas import AppointmentOut, EscalationOut, Page, to_page
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, repository
 from src.scheduling.booking import BookingResult, Outcome
+from src.scheduling.models import EscalationStatus
 
 router = APIRouter()
 
@@ -291,3 +293,56 @@ async def reschedule_appointment(
         raise HTTPException(status.HTTP_409_CONFLICT, TAKEN_DETAIL)
     moved = require_found(result.appointment, "appointment")
     return await _render(session, clinic_id=scope.clinic_id, appointment_id=moved.id)
+
+
+@router.get(
+    "/escalations",
+    response_model=Page[EscalationOut],
+    summary="The queue of things a human has to deal with",
+)
+async def list_escalations(
+    session: SessionDep,
+    scope: ClinicScopeDep,
+    page: PageDep,
+    status_filter: Annotated[
+        EscalationStatus | None,
+        Query(alias="status", description="Only open ones, or only resolved ones."),
+    ] = None,
+) -> Page[EscalationOut]:
+    """Open escalations first, newest first within each status.
+
+    This is what makes M2's fallback criterion visible: when no slot satisfies a
+    patient, the request lands here rather than in a silent dead end. The
+    attendance sweep writes here too.
+    """
+    result = await repository.list_escalations(
+        session, clinic_id=scope.clinic_id, page=page, status=status_filter
+    )
+    return to_page(result, [EscalationOut.build(view) for view in result.items])
+
+
+@router.post(
+    "/escalations/{escalation_id}/resolve",
+    response_model=EscalationOut,
+    summary="Mark one escalation dealt with",
+)
+async def resolve_escalation(
+    session: SessionDep, scope: ClinicScopeDep, escalation_id: uuid.UUID
+) -> EscalationOut:
+    """Close it, recording when.
+
+    The row is never deleted, so nothing leaves the queue without a record.
+    Resolving one that is already resolved answers 404 rather than moving the
+    timestamp: the first person dealt with it, and that is the time that matters.
+    """
+    view = require_found(
+        await repository.resolve_escalation(
+            session,
+            clinic_id=scope.clinic_id,
+            escalation_id=escalation_id,
+            now=_now(),
+        ),
+        "open escalation",
+    )
+    out = EscalationOut.build(view)
+    return out
