@@ -134,6 +134,8 @@ def test_production_gets_the_strict_limit_with_nothing_configured() -> None:
         phi_encryption_key="p" * 40,
         phi_blind_index_key="b" * 40,
         audit_chain_key="a" * 40,
+        postgres_password="postgres-secret",
+        app_db_password="app-secret",
     )
 
     assert settings.synthetic_data_mode is False
@@ -166,6 +168,8 @@ def test_a_limit_that_is_set_wins_in_either_mode() -> None:
         phi_encryption_key="p" * 40,
         phi_blind_index_key="b" * 40,
         audit_chain_key="a" * 40,
+        postgres_password="postgres-secret",
+        app_db_password="app-secret",
     )
 
     assert local.effective_rate_limit_per_minute == 7
