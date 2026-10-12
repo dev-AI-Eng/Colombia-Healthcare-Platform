@@ -20,8 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.models import AccessLogEntry
 from src.core.config import Settings
+from src.core.tenancy import ClinicScope, apply_clinic_scope
 from src.registry.models import Patient
-from src.scheduling.models import AppointmentStatus, AvailabilityRule
+from src.scheduling.models import (
+    AppointmentStatus,
+    AvailabilityRule,
+    Escalation,
+    EscalationReason,
+    EscalationStatus,
+)
 from tests.integration.factories import (
     DOCUMENT,
     PHONE,
@@ -33,12 +40,32 @@ from tests.integration.factories import (
     scope_client,
 )
 
-PATIENT_DATA_ROUTES = re.compile(r"^/review/(patients|appointments|consents|phone-bindings)")
+PATIENT_DATA_ROUTES = re.compile(
+    r"^/review/(patients|appointments|consents|phone-bindings|escalations)"
+)
 
 
 async def _prepare(session: AsyncSession, client: TestClient) -> tuple[Graph, uuid.UUID]:
     graph = await create_graph(session)
     appointment_id = await add_patient_records(session, graph)
+    # One escalation, so `/review/escalations` has a row to return: the audit
+    # check below refuses to pass on an empty response, since an endpoint that
+    # returns nothing proves nothing about whether it audits.
+    session.add(
+        Escalation(
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            reason=EscalationReason.NO_ACCEPTABLE_SLOT,
+            status=EscalationStatus.OPEN,
+            detail_es="No hay citas disponibles que el paciente pueda tomar.",
+            context={},
+        )
+    )
+    # `add_patient_records` has already committed, so this needs its own commit
+    # to be visible to the TestClient, which uses a different session. The scope
+    # is transaction-local, so it is rebound afterwards for the caller.
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
     scope_client(client, graph)
     return graph, appointment_id
 

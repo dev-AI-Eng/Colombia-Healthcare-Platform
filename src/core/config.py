@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import ClassVar, Literal
 
 from psycopg.conninfo import make_conninfo
 from pydantic import Field, SecretStr, model_validator
@@ -65,10 +65,23 @@ class Settings(BaseSettings):
     # password: an attacker with database write access must not also hold it.
     audit_chain_key: SecretStr = SecretStr("")
 
+    # Unlocks the admin role on the review surface, which sees patient
+    # identifiers unmasked (ADR-13). Unset means no admin sign-in is possible at
+    # all, which is the right default: a deployment that forgot to configure one
+    # must not get an open door. Never written to source -- it comes from the
+    # environment, `.env`, or a file in SECRETS_DIR like every other secret.
+    review_admin_password: SecretStr = SecretStr("")
+
     # ADR-11 / ADR-15 gate. While false, only synthetic data may be processed.
     allow_real_patient_data: bool = False
 
-    rate_limit_per_minute: int = Field(default=60, ge=1)
+    # Per client address, over a sliding minute. Sized for patients messaging a
+    # clinic, which is what faces the network in production.
+    #
+    # `None` means "decide from the mode", which is the default: see
+    # `effective_rate_limit_per_minute`. Setting it pins the number in every
+    # mode, which is what a deployment behind a proxy wants.
+    rate_limit_per_minute: int | None = Field(default=None, ge=1)
 
     # How long a conversation's checkpoints are kept. They hold patient data, so
     # the retention sweep deletes them once a conversation has been idle this
@@ -104,6 +117,32 @@ class Settings(BaseSettings):
         see `synthetic_seeding_allowed`.
         """
         return self.app_env in ("local", "ci") and not self.allow_real_patient_data
+
+    #: Requests per minute per client address in production. Patients message a
+    #: clinic a handful of times in a conversation; a caller doing more than
+    #: this is not a patient.
+    PRODUCTION_RATE_LIMIT: ClassVar[int] = 60
+
+    #: In synthetic-data mode the callers are a developer, a browser and the
+    #: dashboard's own server, all on loopback, and one page render makes
+    #: several API calls. The production number throttles the tools rather than
+    #: protecting anything: nothing but this machine can reach the port, and
+    #: `app.py` additionally requires a loopback Host. A limit is still applied
+    #: rather than removed, so the middleware stays on the same path it takes in
+    #: production and a runaway loop still stops.
+    SYNTHETIC_RATE_LIMIT: ClassVar[int] = 6000
+
+    @property
+    def effective_rate_limit_per_minute(self) -> int:
+        """The limit to apply, from the setting or from the mode.
+
+        An explicit `RATE_LIMIT_PER_MINUTE` always wins, so a deployment can pin
+        it. With nothing set, production gets the strict number and a developer's
+        machine gets one that does not throttle the dashboard or the test suite.
+        """
+        if self.rate_limit_per_minute is not None:
+            return self.rate_limit_per_minute
+        return self.SYNTHETIC_RATE_LIMIT if self.synthetic_data_mode else self.PRODUCTION_RATE_LIMIT
 
     @property
     def synthetic_seeding_allowed(self) -> bool:

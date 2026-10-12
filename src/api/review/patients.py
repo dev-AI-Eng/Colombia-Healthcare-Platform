@@ -12,6 +12,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
+from src.api.review.auth import UNMASKED_FIELDS, RoleDep
 from src.api.review.schemas import (
     AppointmentOut,
     ConsentOut,
@@ -21,6 +22,8 @@ from src.api.review.schemas import (
     PhoneBindingOut,
     to_page,
 )
+from src.audit.context import AccessAction
+from src.audit.service import Access, record_accesses
 from src.core.timezones import BOGOTA
 from src.identity import repository as identity
 from src.registry import repository as registry
@@ -34,10 +37,39 @@ def _today() -> date:
     return datetime.now(BOGOTA).date()
 
 
+async def _record_disclosure(session: SessionDep, patients: list[uuid.UUID]) -> None:
+    """Record that full identifiers were shown to somebody.
+
+    `disclose` rather than `read`, and naming the fields, because ADR-13's
+    question is "who has seen a patient's cédula" and an ordinary read entry
+    cannot answer it -- the log would show that somebody opened the patients
+    screen, which every member of staff does.
+
+    The repository has already recorded the read itself; this is the second,
+    narrower entry that says what was uncovered.
+    """
+    if not patients:
+        return
+    await record_accesses(
+        session,
+        AccessAction.DISCLOSE,
+        [
+            Access(
+                resource="patients",
+                resource_id=str(patient_id),
+                patient_id=patient_id,
+                fields_disclosed=UNMASKED_FIELDS,
+            )
+            for patient_id in patients
+        ],
+    )
+
+
 @router.get("/patients", response_model=Page[PatientOut])
 async def list_patients(
     session: SessionDep,
     scope: ClinicScopeDep,
+    role: RoleDep,
     page: PageDep,
     phone: Annotated[
         str | None, Query(description="Exact E.164 number, for example +573001112233")
@@ -57,12 +89,21 @@ async def list_patients(
         document_number=document_number,
     )
     today = _today()
-    return to_page(result, [PatientOut.build(p, today=today) for p in result.items])
+    unmasked = role.sees_unmasked
+    if unmasked:
+        await _record_disclosure(session, [p.id for p in result.items])
+    return to_page(
+        result,
+        [PatientOut.build(p, today=today, unmasked=unmasked) for p in result.items],
+    )
 
 
 @router.get("/patients/{patient_id}", response_model=PatientDetail)
 async def get_patient(
-    session: SessionDep, scope: ClinicScopeDep, patient_id: uuid.UUID
+    session: SessionDep,
+    scope: ClinicScopeDep,
+    role: RoleDep,
+    patient_id: uuid.UUID,
 ) -> PatientDetail:
     """One patient with their consents, phone bindings and appointments."""
     patient = require_found(
@@ -78,8 +119,11 @@ async def get_patient(
     appointments = await scheduling.list_patient_appointments(
         session, clinic_id=scope.clinic_id, patient_id=patient_id
     )
+    unmasked = role.sees_unmasked
+    if unmasked:
+        await _record_disclosure(session, [patient.id])
     return PatientDetail(
-        **PatientOut.build(patient, today=_today()).model_dump(),
+        **PatientOut.build(patient, today=_today(), unmasked=unmasked).model_dump(),
         consents=[ConsentOut.build(consent) for consent in consents],
         phone_bindings=[PhoneBindingOut.build(binding) for binding in bindings],
         appointments=[AppointmentOut.build(view) for view in appointments],
