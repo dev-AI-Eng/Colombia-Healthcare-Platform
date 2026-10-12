@@ -48,9 +48,9 @@ from src.api.review.scheduling_schemas import (
     HoldIn,
     RescheduleIn,
 )
-from src.api.review.schemas import AppointmentOut, EscalationOut, Page, to_page
+from src.api.review.schemas import AppointmentOut, EscalationOut, Page, SlotOut, to_page
 from src.core.timezones import BOGOTA
-from src.scheduling import booking, repository
+from src.scheduling import booking, offers, repository
 from src.scheduling.booking import BookingResult, Outcome
 from src.scheduling.models import EscalationStatus
 
@@ -293,6 +293,72 @@ async def reschedule_appointment(
         raise HTTPException(status.HTTP_409_CONFLICT, TAKEN_DETAIL)
     moved = require_found(result.appointment, "appointment")
     return await _render(session, clinic_id=scope.clinic_id, appointment_id=moved.id)
+
+
+@router.get(
+    "/availability/slots",
+    response_model=list[SlotOut],
+    summary="The slots a doctor can actually offer",
+)
+async def find_available_slots(
+    session: SessionDep,
+    scope: ClinicScopeDep,
+    doctor_id: uuid.UUID,
+    appointment_type_id: uuid.UUID,
+    start_date: dt.date,
+    end_date: dt.date,
+    earliest: Annotated[
+        dt.time | None, Query(description="Earliest hour the patient can attend.")
+    ] = None,
+    latest: Annotated[
+        dt.time | None, Query(description="Latest hour the patient can attend.")
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+) -> list[SlotOut]:
+    """What this doctor can genuinely offer in a date range.
+
+    Computed from their weekly rules, their dated exceptions, Colombian public
+    holidays and their existing diary -- every time it is asked. Nothing is
+    stored, which is the whole of M2's availability decision: a stored slot
+    table is correct until a doctor changes their hours or a holiday is
+    declared, and then it is quietly wrong.
+
+    An empty list is a normal answer, not a failure. It is what the
+    conversation graph escalates on, and what a receptionist sees when a week
+    is full.
+    """
+    if end_date < start_date:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "La fecha final no puede ser anterior a la inicial.",
+        )
+
+    try:
+        slots = await offers.find_slots(
+            session,
+            offers.SlotSearch(
+                clinic_id=scope.clinic_id,
+                doctor_id=doctor_id,
+                appointment_type_id=appointment_type_id,
+                start_date=start_date,
+                end_date=end_date,
+                earliest=earliest,
+                latest=latest,
+                weekdays=frozenset(range(7)),
+            ),
+            now=_now(),
+            limit=limit,
+        )
+    except ValueError:
+        # The engine raises for an appointment type it cannot find, which is a
+        # programming error from its own callers but an ordinary bad id here.
+        # Answering 404 rather than letting it become a 500: the request named
+        # something that does not exist, and a screen can say so.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "No existe ese tipo de cita en esta clínica.",
+        ) from None
+    return [SlotOut.build(slot) for slot in slots]
 
 
 @router.get(

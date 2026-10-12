@@ -23,6 +23,7 @@ from src.core.timezones import BOGOTA
 from src.identity.models import Consent, PhoneBinding
 from src.identity.repository import SharedHandset
 from src.registry.models import Clinic, Doctor, Location, Patient
+from src.scheduling.availability import Slot
 from src.scheduling.models import AppointmentType, AvailabilityException, AvailabilityRule
 from src.scheduling.repository import AppointmentView, EscalationView
 
@@ -366,6 +367,29 @@ def _age_on(birth_date: date | None, today: date) -> int | None:
         return None
     before_birthday = (today.month, today.day) < (birth_date.month, birth_date.day)
     return today.year - birth_date.year - before_birthday
+
+
+class SlotOut(BaseModel):
+    """One bookable slot, computed rather than stored.
+
+    Derived from the doctor's rules, their dated exceptions, Colombian public
+    holidays and whatever already occupies their diary -- recomputed on every
+    request, so it cannot drift from reality the way a stored slot table does.
+    """
+
+    start: datetime
+    end: datetime
+    duration_minutes: int
+
+    @classmethod
+    def build(cls, slot: Slot) -> SlotOut:
+        start = slot.start.astimezone(BOGOTA)
+        end = slot.end.astimezone(BOGOTA)
+        return cls(
+            start=start,
+            end=end,
+            duration_minutes=int((end - start).total_seconds() // 60),
+        )
 
 
 class EscalationOut(BaseModel):
