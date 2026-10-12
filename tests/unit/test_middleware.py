@@ -127,9 +127,34 @@ async def test_idle_keys_are_swept(monkeypatch: pytest.MonkeyPatch) -> None:
 # ------------------------------------------------- the limit the mode implies
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let these tests see only what they pass in.
+
+    They assert what a *mode* implies with nothing configured, so ambient
+    configuration is the one thing that must not reach them. `_env_file=None`
+    alone is not enough: it stops the `.env` file, while pydantic still reads
+    the process environment, so `RATE_LIMIT_PER_MINUTE=99` in a shell made
+    three of these fail on a number nobody had written down.
+
+    Same reasoning as `test_review_access.py`. A test that passes because of
+    the developer's environment passes for the wrong reason, and fails on the
+    next machine -- which is how this file was already broken once.
+    """
+    for name in (
+        "RATE_LIMIT_PER_MINUTE",
+        "ALLOW_REAL_PATIENT_DATA",
+        "APP_ENV",
+        "POSTGRES_PASSWORD",
+        "APP_DB_PASSWORD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_production_gets_the_strict_limit_with_nothing_configured() -> None:
     """What faces the network is sized for patients messaging a clinic."""
     settings = Settings(
+        _env_file=None,
         app_env="production",
         phi_encryption_key="p" * 40,
         phi_blind_index_key="b" * 40,
@@ -152,7 +177,7 @@ def test_synthetic_mode_is_not_throttled_to_the_production_number() -> None:
     variable, and a suite that needs production settings changed to pass is a
     trap for the next person.
     """
-    settings = Settings(app_env="local")
+    settings = Settings(_env_file=None, app_env="local")
 
     assert settings.synthetic_data_mode is True
     assert settings.effective_rate_limit_per_minute == Settings.SYNTHETIC_RATE_LIMIT
@@ -161,8 +186,9 @@ def test_synthetic_mode_is_not_throttled_to_the_production_number() -> None:
 
 def test_a_limit_that_is_set_wins_in_either_mode() -> None:
     """A deployment behind a proxy pins its own number, and that is final."""
-    local = Settings(app_env="local", rate_limit_per_minute=7)
+    local = Settings(_env_file=None, app_env="local", rate_limit_per_minute=7)
     production = Settings(
+        _env_file=None,
         app_env="production",
         rate_limit_per_minute=7,
         phi_encryption_key="p" * 40,
@@ -182,7 +208,7 @@ def test_enabling_real_patient_data_restores_the_strict_limit() -> None:
     `app_env=local` with real patient data enabled is no longer a developer's
     sandbox, so it must not keep the sandbox's limit.
     """
-    settings = Settings(app_env="local", allow_real_patient_data=True)
+    settings = Settings(_env_file=None, app_env="local", allow_real_patient_data=True)
 
     assert settings.synthetic_data_mode is False
     assert settings.effective_rate_limit_per_minute == Settings.PRODUCTION_RATE_LIMIT
@@ -190,7 +216,7 @@ def test_enabling_real_patient_data_restores_the_strict_limit() -> None:
 
 def test_synthetic_mode_still_has_a_limit() -> None:
     """Raised, not removed: a runaway loop must still be stopped."""
-    settings = Settings(app_env="local")
+    settings = Settings(_env_file=None, app_env="local")
 
     assert settings.effective_rate_limit_per_minute < 1_000_000
     with TestClient(_app(rate_limit=3)) as limited:
