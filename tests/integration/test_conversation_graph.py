@@ -600,3 +600,135 @@ async def test_every_patient_read_in_a_turn_is_audited(session: AsyncSession) ->
     resources = set((await session.execute(select(AccessLogEntry.resource))).scalars().all())
     assert "patients" in resources, "the patient was read without an audit entry"
     assert "appointments" in resources, "the appointment was read without an audit entry"
+
+
+# ------------------------------------------- M3's first exit criterion, e2e
+#
+# `tests/unit/test_conversation_validator.py` proves the validator rejects
+# every fabrication at 100%. That is the criterion, but it tests the validator
+# in isolation. This proves the same thing *through the assembled graph*: a
+# generator that fabricates cannot get a message past the gate, whatever the
+# routing does. Without it, a wiring change that skipped `gate` would leave the
+# unit suite green.
+
+
+def _fabricating_generator(text: str):
+    """A generator that states a fact no tool established.
+
+    Stands in for a model inventing a date. Marked non-templated so the full
+    pipeline applies, including the model judge.
+    """
+
+    def generate(state) -> Draft:
+        return Draft(text=text, kind=MessageKind.CONFIRMATION, templated=False)
+
+    return generate
+
+
+@pytest.mark.parametrize(
+    ("label", "draft"),
+    [
+        ("an invented date", "Su cita quedó confirmada para el 30 de diciembre a las 8:00 a.m."),
+        ("an invented time", "Su cita quedó confirmada para las 4:45 p.m. con Dra. Prueba."),
+        ("an invented doctor", "Su cita quedó confirmada con Dr. Fantasma Inexistente."),
+        ("an invented room", "Su cita quedó confirmada en el consultorio 907."),
+        ("an invented phone", "Su cita quedó confirmada. Llame al 601 555 7777."),
+    ],
+)
+async def test_a_fabricating_generator_never_reaches_the_patient(
+    session: AsyncSession, label: str, draft: str
+) -> None:
+    """M3's first exit criterion, end to end.
+
+    Rev3 asks for 95% of fabricated-fact cases rejected on every run. This
+    asserts that **none** of them is sent, through the real graph: the draft is
+    refused, the retry bound is spent, and what the patient receives is the
+    pre-approved static template instead.
+    """
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    deps = Dependencies(
+        session=session,
+        settings=Settings(_env_file=None),
+        generate=_fabricating_generator(draft),
+        judge=lambda text: Verdict(approved=True),  # even a permissive judge
+    )
+    result = await _run(session, graph, "Si, confirmo", deps=deps)
+
+    # The fabrication is never what goes out.
+    assert result["outbound_text"] != draft, f"{label}: a fabricated draft was sent"
+    assert result["stop"] is Stop.GATE_EXHAUSTED
+    assert result["outbound_text"] == T.STAFF_WILL_CALL
+    # Every attempt was refused, and the reason names fabrication.
+    assert all(not d.approved for d in result["drafts"])
+    assert any(f.reason.value == "fabricated_fact" for d in result["drafts"] for f in d.findings), (
+        f"{label}: refused for the wrong reason"
+    )
+    # A person is told, carrying the draft history (ADR-23).
+    assert result["escalation_id"] is not None
+
+
+async def test_the_fabrication_rejection_rate_through_the_graph_is_total(
+    session: AsyncSession,
+) -> None:
+    """Stated as a rate, so the number in the report is measured not claimed."""
+    fabrications = [
+        "Su cita es el 31 de enero a las 7:15 a.m.",
+        "Su cita es con Dr. Nadie en el consultorio 404.",
+        "Su cita dura 95 minutos. Llame al 601 555 0000.",
+    ]
+    sent = []
+    for index, draft in enumerate(fabrications):
+        # A fresh clinic and patient per iteration, not just a fresh
+        # appointment. A turn that confirms leaves the appointment `confirmed`,
+        # which `CONFIRMABLE` excludes, so the next turn takes the
+        # `no_appointment` exit and produces no draft at all -- the first
+        # version of this reported "2 of 3 reached the patient" when in truth
+        # two turns never drafted anything.
+        graph = await _clinic_with_patient(session, phone=f"+5730055500{index:02d}")
+        session.add(appointment(graph, at(3, 9, 0)))
+        await session.flush()
+
+        deps = Dependencies(
+            session=session,
+            settings=Settings(_env_file=None),
+            generate=_fabricating_generator(draft),
+            judge=lambda text: Verdict(approved=True),
+        )
+        result = await _run(
+            session, graph, "Si, confirmo", deps=deps, sender=f"+5730055500{index:02d}"
+        )
+        assert result["drafts"], f"no draft was produced for {draft!r}"
+        sent.append(result["outbound_text"])
+
+    assert all(text == T.STAFF_WILL_CALL for text in sent), (
+        f"{sum(1 for t in sent if t != T.STAFF_WILL_CALL)} of "
+        f"{len(fabrications)} fabricated drafts reached the patient"
+    )
+
+
+async def test_medical_advice_from_a_generator_is_also_refused(
+    session: AsyncSession,
+) -> None:
+    """Rule 5 through the graph. The draft states only verified facts, so stage
+    1 passes it and stage 2 is what has to catch the advice."""
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    deps = Dependencies(
+        session=session,
+        settings=Settings(_env_file=None),
+        generate=_fabricating_generator(
+            "Su cita fue confirmada. Tome dos tabletas antes de venir."
+        ),
+        judge=lambda text: Verdict(approved=True),
+    )
+    result = await _run(session, graph, "Si, confirmo", deps=deps)
+
+    assert result["outbound_text"] == T.STAFF_WILL_CALL
+    assert any(f.reason.value == "medical_advice" for d in result["drafts"] for f in d.findings), (
+        "dosage advice was not caught by the lexicon"
+    )
