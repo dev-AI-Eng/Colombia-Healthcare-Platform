@@ -147,3 +147,17 @@ def test_a_uuid_is_what_identifies_an_appointment() -> None:
     """
     signature = inspect.signature(tools.cancel_appointment)
     assert "uuid" in str(signature.parameters["appointment_id"].annotation).lower()
+
+
+def test_the_retry_budget_matches_adr_23() -> None:
+    """ADR-23 says "at most two retries", which is three compositions.
+
+    The first version counted attempts against the retry number and stopped
+    after two drafts, giving the patient one fewer chance than the contract
+    allows. It only showed up running the graph end to end, so the arithmetic
+    is pinned here where it is cheap to check.
+    """
+    from src.conversation.graph import MAX_ATTEMPTS, MAX_RETRIES
+
+    assert MAX_RETRIES == 2
+    assert MAX_ATTEMPTS == MAX_RETRIES + 1 == 3

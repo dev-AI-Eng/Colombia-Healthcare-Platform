@@ -69,7 +69,7 @@ from src.conversation.state import (
 from src.conversation.validator import Verdict, validate
 from src.core.config import Settings
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
-from src.registry.models import Clinic, Patient
+from src.registry.models import Clinic, Doctor, Patient
 from src.scheduling import offers
 from src.scheduling.models import ACTIVE_STATUSES, Appointment, EscalationReason
 
@@ -86,9 +86,16 @@ class Node(Protocol):
     ) -> Awaitable[ConversationState]: ...
 
 
-#: ADR-23. Two retries, then a pre-approved static template and a human. The
-#: counter lives in graph state so a resumed thread cannot reset it.
-MAX_ATTEMPTS: Final = 2
+#: ADR-23: "at most two retries". A retry is a *re*-draft, so the budget is one
+#: initial draft plus two more — three compositions, then the static template
+#: and a human. Named for retries rather than attempts because the first
+#: version of this counted attempts against the same number and gave the
+#: patient one fewer chance than the contract allows, which only showed up
+#: when the graph was run end to end.
+MAX_RETRIES: Final = 2
+
+#: Total compositions allowed per turn, derived rather than written twice.
+MAX_ATTEMPTS: Final = MAX_RETRIES + 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +245,12 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
     facts = await _clinic_facts(state, deps)
     intent = state["intent"]
     appointment = await _active_appointment(state, deps, patient_id)
+    if appointment is not None:
+        facts.set(
+            **await _doctor_facts(
+                deps, clinic_id=state["clinic_id"], doctor_id=appointment.doctor_id
+            )
+        )
 
     if intent in {Intent.CONFIRM, Intent.CANCEL}:
         if appointment is None:
@@ -343,6 +356,26 @@ async def _active_appointment(
             .limit(1)
         )
     ).scalar_one_or_none()
+
+
+async def _doctor_facts(
+    deps: Dependencies, *, clinic_id: uuid.UUID, doctor_id: uuid.UUID
+) -> dict[str, str | None]:
+    """The doctor's name and specialty, for the templates that state them.
+
+    Resolved here rather than returned by a tool: a tool reports what it *did*,
+    and no tool changes a doctor. Without this the confirmation template cannot
+    render — which is how it failed the first time the graph met a real
+    database, exhausting the gate on a draft that was never going to pass.
+    """
+    doctor = (
+        await deps.session.execute(
+            select(Doctor).where(Doctor.clinic_id == clinic_id, Doctor.id == doctor_id)
+        )
+    ).scalar_one_or_none()
+    if doctor is None:
+        return {}
+    return {"doctor_name": doctor.full_name, "specialty": doctor.specialty}
 
 
 def _merge(base: FactsBuilder, extra: FactsBuilder) -> VerifiedFacts:
@@ -481,7 +514,7 @@ _ESCALATION_DETAIL: Final[dict[Stop, str]] = {
     Stop.NO_SLOTS: "No hay horarios disponibles que el paciente pueda tomar.",
     Stop.CLINICAL_CONCERN: "El paciente hizo una consulta clínica por este canal.",
     Stop.ASKED_FOR_HUMAN: "El paciente pidió hablar con una persona.",
-    Stop.GATE_EXHAUSTED: "El evaluador rechazó el mensaje dos veces; no se envió nada generado.",
+    Stop.GATE_EXHAUSTED: "El evaluador rechazó el mensaje en todos los intentos; no se envió nada generado.",
     Stop.UNKNOWN_SENDER: "Número no reconocido.",
     Stop.SHARED_HANDSET: "Número compartido por varios pacientes.",
     Stop.NO_APPOINTMENT: "No hay cita activa.",
@@ -607,4 +640,4 @@ def build_graph(
     return builder.compile()
 
 
-__all__ = ["MAX_ATTEMPTS", "Dependencies", "build_graph"]
+__all__ = ["MAX_ATTEMPTS", "MAX_RETRIES", "Dependencies", "build_graph"]

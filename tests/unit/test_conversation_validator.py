@@ -284,3 +284,36 @@ def test_an_empty_fact_set_rejects_any_stated_fact() -> None:
         "Su cita es el 23 de octubre a las 10:30 a.m.", VerifiedFacts(), MessageKind.CONFIRMATION
     )
     assert not verdict.approved
+
+
+# ------------------------------------------------------- a phone is one fact
+
+
+@pytest.mark.parametrize(
+    "written",
+    [
+        "+57 601 555 0101",
+        "601 555 0101",
+        "601-555-0101",
+        "6015550101",
+    ],
+)
+def test_a_clinic_phone_resolves_however_it_is_written(written: str) -> None:
+    """The country code was reported as a fabrication until a phone was
+    matched as one token: "+57 601 555 0101" tokenised to four numbers and the
+    "57" resolved against nothing, so a correct cancellation failed the gate.
+    """
+    facts = VerifiedFacts(clinic_phone="+57 601 555 0101")
+    draft = f"Su cita fue cancelada. Llame al {written}."
+    verdict = validate(draft, facts, MessageKind.CANCELLATION)
+    assert verdict.approved, verdict.findings
+
+
+def test_a_phone_that_is_not_the_clinics_is_still_a_fabrication() -> None:
+    """The fix must not have widened the gate into accepting any number."""
+    facts = VerifiedFacts(clinic_phone="+57 601 555 0101")
+    verdict = validate(
+        "Su cita fue cancelada. Llame al +57 601 555 9999.", facts, MessageKind.CANCELLATION
+    )
+    assert not verdict.approved
+    assert Reason.FABRICATED_FACT.value in verdict.reason_codes

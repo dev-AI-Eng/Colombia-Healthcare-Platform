@@ -31,6 +31,8 @@ from typing import Final
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.audit.context import AccessAction
+from src.audit.service import Access, record_access
 from src.conversation.facts import FactsBuilder
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers
@@ -76,23 +78,71 @@ async def confirm_appointment(
     appointment_id: uuid.UUID,
     now: dt.datetime,
 ) -> ToolResult:
-    """Confirm a held appointment.
+    """Record that the patient says they will attend.
 
-    An expired hold comes back as `TAKEN` from the engine, which is reported
-    here as `ok=False` rather than raised: the patient replied too late, and
-    the conversation's answer to that is to offer again, not to show a fault.
+    Two transitions, because `hold` and `scheduled` mean different things:
+
+    A **hold** is a slot reserved while someone decides. `confirm_hold` turns
+    it into `scheduled`, which is the slot being secured — that is M2's job and
+    this defers to it rather than writing the status itself.
+
+    A **scheduled** appointment exists but nobody has said they are coming.
+    A patient replying "confirmo" is exactly that statement, so it becomes
+    `confirmed`. Nothing in M2 ever set this status; a patient's own
+    confirmation is the only thing that legitimately can, which is why it was
+    unreachable until the conversation existed.
+
+    An expired hold comes back as `TAKEN`, reported here as `ok=False` rather
+    than raised: the patient replied too late, and the answer to that is to
+    offer again, not to show a fault.
     """
-    result = await booking.confirm_hold(
-        session, clinic_id=clinic_id, appointment_id=appointment_id, now=now
-    )
-    if result.appointment is None:
-        return ToolResult(ok=False, facts=FactsBuilder(), detail="expired_or_taken")
+    from sqlalchemy import select
+
+    from src.scheduling.models import Appointment
+
+    found = (
+        await session.execute(
+            select(Appointment)
+            .where(Appointment.clinic_id == clinic_id, Appointment.id == appointment_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        raise ToolError(f"appointment {appointment_id} not found in clinic {clinic_id}")
+
+    if found.status is AppointmentStatus.HOLD:
+        result = await booking.confirm_hold(
+            session, clinic_id=clinic_id, appointment_id=appointment_id, now=now
+        )
+        if result.appointment is None:
+            return ToolResult(ok=False, facts=FactsBuilder(), detail="expired_or_taken")
+        found = result.appointment
+
+    if found.status is AppointmentStatus.SCHEDULED:
+        found.status = AppointmentStatus.CONFIRMED
+        await session.flush()
+        # Rule 8: every patient-data write is audited. `confirm_hold` records
+        # its own update; this second transition is ours, so it records its
+        # own rather than relying on the one above having covered it.
+        await record_access(
+            session,
+            AccessAction.UPDATE,
+            Access(
+                resource="appointments",
+                resource_id=str(found.id),
+                patient_id=found.patient_id,
+            ),
+        )
+    elif found.status is not AppointmentStatus.CONFIRMED:
+        # Already cancelled, attended or missed. Confirming is not possible and
+        # not an error: the graph tells the patient there is no active
+        # appointment rather than reporting a fault at them.
+        return ToolResult(ok=False, facts=FactsBuilder(), detail="not_confirmable")
 
     facts = FactsBuilder()
-    during = result.appointment.during
     facts.set(
-        appointment_starts_at=during.lower,
-        appointment_duration_minutes=_minutes(during.lower, during.upper),
+        appointment_starts_at=found.during.lower,
+        appointment_duration_minutes=_minutes(found.during.lower, found.during.upper),
     )
     return ToolResult(ok=True, facts=facts)
 

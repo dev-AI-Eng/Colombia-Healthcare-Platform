@@ -140,7 +140,13 @@ _DATE = re.compile(
     r"\b\d{1,2}/\d{1,2}/\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b"
     r"|\b\d{1,2}\s+de\s+[a-z]+\b"
 )
-#: A bare number of two or more digits: a duration, a phone, a room.
+#: A phone number written in groups, with or without a country code. Matched
+#: before bare numbers so the whole number is one token: "+57 601 555 0101"
+#: otherwise tokenises to four, and its "57" resolves against nothing — which
+#: is how a correct cancellation failed the gate the first time this ran
+#: against a real database.
+_PHONE = re.compile(r"\+?\d{2,3}[\s.\-]?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3,4}")
+#: A bare number of two or more digits: a duration, a room.
 _NUMBER = re.compile(r"\b\d{2,}\b")
 #: A capitalised run: a person, a place. Lower-cased sentence starts are not
 #: names, so the pattern requires the capital to be mid-sentence or a title.
@@ -199,6 +205,9 @@ def _fact_tokens(draft: str) -> list[str]:
     def take(pattern: re.Pattern[str], text: str) -> None:
         for match in pattern.finditer(text):
             start, end = match.span()
+            # Longest-first: a span already inside one that was taken is part
+            # of the same fact, not a second one. This is what lets a whole
+            # phone number be checked as one token rather than as its groups.
             if any(s <= start and end <= e for s, e in consumed):
                 continue
             consumed.append((start, end))
@@ -207,6 +216,7 @@ def _fact_tokens(draft: str) -> list[str]:
     take(_PROPER, draft)
     lowered = draft.casefold()
     take(_DATE, lowered)
+    take(_PHONE, lowered)
     take(_TIME, lowered)
     take(_NUMBER, lowered)
     return spans
