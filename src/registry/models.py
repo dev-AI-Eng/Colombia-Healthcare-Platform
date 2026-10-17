@@ -199,6 +199,21 @@ class Patient(Base):
     telegram_chat_id: Mapped[str | None] = mapped_column(String(64))
     # The clinic's own key for this row, so a re-import updates instead of duplicating.
     external_ref: Mapped[str | None] = mapped_column(String(64))
+    # M4, for the geographic no-show view. Taken from an onboarding import when
+    # the clinic's file carries them, and editable by staff otherwise.
+    #
+    # Two notes that are not implementation detail. Rev3 requires that
+    # collecting these is covered by the clinic's privacy notice and the
+    # patient's authorisation (Ley 1581, arts. 4(b) and 12), which is a
+    # client-side dependency rather than something code can satisfy. And the
+    # report suppresses groups below a minimum size: a no-show rate computed
+    # from three patients in one neighbourhood is both unreliable and
+    # re-identifying.
+    #
+    # The municipality is the DANE DIVIPOLA code, five digits, not a name --
+    # "Bogotá D.C." has several spellings and a code has one.
+    municipality_divipola: Mapped[str | None] = mapped_column(String(5))
+    neighborhood: Mapped[str | None] = mapped_column(String(120))
     # Soft-deletion marker. Every repository query that returns patient details
     # (registry, scheduling, identity) excludes patients where it is set.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -32,8 +32,10 @@ _TABLES = (
     "onboarding.staging_rows",
     "onboarding.import_sessions",
     "onboarding.import_profiles",
-    # Before appointments and patients: it references both.
+    # Before appointments and patients: both reference them, and TRUNCATE
+    # refuses a table that another still points at.
     "app.escalations",
+    "app.appointment_events",
     "app.appointments",
     "app.availability_exceptions",
     "app.availability_rules",

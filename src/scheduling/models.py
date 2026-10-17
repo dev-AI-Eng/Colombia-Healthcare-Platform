@@ -25,11 +25,13 @@ from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     SmallInteger,
@@ -207,6 +209,15 @@ class Appointment(Base):
     preferred_channel: Mapped[str | None] = mapped_column(String(30))
     reminder_48h_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     reminder_24h_sent: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    # M4, ADR-14: when the consultation actually happened, as against when it
+    # was booked. Recorded only when staff or the doctor press Check-in, Start
+    # or End -- Rev3 is explicit that "the system cannot detect on its own when
+    # a consultation starts or ends", so each of these is null until a person
+    # says otherwise. Reports show their coverage rather than assuming it:
+    # punctuality computed from a tenth of the rows is a number that misleads.
+    checked_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     external_ref: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -270,3 +281,73 @@ class Escalation(Base):
     context: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AppointmentEventKind(StrEnum):
+    """What happened to an appointment, as a thing that happened.
+
+    ADR-14: management reporting is computed from these rather than from
+    current status, because status alone loses the history. An appointment
+    rescheduled twice and then attended reads as `completed` today, and no
+    report built on that can tell you it was rescheduled at all -- which is
+    exactly the number a manager wants.
+
+    `OFFERED` is the one that is not a status change. Rev3 names it explicitly
+    in the funnel, and it is the denominator of the only metric that measures
+    the bot rather than the clinic: slots proposed against slots accepted.
+    """
+
+    OFFERED = "offered"
+    CONFIRMED = "confirmed"
+    RESCHEDULED = "rescheduled"
+    CANCELLED = "cancelled"
+    CHECKED_IN = "checked_in"
+    STARTED = "started"
+    COMPLETED = "completed"
+    NO_SHOW = "no_show"
+
+
+class AppointmentEvent(Base):
+    """One thing that happened to one appointment. Append-only.
+
+    Written in the same transaction as the change it records (ADR-14), so a
+    booking that commits without its event is impossible rather than unlikely:
+    the two share a transaction and either both land or neither does.
+
+    Nothing updates or deletes a row here. The migration grants the runtime
+    role INSERT and SELECT and nothing else, which is the same reasoning as the
+    audit log -- a report whose underlying events can be edited is a report
+    that proves nothing.
+
+    `actor` records who caused it, and is deliberately coarse: `patient`,
+    `staff` or `system`. A patient cancelling and a receptionist cancelling are
+    different facts about the clinic, and the funnel is misleading if they are
+    the same row. It is not a user id -- M5 brings accounts, and until then
+    there is no id to record.
+    """
+
+    __tablename__ = "appointment_events"
+    __table_args__ = (
+        Index("ix_appointment_events_clinic_id_occurred_at", "clinic_id", "occurred_at"),
+        Index("ix_appointment_events_appointment_id", "appointment_id"),
+        {"schema": "app"},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
+    appointment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.appointments.id"))
+    # Denormalised from the appointment so the funnel can group by doctor and
+    # by site without joining a table whose rows may since have changed: a
+    # doctor moved to another sede must not retroactively move their history.
+    doctor_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.doctors.id"))
+    location_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.locations.id"))
+    kind: Mapped[AppointmentEventKind] = mapped_column(
+        string_enum(AppointmentEventKind, "kind_valid")
+    )
+    actor: Mapped[str] = mapped_column(String(16))
+    # The clinic's own reason code where there is one, so the funnel can break
+    # cancellations down without re-reading the appointment.
+    reason: Mapped[str | None] = mapped_column(String(200))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
