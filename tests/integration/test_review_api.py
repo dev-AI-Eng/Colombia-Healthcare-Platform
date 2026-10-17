@@ -41,7 +41,10 @@ from tests.integration.factories import (
 )
 
 PATIENT_DATA_ROUTES = re.compile(
-    r"^/review/(patients|appointments|consents|phone-bindings|escalations)"
+    # `reports` is here because the follow-up list returns patient names, so it
+    # is a disclosure however aggregated the screen looks. Rule 8 requires the
+    # prefix added when a patient-data route arrives under a new one.
+    r"^/review/(patients|appointments|consents|phone-bindings|escalations|reports)"
 )
 
 

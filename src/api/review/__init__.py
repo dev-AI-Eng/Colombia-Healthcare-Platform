@@ -15,6 +15,7 @@ from src.api.review import (
     identity,
     patients,
     reference,
+    reporting,
     scheduling,
     session,
 )
@@ -25,7 +26,16 @@ router = APIRouter(
     tags=["review (synthetic data only)"],
     dependencies=[Depends(require_synthetic_review)],
 )
-for module in (reference, patients, identity, audit, scheduling, session, conversation):
+for module in (
+    reference,
+    patients,
+    identity,
+    audit,
+    scheduling,
+    session,
+    conversation,
+    reporting,
+):
     router.include_router(module.router)
 
 __all__ = ["router"]

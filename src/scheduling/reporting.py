@@ -39,10 +39,14 @@ from typing import Final
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.audit.context import AccessAction
+from src.audit.service import Access, record_accesses
+from src.registry.models import Doctor, Patient
 from src.scheduling.models import (
     Appointment,
     AppointmentEvent,
     AppointmentEventKind,
+    AppointmentStatus,
 )
 
 #: Below this, a geographic group is suppressed rather than published. Five is
@@ -268,3 +272,225 @@ async def summary(session: AsyncSession, filters: ReportFilter) -> Summary:
         percentages=counts.percentages(),
         cancellations=await cancellation_reasons(session, filters),
     )
+
+
+async def zones(session: AsyncSession, filters: ReportFilter) -> tuple[ZoneRow, ...]:
+    """No-show rate by municipality and neighbourhood, small groups suppressed.
+
+    Suppression happens before the rate is computed, not after: computing
+    "2 of 3 missed" and then hiding it still means the number existed in a
+    response somebody could inspect. A group below `MIN_GROUP_SIZE` gets None.
+
+    The null-zone group is returned rather than dropped. Most patients have no
+    recorded zone until a clinic's import carries one, and a clinic with no
+    zone data should see "we have no zone data" instead of an empty table that
+    reads as no no-shows.
+    """
+    statement = (
+        select(
+            Patient.municipality_divipola,
+            Patient.neighborhood,
+            func.count().label("appointments"),
+            func.count()
+            .filter(AppointmentEvent.kind == AppointmentEventKind.NO_SHOW)
+            .label("no_shows"),
+        )
+        .select_from(AppointmentEvent)
+        .join(Appointment, Appointment.id == AppointmentEvent.appointment_id)
+        .join(Patient, Patient.id == Appointment.patient_id)
+        .where(
+            AppointmentEvent.kind.in_(
+                (AppointmentEventKind.COMPLETED, AppointmentEventKind.NO_SHOW)
+            )
+        )
+        .group_by(Patient.municipality_divipola, Patient.neighborhood)
+        .order_by(func.count().desc())
+    )
+    rows = (await session.execute(_in_range(statement, filters))).all()
+
+    out: list[ZoneRow] = []
+    for municipality, neighborhood, appointments, no_shows in rows:
+        total = int(appointments)
+        suppressed = total < MIN_GROUP_SIZE
+        out.append(
+            ZoneRow(
+                municipality_divipola=municipality,
+                neighborhood=neighborhood,
+                appointments=total,
+                no_shows=int(no_shows),
+                no_show_pct=None if suppressed else _rate(int(no_shows), total),
+                suppressed=suppressed,
+            )
+        )
+    return tuple(out)
+
+
+async def punctuality(session: AsyncSession, filters: ReportFilter) -> tuple[PunctualityRow, ...]:
+    """Start delay and overrun per doctor, computed only where recorded.
+
+    Rev3: "computed only where both times were recorded, with recording
+    coverage shown". The averages use the rows that have the times; the
+    coverage counts all of them. Reporting one without the other is how a mean
+    over four appointments gets read as a fact about a doctor.
+
+    Delay is `started_at` minus the planned start, so a doctor who starts early
+    shows a negative delay rather than zero -- running ahead is information.
+    """
+    planned_start = func.lower(Appointment.during)
+    planned_end = func.upper(Appointment.during)
+    delay_minutes = func.extract("epoch", Appointment.started_at - planned_start) / 60.0
+    overrun_minutes = func.extract("epoch", Appointment.ended_at - planned_end) / 60.0
+
+    statement = (
+        select(
+            Doctor.id,
+            Doctor.full_name,
+            func.count().label("total"),
+            func.count().filter(Appointment.started_at.is_not(None)).label("recorded_start"),
+            func.count().filter(Appointment.ended_at.is_not(None)).label("recorded_end"),
+            func.avg(delay_minutes).label("mean_delay"),
+            func.avg(overrun_minutes).label("mean_overrun"),
+        )
+        .select_from(Appointment)
+        .join(Doctor, Doctor.id == Appointment.doctor_id)
+        .where(
+            Appointment.clinic_id == filters.clinic_id,
+            func.date(planned_start) >= filters.start_date,
+            func.date(planned_start) <= filters.end_date,
+        )
+        .group_by(Doctor.id, Doctor.full_name)
+        .order_by(Doctor.full_name)
+    )
+    if filters.doctor_id is not None:
+        statement = statement.where(Appointment.doctor_id == filters.doctor_id)
+    if filters.location_id is not None:
+        statement = statement.where(Appointment.location_id == filters.location_id)
+
+    rows = (await session.execute(statement)).all()
+    return tuple(
+        PunctualityRow(
+            doctor_id=doctor_id,
+            doctor_name=name,
+            total=int(total),
+            recorded_start=int(recorded_start),
+            recorded_end=int(recorded_end),
+            mean_start_delay_minutes=None if mean_delay is None else round(float(mean_delay), 1),
+            mean_overrun_minutes=None if mean_overrun is None else round(float(mean_overrun), 1),
+        )
+        for (
+            doctor_id,
+            name,
+            total,
+            recorded_start,
+            recorded_end,
+            mean_delay,
+            mean_overrun,
+        ) in rows
+    )
+
+
+#: What a patient has said about an upcoming appointment. `NO_RESPONSE` is the
+#: follow-up list: reminded, and still silent.
+RESPONSE_CONFIRMED: Final = "confirmed"
+RESPONSE_CANCELLED: Final = "cancelled"
+RESPONSE_NO_RESPONSE: Final = "no_response"
+RESPONSE_NOT_YET_REMINDED: Final = "not_yet_reminded"
+
+RESPONSES: Final[frozenset[str]] = frozenset(
+    {
+        RESPONSE_CONFIRMED,
+        RESPONSE_CANCELLED,
+        RESPONSE_NO_RESPONSE,
+        RESPONSE_NOT_YET_REMINDED,
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpRow:
+    appointment_id: uuid.UUID
+    patient_id: uuid.UUID
+    patient_name: str
+    starts_at: dt.datetime
+    doctor_name: str
+    response: str
+    reminded: bool
+
+
+def _response_of(appointment: Appointment, *, reminded: bool) -> str:
+    """A status plus the reminder flags, as one of four answers."""
+    if appointment.status is AppointmentStatus.CONFIRMED:
+        return RESPONSE_CONFIRMED
+    if appointment.status in (AppointmentStatus.CANCELLED, AppointmentStatus.RESCHEDULED):
+        return RESPONSE_CANCELLED
+    return RESPONSE_NO_RESPONSE if reminded else RESPONSE_NOT_YET_REMINDED
+
+
+async def follow_up(
+    session: AsyncSession,
+    filters: ReportFilter,
+    *,
+    response: str | None = None,
+    limit: int = 200,
+) -> tuple[FollowUpRow, ...]:
+    """Who confirmed, cancelled, or has not answered.
+
+    The third category is the point. A `scheduled` appointment means one of
+    two different things -- "we reminded them and they went quiet" or "we have
+    not reminded them yet" -- and only the first is a phone call. The reminder
+    flags separate them, which is why this report works before M4's channels
+    exist at all.
+    """
+    planned_start = func.lower(Appointment.during)
+    statement = (
+        select(Appointment, Doctor.full_name, Patient)
+        .join(Doctor, Doctor.id == Appointment.doctor_id)
+        .join(Patient, Patient.id == Appointment.patient_id)
+        .where(
+            Appointment.clinic_id == filters.clinic_id,
+            Patient.deleted_at.is_(None),
+            func.date(planned_start) >= filters.start_date,
+            func.date(planned_start) <= filters.end_date,
+        )
+        .order_by(planned_start)
+        .limit(limit)
+    )
+    if filters.doctor_id is not None:
+        statement = statement.where(Appointment.doctor_id == filters.doctor_id)
+    if filters.location_id is not None:
+        statement = statement.where(Appointment.location_id == filters.location_id)
+
+    out: list[FollowUpRow] = []
+    for appointment, doctor_name, patient in (await session.execute(statement)).all():
+        reminded = bool(appointment.reminder_48h_sent or appointment.reminder_24h_sent)
+        state = _response_of(appointment, reminded=reminded)
+        if response is not None and state != response:
+            continue
+        out.append(
+            FollowUpRow(
+                appointment_id=appointment.id,
+                patient_id=patient.id,
+                patient_name=f"{patient.given_names} {patient.family_names}".strip(),
+                starts_at=appointment.during.lower,
+                doctor_name=doctor_name,
+                response=state,
+                reminded=reminded,
+            )
+        )
+
+    # One audit entry per patient named (rule 8). This report returns patient
+    # names, so it is a disclosure however aggregated the screen looks.
+    if out:
+        await record_accesses(
+            session,
+            AccessAction.READ,
+            [
+                Access(
+                    resource="appointments",
+                    resource_id=str(row.appointment_id),
+                    patient_id=row.patient_id,
+                )
+                for row in out
+            ],
+        )
+    return tuple(out)
