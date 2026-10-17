@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 
 from src.api.dependencies import ClinicScopeDep, SessionDep, SettingsDep
 from src.conversation import templates as T
+from src.conversation.generator import generate as generate_draft
 from src.conversation.graph import Dependencies, build_graph
 from src.conversation.judge import judge as model_judge
 from src.conversation.state import ConversationState, Draft, initial
@@ -134,6 +135,29 @@ def _prototype_generator() -> Callable[[ConversationState], Draft]:
     return generate
 
 
+def _generator_for(settings: SettingsDep) -> Callable[[ConversationState], Draft]:
+    """The model generator when a key is set, the templated one otherwise.
+
+    Both are drafted from the same `verified_facts` and both face the same
+    gate; the difference is phrasing, and whether a provider is reachable.
+    Falling back rather than failing means the demo works on a machine with no
+    keys -- which is every machine running the test suite (§6) -- while a
+    configured install exercises the real generator/validator/evaluator
+    pipeline M3's deliverable names.
+
+    A generated draft is marked non-templated, so it also faces the model
+    judge; a templated one does not, because ADR-13 exempts wording a person
+    already approved.
+    """
+    if settings.openai_api_key.get_secret_value():
+
+        def model_backed(state: ConversationState) -> Draft:
+            return generate_draft(state, settings=settings)
+
+        return model_backed
+    return _prototype_generator()
+
+
 def _facts_for_display(state: ConversationState) -> dict[str, str]:
     """The verified facts, flattened for a screen.
 
@@ -186,7 +210,7 @@ async def run_turn(
         Dependencies(
             session=session,
             settings=settings,
-            generate=_prototype_generator(),
+            generate=_generator_for(settings),
             judge=judge,
         )
     )
