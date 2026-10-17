@@ -42,9 +42,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
+from src.scheduling.events import ACTOR_STAFF, record_event
 from src.scheduling.models import (
     ACTIVE_STATUSES,
     Appointment,
+    AppointmentEventKind,
     AppointmentStatus,
 )
 
@@ -351,6 +353,7 @@ async def cancel(
     clinic_id: uuid.UUID,
     appointment_id: uuid.UUID,
     reason: str | None = None,
+    actor: str = ACTOR_STAFF,
 ) -> bool:
     """Cancel a booking, freeing the doctor's time.
 
@@ -373,6 +376,15 @@ async def cancel(
     if reason:
         found.cancellation_reason = reason
     await session.flush()
+    # ADR-14, in this transaction: the event and the status change land
+    # together or not at all.
+    await record_event(
+        session,
+        appointment=found,
+        kind=AppointmentEventKind.CANCELLED,
+        actor=actor,
+        reason=reason,
+    )
     await record_access(
         session,
         AccessAction.UPDATE,
@@ -389,6 +401,7 @@ async def reschedule(
     start: dt.datetime,
     end: dt.datetime,
     idempotency_key: str | None = None,
+    actor: str = ACTOR_STAFF,
 ) -> BookingResult:
     """Move an appointment to a new time, or report the new time is taken.
 
@@ -430,6 +443,15 @@ async def reschedule(
     original.status = AppointmentStatus.RESCHEDULED
     original.expires_at = None
     await session.flush()
+    # Against the original, not the replacement: the funnel counts "this
+    # appointment was moved", and the new row's own `offered`/`confirmed`
+    # events tell the rest of the story.
+    await record_event(
+        session,
+        appointment=original,
+        kind=AppointmentEventKind.RESCHEDULED,
+        actor=actor,
+    )
     await record_access(
         session,
         AccessAction.CREATE,

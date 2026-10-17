@@ -36,7 +36,8 @@ from src.audit.service import Access, record_access
 from src.conversation.facts import FactsBuilder
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers
-from src.scheduling.models import AppointmentStatus
+from src.scheduling.events import ACTOR_PATIENT, record_event
+from src.scheduling.models import AppointmentEventKind, AppointmentStatus
 
 
 class ToolError(Exception):
@@ -121,6 +122,16 @@ async def confirm_appointment(
     if found.status is AppointmentStatus.SCHEDULED:
         found.status = AppointmentStatus.CONFIRMED
         await session.flush()
+        # ADR-14, in this transaction. `patient` because this path is only
+        # ever reached by a patient replying -- a receptionist confirming on
+        # their behalf goes through the staff route, and the funnel has to
+        # tell those apart.
+        await record_event(
+            session,
+            appointment=found,
+            kind=AppointmentEventKind.CONFIRMED,
+            actor=ACTOR_PATIENT,
+        )
         # Rule 8: every patient-data write is audited. `confirm_hold` records
         # its own update; this second transition is ours, so it records its
         # own rather than relying on the one above having covered it.
@@ -162,7 +173,15 @@ async def cancel_appointment(
     text as data.
     """
     cancelled = await booking.cancel(
-        session, clinic_id=clinic_id, appointment_id=appointment_id, reason=reason_code
+        session,
+        clinic_id=clinic_id,
+        appointment_id=appointment_id,
+        reason=reason_code,
+        # The patient asked. A receptionist cancelling on their behalf goes
+        # through the staff route, and the funnel has to tell them apart --
+        # "patients cancel 30% of appointments" and "staff cancel 30%" are
+        # different problems with different answers.
+        actor=ACTOR_PATIENT,
     )
     if not cancelled:
         # Already cancelled, or never active. Not an error: the patient's
