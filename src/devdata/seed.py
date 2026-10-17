@@ -158,7 +158,15 @@ async def seed_synthetic_data(
 
     # Foreign keys have no ORM relationships, so parents are flushed before
     # children to give the unit of work a valid insert order.
-    clinic = Clinic(name="Clínica Demo Bogotá")
+    clinic = Clinic(
+        name="Clínica Demo Bogotá",
+        # The cancellation template tells a patient which number to call, and
+        # a clinic without one cannot send it -- `render` refuses rather than
+        # printing a placeholder. Seeded so the M3 demo works from a clean
+        # install; the key is read by `conversation.graph`, and a dedicated
+        # column arrives with M4's channel layer.
+        settings={"public_phone_e164": "+57 601 555 0101"},
+    )
     session.add(clinic)
     await session.flush()
 

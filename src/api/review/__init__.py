@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 
-from src.api.review import audit, identity, patients, reference, scheduling, session
+from src.api.review import (
+    audit,
+    conversation,
+    identity,
+    patients,
+    reference,
+    scheduling,
+    session,
+)
 from src.api.review.access import require_synthetic_review
 
 router = APIRouter(
@@ -17,7 +25,7 @@ router = APIRouter(
     tags=["review (synthetic data only)"],
     dependencies=[Depends(require_synthetic_review)],
 )
-for module in (reference, patients, identity, audit, scheduling, session):
+for module in (reference, patients, identity, audit, scheduling, session, conversation):
     router.include_router(module.router)
 
 __all__ = ["router"]
