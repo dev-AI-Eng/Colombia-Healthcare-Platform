@@ -55,6 +55,8 @@ from langgraph.graph.state import CompiledStateGraph
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.audit.context import AccessAction
+from src.audit.service import Access, record_access
 from src.conversation import templates as T
 from src.conversation import tools
 from src.conversation.classify import classify_intent
@@ -69,7 +71,8 @@ from src.conversation.state import (
 from src.conversation.validator import Verdict, validate
 from src.core.config import Settings
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
-from src.registry.models import Clinic, Doctor, Patient
+from src.registry import repository as registry
+from src.registry.models import Clinic, Doctor
 from src.scheduling import offers
 from src.scheduling.models import ACTIVE_STATUSES, Appointment, EscalationReason
 
@@ -149,12 +152,17 @@ async def identify(state: ConversationState, *, deps: Dependencies) -> Conversat
             "stop": Stop.SHARED_HANDSET,
         }
 
-    patient = (
-        await deps.session.execute(select(Patient).where(Patient.id == patient_ids[0]))
-    ).scalar_one_or_none()
-    if patient is None or patient.deleted_at is not None:
-        # A binding to a soft-deleted patient is a stranger as far as this
-        # conversation goes (§7: deleted patients appear in no query).
+    # Through the repository, not a raw select: it records the access (rule 8)
+    # and excludes soft-deleted patients (§7). Reading the row directly here
+    # would disclose a patient's name to the conversation with nothing in the
+    # audit log saying so, which is the exact failure §7 warns about when it
+    # says repositories record accesses and routes never do.
+    patient = await registry.get_patient(
+        deps.session, clinic_id=state["clinic_id"], patient_id=patient_ids[0]
+    )
+    if patient is None:
+        # A binding to a patient who is gone is a stranger as far as this
+        # conversation goes.
         return {"patient": PatientContext(), "stop": Stop.UNKNOWN_SENDER}
 
     return {
@@ -342,9 +350,14 @@ async def _clinic_facts(state: ConversationState, deps: Dependencies) -> FactsBu
 async def _active_appointment(
     state: ConversationState, deps: Dependencies, patient_id: uuid.UUID
 ) -> Appointment | None:
-    """The patient's next active appointment, resolved by code not by text."""
+    """The patient's next active appointment, resolved by code not by text.
 
-    return (
+    The ORM row rather than `scheduling.repository`'s projection, because the
+    tools mutate it. That means the access is recorded here: the repository
+    functions that would have done it return a read-only view, and an
+    appointment is patient data whichever shape it arrives in (rule 8).
+    """
+    found = (
         await deps.session.execute(
             select(Appointment)
             .where(
@@ -356,6 +369,17 @@ async def _active_appointment(
             .limit(1)
         )
     ).scalar_one_or_none()
+    if found is not None:
+        await record_access(
+            deps.session,
+            AccessAction.READ,
+            Access(
+                resource="appointments",
+                resource_id=str(found.id),
+                patient_id=found.patient_id,
+            ),
+        )
+    return found
 
 
 async def _doctor_facts(

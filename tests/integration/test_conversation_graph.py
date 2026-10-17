@@ -574,3 +574,29 @@ async def test_a_clinic_without_a_phone_number_does_not_send_a_placeholder(
     )
 
     assert "�" not in (result["outbound_text"] or "")
+
+
+async def test_every_patient_read_in_a_turn_is_audited(session: AsyncSession) -> None:
+    """Rule 8, through the graph.
+
+    The graph reads a patient and an appointment on the way to a reply, and
+    both are patient data. An earlier version used raw selects for both and
+    recorded nothing, so a conversation could disclose a name with the audit
+    log silent -- exactly what §7 warns about when it says repositories record
+    accesses.
+    """
+    from src.audit.models import AccessLogEntry
+
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    await _run(session, graph, "Si, confirmo")
+
+    # Per resource, not a total. A count alone passed while the patient read
+    # bypassed the repository entirely, because the appointment read still
+    # logged and the total still rose -- so the mutation survived and the test
+    # proved nothing about the patient.
+    resources = set((await session.execute(select(AccessLogEntry.resource))).scalars().all())
+    assert "patients" in resources, "the patient was read without an audit entry"
+    assert "appointments" in resources, "the appointment was read without an audit entry"
