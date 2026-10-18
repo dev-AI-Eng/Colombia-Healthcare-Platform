@@ -13,6 +13,7 @@ from src.api.review import (
     audit,
     conversation,
     identity,
+    live,
     patients,
     reference,
     reporting,
@@ -35,6 +36,7 @@ for module in (
     session,
     conversation,
     reporting,
+    live,
 ):
     router.include_router(module.router)
 

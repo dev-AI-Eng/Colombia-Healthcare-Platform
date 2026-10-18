@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from src.api.dependencies import ClinicScopeDep, SessionDep
 from src.api.review.auth import RoleDep
+from src.api.review.live import TOPIC_APPOINTMENTS, notify
 from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
 from src.core.timezones import BOGOTA
@@ -260,6 +261,9 @@ async def record_attendance(
         raise HTTPException(_REFUSAL_STATUS[refusal], _REFUSAL_DETAIL[refusal])
 
     row = result.appointment
+    # Check-in, start, end and no-show all change what the follow-up list and
+    # the funnel show, so an open dashboard is told.
+    notify(scope.clinic_id, TOPIC_APPOINTMENTS)
     return AttendanceOut(
         appointment_id=row.id,
         status=row.status.value,

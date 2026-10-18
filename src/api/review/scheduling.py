@@ -42,6 +42,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, status
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
+from src.api.review.live import TOPIC_APPOINTMENTS, notify
 from src.api.review.scheduling_schemas import (
     BookIn,
     CancelIn,
@@ -99,6 +100,12 @@ async def _render(
         ),
         "appointment",
     )
+    # Every write route reaches here on success, so one hook covers book,
+    # hold, confirm, cancel and reschedule rather than five call sites that
+    # can drift. The notice carries no patient data -- it says "appointments
+    # changed in this clinic", and the dashboard re-fetches through the
+    # audited route.
+    notify(clinic_id, TOPIC_APPOINTMENTS)
     return AppointmentOut.build(view)
 
 
