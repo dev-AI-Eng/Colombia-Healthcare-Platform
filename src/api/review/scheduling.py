@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Awaitable
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -52,7 +53,7 @@ from src.api.review.schemas import AppointmentOut, EscalationOut, Page, SlotOut,
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers, repository
 from src.scheduling.booking import BookingResult, Outcome
-from src.scheduling.models import EscalationStatus
+from src.scheduling.models import AppointmentType, EscalationStatus
 
 router = APIRouter()
 
@@ -102,6 +103,55 @@ async def _render(
     return AppointmentOut.build(view)
 
 
+async def _attempt(call: Awaitable[BookingResult]) -> BookingResult:
+    """Run a booking call, turning an ineligible time into a 422.
+
+    QA finding 3. A time the clinic does not work is not a slot somebody else
+    took: a 409 invites the receptionist to retry, and retrying 03:00 on a
+    Sunday will fail forever. The engine's Spanish detail is what they read.
+    """
+    try:
+        return await call
+    except booking.Ineligible as ineligible:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, ineligible.detail_es
+        ) from ineligible
+
+
+async def _span(
+    session: SessionDep,
+    *,
+    appointment_type_id: uuid.UUID,
+    start: dt.datetime,
+    end: dt.datetime | None,
+    duration_minutes: int | None,
+) -> dt.datetime:
+    """The end of the requested span, from the appointment type when not given.
+
+    QA finding 3's second defect: this used `duration_minutes or 0` and never
+    loaded the appointment type, while the docstring claimed the opposite --
+    so omitting both fields produced an end equal to the start, and the type's
+    configured duration was never consulted at all.
+
+    A supplied `end` is still accepted and still checked, by
+    `booking.check_eligible`, which refuses an interval that does not match the
+    type's duration. Validating it here as well would put the rule in two
+    places and let the engine's callers past it.
+    """
+    if end is not None:
+        return end
+    if duration_minutes is not None:
+        return start + dt.timedelta(minutes=duration_minutes)
+
+    appointment_type = await session.get(AppointmentType, appointment_type_id)
+    if appointment_type is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "El tipo de cita no existe. Verifique el servicio seleccionado.",
+        )
+    return start + dt.timedelta(minutes=appointment_type.duration_minutes)
+
+
 async def _respond(
     session: SessionDep, *, clinic_id: uuid.UUID, result: BookingResult
 ) -> AppointmentOut:
@@ -131,26 +181,40 @@ async def book_appointment(
     """Write one appointment, inside the transaction the constraint guards.
 
     The end time is computed from the appointment type's duration when the body
-    does not give one, so a caller cannot book a 20-minute consultation into a
-    10-minute slot by sending its own end.
+    does not give one, and an end the caller does send is checked against that
+    duration by the engine -- so a caller cannot book a 20-minute consultation
+    into a 10-minute slot by sending its own end.
+
+    The engine also refuses a time the clinic does not work (QA finding 3),
+    which arrives here as a 422 carrying the Spanish explanation: a time
+    outside the doctor's hours is not a slot somebody else took, and a 409
+    would tell the receptionist to try again at the same hour tomorrow.
     """
-    end = body.end or body.start + dt.timedelta(minutes=body.duration_minutes or 0)
+    end = await _span(
+        session,
+        appointment_type_id=body.appointment_type_id,
+        start=body.start,
+        end=body.end,
+        duration_minutes=body.duration_minutes,
+    )
     if end <= body.start:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "The appointment must end after it starts: send `end` or `duration_minutes`.",
         )
 
-    result = await booking.book(
-        session,
-        clinic_id=scope.clinic_id,
-        patient_id=body.patient_id,
-        doctor_id=body.doctor_id,
-        location_id=body.location_id,
-        appointment_type_id=body.appointment_type_id,
-        start=body.start,
-        end=end,
-        idempotency_key=body.idempotency_key,
+    result = await _attempt(
+        booking.book(
+            session,
+            clinic_id=scope.clinic_id,
+            patient_id=body.patient_id,
+            doctor_id=body.doctor_id,
+            location_id=body.location_id,
+            appointment_type_id=body.appointment_type_id,
+            start=body.start,
+            end=end,
+            idempotency_key=body.idempotency_key,
+        )
     )
     return await _respond(session, clinic_id=scope.clinic_id, result=result)
 
@@ -169,25 +233,33 @@ async def hold_slot(session: SessionDep, scope: ClinicScopeDep, body: HoldIn) ->
     the time is genuinely the patient's. It releases itself when `expires_at`
     passes whether or not the sweeper has run.
     """
-    end = body.end or body.start + dt.timedelta(minutes=body.duration_minutes or 0)
+    end = await _span(
+        session,
+        appointment_type_id=body.appointment_type_id,
+        start=body.start,
+        end=body.end,
+        duration_minutes=body.duration_minutes,
+    )
     if end <= body.start:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "The hold must end after it starts: send `end` or `duration_minutes`.",
         )
 
-    result = await booking.hold(
-        session,
-        clinic_id=scope.clinic_id,
-        patient_id=body.patient_id,
-        doctor_id=body.doctor_id,
-        location_id=body.location_id,
-        appointment_type_id=body.appointment_type_id,
-        start=body.start,
-        end=end,
-        now=_now(),
-        minutes=body.minutes,
-        idempotency_key=body.idempotency_key,
+    result = await _attempt(
+        booking.hold(
+            session,
+            clinic_id=scope.clinic_id,
+            patient_id=body.patient_id,
+            doctor_id=body.doctor_id,
+            location_id=body.location_id,
+            appointment_type_id=body.appointment_type_id,
+            start=body.start,
+            end=end,
+            now=_now(),
+            minutes=body.minutes,
+            idempotency_key=body.idempotency_key,
+        )
     )
     return await _respond(session, clinic_id=scope.clinic_id, result=result)
 
@@ -281,13 +353,15 @@ async def reschedule_appointment(
             "The appointment must end after it starts: send `end` or `duration_minutes`.",
         )
 
-    result = await booking.reschedule(
-        session,
-        clinic_id=scope.clinic_id,
-        appointment_id=appointment_id,
-        start=body.start,
-        end=end,
-        idempotency_key=body.idempotency_key,
+    result = await _attempt(
+        booking.reschedule(
+            session,
+            clinic_id=scope.clinic_id,
+            appointment_id=appointment_id,
+            start=body.start,
+            end=end,
+            idempotency_key=body.idempotency_key,
+        )
     )
     if result.outcome is Outcome.TAKEN:
         raise HTTPException(status.HTTP_409_CONFLICT, TAKEN_DETAIL)

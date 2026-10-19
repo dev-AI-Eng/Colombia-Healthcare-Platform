@@ -46,6 +46,14 @@ def _audited(staff_context: AuditContext) -> AuditContext:
 
 
 async def _book(session: AsyncSession, graph: Graph, start=SLOT, **kwargs):  # type: ignore[no-untyped-def]
+    """Book `graph`'s slot at the same fixture moment `_hold` uses.
+
+    The clock matters since QA finding 2: `book` reclaims a hold that has
+    expired, so a helper booking at the real clock against a hold taken at
+    `at(5, 8)` would delete a hold these tests mean to be live. One moment per
+    test is also what the API does -- `_now()` is read once per request.
+    """
+    kwargs.setdefault("now", at(5, 8))
     return await booking.book(
         session,
         clinic_id=graph.clinic_id,
@@ -80,7 +88,7 @@ async def _count(session: AsyncSession) -> int:
 
 # ------------------------------------------------------------------ booking
 async def test_a_free_slot_is_booked(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     result = await _book(session, graph)
     assert result.outcome is Outcome.BOOKED
     assert result.ok
@@ -95,7 +103,7 @@ async def test_a_taken_slot_reports_taken_rather_than_raising(session: AsyncSess
     is talking to the patient, and would poison the transaction so nothing
     already written could commit.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     assert (await _book(session, graph)).outcome is Outcome.BOOKED
 
     second = await _book(session, graph, start=SLOT + timedelta(minutes=10))
@@ -111,7 +119,7 @@ async def test_the_transaction_survives_a_lost_race(session: AsyncSession) -> No
     before the attempt are lost. This books, loses a race, then books again on
     the same session.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     assert (await _book(session, graph)).outcome is Outcome.BOOKED
     assert (await _book(session, graph)).outcome is Outcome.TAKEN
 
@@ -122,7 +130,7 @@ async def test_the_transaction_survives_a_lost_race(session: AsyncSession) -> No
 
 async def test_back_to_back_appointments_both_fit(session: AsyncSession) -> None:
     """`during` is half-open, so 09:00-09:20 and 09:20-09:40 do not overlap."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     assert (await _book(session, graph)).outcome is Outcome.BOOKED
     assert (await _book(session, graph, start=SLOT + timedelta(minutes=20))).outcome is (
         Outcome.BOOKED
@@ -131,7 +139,7 @@ async def test_back_to_back_appointments_both_fit(session: AsyncSession) -> None
 
 async def test_booking_writes_exactly_one_audit_entry(session: AsyncSession) -> None:
     """Every patient-data write is audited, inside the same transaction."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     before = (await session.execute(select(func.count()).select_from(AccessLogEntry))).scalar_one()
     result = await _book(session, graph)
     after = (await session.execute(select(func.count()).select_from(AccessLogEntry))).scalar_one()
@@ -141,7 +149,7 @@ async def test_booking_writes_exactly_one_audit_entry(session: AsyncSession) -> 
 
 async def test_a_lost_race_writes_no_audit_entry(session: AsyncSession) -> None:
     """The log must not claim a booking that never happened."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _book(session, graph)
     before = (await session.execute(select(func.count()).select_from(AccessLogEntry))).scalar_one()
     assert (await _book(session, graph)).outcome is Outcome.TAKEN
@@ -152,7 +160,7 @@ async def test_a_lost_race_writes_no_audit_entry(session: AsyncSession) -> None:
 # ------------------------------------------------------------- idempotency
 async def test_a_replayed_request_returns_the_first_appointment(session: AsyncSession) -> None:
     """A redelivered webhook must not create a second booking (ADR-16)."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     first = await _book(session, graph, idempotency_key="wh-1")
     assert first.outcome is Outcome.BOOKED
 
@@ -166,20 +174,20 @@ async def test_a_replayed_request_returns_the_first_appointment(session: AsyncSe
 # -------------------------------------------------------------------- holds
 async def test_a_hold_blocks_a_booking(session: AsyncSession) -> None:
     """ADR-17: a hold and a booking share one exclusion constraint."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     assert (await _hold(session, graph)).outcome is Outcome.BOOKED
     assert (await _book(session, graph)).outcome is Outcome.TAKEN
 
 
 async def test_a_booking_blocks_a_hold(session: AsyncSession) -> None:
     """The reverse, which is the half that is easy to forget."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     assert (await _book(session, graph)).outcome is Outcome.BOOKED
     assert (await _hold(session, graph)).outcome is Outcome.TAKEN
 
 
 async def test_a_live_hold_confirms_into_a_booking(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph, minutes=15)
     assert held.appointment is not None
 
@@ -197,7 +205,7 @@ async def test_a_live_hold_confirms_into_a_booking(session: AsyncSession) -> Non
 
 async def test_an_expired_hold_cannot_be_confirmed(session: AsyncSession) -> None:
     """The time may have gone to somebody else; the flow re-offers (ADR-17)."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph, minutes=15)
     assert held.appointment is not None
 
@@ -211,7 +219,7 @@ async def test_an_expired_hold_cannot_be_confirmed(session: AsyncSession) -> Non
 
 
 async def test_releasing_a_hold_frees_the_slot(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph)
     assert held.appointment is not None
 
@@ -223,7 +231,7 @@ async def test_releasing_a_hold_frees_the_slot(session: AsyncSession) -> None:
 
 async def test_releasing_leaves_no_row_behind(session: AsyncSession) -> None:
     """An offer nobody accepted is not part of the patient's history."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph)
     assert held.appointment is not None
     await booking.release_hold(
@@ -234,7 +242,7 @@ async def test_releasing_leaves_no_row_behind(session: AsyncSession) -> None:
 
 async def test_the_sweep_removes_only_lapsed_holds(session: AsyncSession) -> None:
     """Housekeeping: a live hold and a real booking must both survive it."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _hold(session, graph, minutes=15)  # lapses 08:15
     await _hold(session, graph, start=LATER, minutes=120)  # lapses 10:00
     await _book(session, graph, start=at(5, 14))
@@ -247,7 +255,7 @@ async def test_the_sweep_removes_only_lapsed_holds(session: AsyncSession) -> Non
 # ------------------------------------------------------- cancel and reschedule
 async def test_cancelling_frees_the_time_and_keeps_the_row(session: AsyncSession) -> None:
     """History keeps the fact that an appointment existed and was cancelled."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     first = await _book(session, graph)
     assert first.appointment is not None
 
@@ -265,7 +273,7 @@ async def test_cancelling_frees_the_time_and_keeps_the_row(session: AsyncSession
 async def test_cancelling_twice_reports_the_second_as_nothing_to_do(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     first = await _book(session, graph)
     assert first.appointment is not None
     assert await booking.cancel(
@@ -279,7 +287,7 @@ async def test_cancelling_twice_reports_the_second_as_nothing_to_do(
 async def test_rescheduling_moves_the_appointment_and_links_it_back(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     first = await _book(session, graph)
     assert first.appointment is not None
 
@@ -304,7 +312,7 @@ async def test_a_failed_reschedule_leaves_the_original_untouched(
     If the new time is taken and the original has already been given up, the
     patient ends with no appointment at all.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     original = await _book(session, graph)
     blocker = await _book(session, graph, start=LATER)
     assert original.appointment is not None and blocker.appointment is not None
@@ -332,13 +340,13 @@ async def test_a_failed_reschedule_leaves_the_original_untouched(
 async def test_booking_refuses_a_status_that_is_not_a_booking(
     session: AsyncSession, kwargs: dict, message: str
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     with pytest.raises(ValueError, match=message):
         await _book(session, graph, **kwargs)
 
 
 async def test_an_appointment_must_end_after_it_starts(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     with pytest.raises(ValueError, match="must end after it starts"):
         await booking.book(
             session,
@@ -364,7 +372,7 @@ async def test_concurrent_bookings_through_the_service_admit_exactly_one(
     reschedule storm looks like: every loser must come back as TAKEN rather
     than as an exception, and exactly one appointment must exist afterwards.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await session.commit()
 
     engine = create_async_engine(settings.app_database_url, poolclass=NullPool)
@@ -401,7 +409,7 @@ async def test_a_second_conversation_cannot_book_a_held_slot(
     the situation the hold exists for -- minutes pass while a patient reads a
     WhatsApp message, and another patient must not take the time meanwhile.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph)
     assert held.ok
     await session.commit()
@@ -423,7 +431,7 @@ async def test_expiry_releases_a_hold_to_another_conversation(
     session: AsyncSession, settings: Settings
 ) -> None:
     """The other half: once the hold lapses, the next patient can have it."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     held = await _hold(session, graph, minutes=15)  # lapses at 08:15
     assert held.appointment is not None
     await session.commit()
@@ -454,17 +462,25 @@ async def test_an_unexpected_database_error_is_not_swallowed(
     booking that silently failed for an unrelated reason would look to a
     conversation exactly like a slot somebody else had won.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     # A foreign key that does not resolve: 23503, which is neither a lost race
     # nor a replayed idempotency key.
+    #
+    # The dangling id is the *patient*, not the doctor. Since QA finding 3,
+    # `check_eligible` loads the doctor's hours and the appointment type before
+    # the insert, so a nonexistent doctor is refused as ineligible and this
+    # test would never reach the SQLSTATE it is about. The patient is not part
+    # of eligibility -- whether the clinic works at that hour does not depend
+    # on who is coming -- so the insert still runs and still fails at 23503.
     with pytest.raises(DBAPIError):
         await booking.book(
             session,
             clinic_id=graph.clinic_id,
-            patient_id=graph.patient_id,
-            doctor_id=uuid.uuid4(),  # no such doctor
+            patient_id=uuid.uuid4(),  # no such patient
+            doctor_id=graph.doctor_id,
             location_id=graph.location_id,
             appointment_type_id=graph.appointment_type_id,
             start=SLOT,
             end=SLOT + timedelta(minutes=20),
+            now=at(5, 8),
         )

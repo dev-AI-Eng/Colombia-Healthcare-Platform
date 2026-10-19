@@ -23,7 +23,7 @@ LOST_RACE_SQLSTATES = {"23P01", "40P01"}
 
 
 async def test_overlapping_active_appointments_are_rejected(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add(appointment(graph, at(1, 9)))
     await session.flush()
     session.add(appointment(graph, at(1, 9, 10)))
@@ -32,13 +32,13 @@ async def test_overlapping_active_appointments_are_rejected(session: AsyncSessio
 
 
 async def test_back_to_back_appointments_are_allowed(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add_all([appointment(graph, at(1, 9)), appointment(graph, at(1, 9, 20))])
     await session.flush()
 
 
 async def test_hold_blocks_a_booking(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add(
         appointment(graph, at(1, 11), status=AppointmentStatus.HOLD, expires_at=HOLD_EXPIRY)
     )
@@ -55,27 +55,27 @@ async def test_hold_blocks_a_booking(session: AsyncSession) -> None:
 async def test_inactive_statuses_free_the_slot(
     session: AsyncSession, inactive: AppointmentStatus
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add_all([appointment(graph, at(1, 14), status=inactive), appointment(graph, at(1, 14))])
     await session.flush()
 
 
 async def test_hold_without_expiry_is_rejected(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add(appointment(graph, at(2, 9), status=AppointmentStatus.HOLD))
     with pytest.raises(IntegrityError, match="expiry_only_for_holds"):
         await session.flush()
 
 
 async def test_expiry_on_a_non_hold_is_rejected(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add(appointment(graph, at(2, 9), expires_at=HOLD_EXPIRY))
     with pytest.raises(IntegrityError, match="expiry_only_for_holds"):
         await session.flush()
 
 
 async def test_availability_window_must_be_ordered(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     session.add(
         AvailabilityRule(
             clinic_id=graph.clinic_id,
@@ -100,7 +100,7 @@ async def test_concurrent_bookings_of_one_slot_admit_exactly_one(
     Losers fail with exclusion_violation or, when their inserts wait on each
     other, deadlock_detected. Any other failure fails the test.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await session.commit()
 
     engine = create_async_engine(settings.app_database_url, poolclass=NullPool)
@@ -139,7 +139,7 @@ async def test_raw_sql_insert_cannot_double_book(session: AsyncSession) -> None:
     a reader does not have to trust that the mapper adds nothing. Anyone with a
     psql prompt and the runtime role gets the same refusal.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await session.flush()
 
     insert = text(

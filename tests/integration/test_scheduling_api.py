@@ -66,7 +66,7 @@ async def _audit_count(session: AsyncSession) -> int:
 
 @pytest.fixture
 async def scoped(session: AsyncSession, client: TestClient):  # type: ignore[no-untyped-def]
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await session.commit()
     await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
     yield scope_client(client, graph), graph
@@ -321,7 +321,7 @@ async def test_a_write_route_cannot_reach_another_clinic(
     session: AsyncSession, client: TestClient
 ) -> None:
     """Row-level security, through HTTP rather than through the engine."""
-    theirs = await create_graph(session)
+    theirs = await create_graph(session, hours=True)
     await session.commit()
     # `create_graph` leaves the scope bound to the clinic it just made, and the
     # insert needs that scope: without it row-level security refuses the write.
@@ -330,7 +330,7 @@ async def test_a_write_route_cannot_reach_another_clinic(
     session.add(their_appointment)
     await session.commit()
 
-    mine = await create_graph(session, name="Clínica Mía")
+    mine = await create_graph(session, name="Clínica Mía", hours=True)
     await session.commit()
     scoped = scope_client(client, mine)
 
@@ -520,12 +520,12 @@ async def test_the_queue_can_be_filtered_to_what_is_still_open(
 async def test_one_clinic_cannot_resolve_another_clinics_escalation(
     session: AsyncSession, client: TestClient
 ) -> None:
-    theirs = await create_graph(session)
+    theirs = await create_graph(session, hours=True)
     await session.commit()
     await apply_clinic_scope(session, ClinicScope(clinic_id=theirs.clinic_id))
     row = await _escalate(session, theirs)
 
-    mine = await create_graph(session, name="Clínica Mía")
+    mine = await create_graph(session, name="Clínica Mía", hours=True)
     await session.commit()
     scoped = scope_client(client, mine)
 

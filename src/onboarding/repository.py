@@ -936,6 +936,13 @@ async def _apply_appointments(
             start=start,
             end=start + duration,
             status=status,
+            # An import records appointments the clinic has already made, and
+            # the hours it configures here are today's. A consultation booked
+            # last March under last March's schedule is not an error to refuse
+            # -- refusing it would drop real history and leave a diary that
+            # looks emptier than the clinic's own records. QA finding 3's
+            # eligibility check is for a *new* booking; this is a transcription.
+            override_reason="imported from the clinic's own records",
         )
         if result.ok:
             already.add((doctor_id, start))
