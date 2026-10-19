@@ -179,9 +179,6 @@ async def find_slots(
         raise ValueError(f"no appointment type {search.appointment_type_id}")
 
     rules = await _load_rules(session, clinic_id=search.clinic_id, doctor_id=search.doctor_id)
-    if not rules:
-        return []  # the doctor has no schedule; nothing to offer
-
     exceptions = await _load_exceptions(
         session,
         clinic_id=search.clinic_id,
@@ -189,6 +186,15 @@ async def find_slots(
         start_date=search.start_date,
         end_date=search.end_date,
     )
+    # QA finding 8: this used to return [] on an empty rule list, before the
+    # exceptions were loaded at all. An `extra_hours` exception is a schedule
+    # in its own right -- a locum covering one Saturday, a doctor opening a
+    # clinic day that no weekly rule describes -- and it was silently ignored.
+    # `open_windows` already returns nothing when neither source offers a
+    # window, so the early exit was not needed, only early.
+    if not rules and not exceptions:
+        return []  # the doctor has no schedule at all; nothing to offer
+
     busy = await _load_busy(
         session,
         clinic_id=search.clinic_id,

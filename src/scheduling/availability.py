@@ -182,6 +182,30 @@ def _subtract(window: Window, blocks: Iterable[Window]) -> list[Window]:
     return remaining
 
 
+def _merge(windows: Sequence[Window]) -> list[Window]:
+    """Overlapping and touching windows on one day, combined into the fewest.
+
+    QA finding 7. Two rules that overlap -- a morning clinic 08:00-12:00 and a
+    "late morning" one 10:00-14:00, which is how a clinic records a schedule
+    that changed -- were each cut into slots separately, so 10:00 was offered
+    twice. The patient saw what looked like several choices and had one, and an
+    offer that tried to hold the duplicate lost to the exclusion constraint.
+
+    Touching windows merge too (12:00-14:00 after 08:00-12:00): the gap is zero
+    minutes, and treating them separately would refuse an appointment that
+    straddles noon for no reason a receptionist could explain.
+    """
+    out: list[Window] = []
+    for window in sorted(windows, key=lambda w: (w.on_date, w.start)):
+        last = out[-1] if out else None
+        if last is not None and last.on_date == window.on_date and window.start <= last.end:
+            if window.end > last.end:
+                out[-1] = Window(last.on_date, last.start, window.end)
+            continue
+        out.append(window)
+    return out
+
+
 def open_windows(
     day: dt.date,
     rules: Sequence[Rule],
@@ -221,8 +245,11 @@ def open_windows(
         for e in exceptions
         if e.on_date == day and e.kind == "unavailable" and e.start and e.end
     ]
+    # Merge before subtracting, not after: two overlapping rules would each
+    # survive an unavailable block that only partly covers them, and merging
+    # the leftovers afterwards would not recover the duplicate start times.
     out: list[Window] = []
-    for window in windows:
+    for window in _merge(windows):
         out.extend(_subtract(window, partial_blocks))
     return sorted(out, key=lambda w: w.start)
 
@@ -232,13 +259,23 @@ def free_windows(
     busy: Sequence[Busy],
     *,
     now: dt.datetime,
+    buffer_minutes: int = 0,
 ) -> list[tuple[dt.datetime, dt.datetime]]:
     """The open windows as UTC spans, with occupied time removed.
 
     Expired holds are skipped: a hold past `expires_at` releases the time
     immediately, rather than when the background sweep next runs.
+
+    `buffer_minutes` extends each occupied span forwards, which is QA finding
+    6's second half. The buffer is a gap the doctor needs *after* a
+    consultation, so it has to come out of the free time as well as out of the
+    candidate: without this, a 09:00-09:30 appointment left a free span
+    beginning at 09:30 and the next patient was offered exactly that, with no
+    turnaround. 09:40 is still offered, which is the point -- the buffer
+    removes ten minutes, not the rest of the morning.
     """
-    taken = [(b.start, b.end) for b in busy if b.occupies(now=now)]
+    pad = dt.timedelta(minutes=buffer_minutes)
+    taken = [(b.start, b.end + pad) for b in busy if b.occupies(now=now)]
     out: list[tuple[dt.datetime, dt.datetime]] = []
     for window in windows:
         parts = [window.as_instants()]
@@ -271,10 +308,17 @@ def slots_in(
     appointment with a 10-minute buffer needs 40 free minutes, or the next
     patient starts before the doctor is ready.
 
-    `step_minutes` is how far apart offered start times are, defaulting to the
-    appointment length so slots do not overlap each other. A clinic offering
-    every 15 minutes for a 30-minute appointment passes 15 and gets overlapping
-    candidates, which is correct: only one of them will survive booking.
+    `step_minutes` is how far apart offered start times are. It defaults to the
+    appointment *plus* the buffer, so consecutive offers leave the turnaround
+    the clinic asked for -- QA finding 6: defaulting to the duration alone put
+    a 30-minute appointment at 09:00, 09:30 and 10:00 with a 10-minute buffer
+    configured, which is back to back. The buffer still has to fit inside the
+    span as well, or the last appointment of the morning ends with the doctor
+    already due elsewhere.
+
+    An explicit `step_minutes` still wins. A clinic offering every 15 minutes
+    for a 30-minute appointment passes 15 and gets overlapping candidates,
+    which is correct: only one of them will survive booking.
     """
     if duration_minutes <= 0:
         raise ValueError("duration_minutes must be positive")
@@ -285,7 +329,9 @@ def slots_in(
     # loop forever, and defaulting it to the duration hides that.
     if step_minutes is not None and step_minutes <= 0:
         raise ValueError("step_minutes must be positive")
-    step = dt.timedelta(minutes=duration_minutes if step_minutes is None else step_minutes)
+    step = dt.timedelta(
+        minutes=duration_minutes + buffer_minutes if step_minutes is None else step_minutes
+    )
     needed = dt.timedelta(minutes=duration_minutes + buffer_minutes)
     appointment = dt.timedelta(minutes=duration_minutes)
 
@@ -333,7 +379,7 @@ def bookable_slots(
         windows = open_windows(day, rules, exceptions, holidays_for=holidays_for)
         if not windows:
             continue
-        spans = free_windows(windows, busy, now=now)
+        spans = free_windows(windows, busy, now=now, buffer_minutes=buffer_minutes)
         out.extend(
             slot
             for slot in slots_in(
