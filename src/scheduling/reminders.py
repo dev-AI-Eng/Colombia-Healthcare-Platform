@@ -289,7 +289,11 @@ async def flag_unrecorded_attendance(
     )
 
     raised = 0
-    flagged_patients: list[tuple[uuid.UUID, uuid.UUID | None]] = []
+    # The escalation's own id, not the appointment's: QA finding 12. The entry
+    # said resource="escalations" while carrying the appointment id, so an
+    # investigator asked to account for escalation X found no access that
+    # created it.
+    flagged: list[Escalation] = []
     for row in candidates:
         if row.id in already:
             continue
@@ -297,29 +301,30 @@ async def flag_unrecorded_attendance(
         if start is None:  # unreachable: the column is NOT NULL and bounded
             continue
         local = start.astimezone(BOGOTA)
-        session.add(
-            Escalation(
-                clinic_id=clinic_id,
-                patient_id=row.patient_id,
-                appointment_id=row.id,
-                reason=EscalationReason.ATTENDANCE_UNRECORDED,
-                status=EscalationStatus.OPEN,
-                detail_es=(
-                    f"Nadie registró si el paciente asistió a la cita del "
-                    f"{local.strftime('%d/%m/%Y')} a las "
-                    f"{local.strftime('%I:%M %p').lstrip('0').lower()}. "
-                    f"Confirme si asistió o no asistió."
-                ),
-                context={
-                    "appointment_start": start.isoformat(),
-                    "status_at_sweep": str(row.status),
-                },
-            )
+        escalation = Escalation(
+            clinic_id=clinic_id,
+            patient_id=row.patient_id,
+            appointment_id=row.id,
+            reason=EscalationReason.ATTENDANCE_UNRECORDED,
+            status=EscalationStatus.OPEN,
+            detail_es=(
+                f"Nadie registró si el paciente asistió a la cita del "
+                f"{local.strftime('%d/%m/%Y')} a las "
+                f"{local.strftime('%I:%M %p').lstrip('0').lower()}. "
+                f"Confirme si asistió o no asistió."
+            ),
+            context={
+                "appointment_start": start.isoformat(),
+                "status_at_sweep": str(row.status),
+            },
         )
-        flagged_patients.append((row.id, row.patient_id))
+        session.add(escalation)
+        flagged.append(escalation)
         raised += 1
 
     if raised:
+        # Flush first, so every escalation has the id the audit entry names.
+        await session.flush()
         # One entry per escalation actually written, taken from the loop rather
         # than recomputed from `candidates`: a filter that drifted would log an
         # access that never happened, or miss one that did.
@@ -329,10 +334,10 @@ async def flag_unrecorded_attendance(
             [
                 Access(
                     resource="escalations",
-                    resource_id=str(appointment_id),
-                    patient_id=patient_id,
+                    resource_id=str(escalation.id),
+                    patient_id=escalation.patient_id,
                 )
-                for appointment_id, patient_id in flagged_patients
+                for escalation in flagged
             ],
         )
         await session.flush()

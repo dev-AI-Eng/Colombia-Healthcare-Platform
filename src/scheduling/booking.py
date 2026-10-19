@@ -35,19 +35,24 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
+from src.core.timezones import BOGOTA
+from src.scheduling.availability import Exception_, Rule, open_windows
 from src.scheduling.events import ACTOR_STAFF, record_event
 from src.scheduling.models import (
     ACTIVE_STATUSES,
     Appointment,
     AppointmentEventKind,
     AppointmentStatus,
+    AppointmentType,
+    AvailabilityException,
+    AvailabilityRule,
 )
 
 #: The SQLSTATEs that mean "another transaction took this time".
@@ -135,6 +140,183 @@ async def _insert(session: AsyncSession, appointment: Appointment) -> BookingRes
     return BookingResult(Outcome.BOOKED, appointment)
 
 
+class Ineligible(Exception):
+    """The requested time is not one the clinic offers.
+
+    QA finding 3. The exclusion constraint answers "is this time still free",
+    which is a question only the database can answer at the moment of writing.
+    It does not answer "is this a time the clinic works at all", and nothing
+    else did either: a direct request booked 15:00 for a doctor whose hours end
+    at 12:00, and 03:00 on a Sunday, because no appointment conflicted.
+
+    Raised rather than returned as an `Outcome`, because the two are different
+    kinds of answer. TAKEN means try another time; this means the request was
+    never valid, and a caller that cannot tell them apart would offer the
+    patient a retry that can never succeed.
+
+    `detail_es` is what a receptionist reads. The exception carries both so the
+    HTTP layer does not have to translate.
+    """
+
+    def __init__(self, reason: str, detail_es: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail_es = detail_es
+
+
+async def check_eligible(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    doctor_id: uuid.UUID,
+    appointment_type_id: uuid.UUID,
+    start: dt.datetime,
+    end: dt.datetime,
+    now: dt.datetime,
+) -> None:
+    """Raise `Ineligible` unless the clinic actually offers this time.
+
+    Checks what the constraint cannot: the appointment type's duration, the
+    doctor's weekly rules, the dated exceptions, and Colombian public holidays.
+    What it deliberately does *not* check is whether the time is still free --
+    that is the constraint's job, decided at the moment of writing, and asking
+    here would be the check-then-act race this module exists to avoid.
+
+    So `busy` is passed empty on purpose. A slot occupied by another
+    appointment is eligible and then loses the race, which is the correct pair
+    of answers: the clinic does work then, and somebody else got there first.
+    """
+    appointment_type = await session.get(AppointmentType, appointment_type_id)
+    if appointment_type is None:
+        raise Ineligible(
+            f"no appointment type {appointment_type_id}",
+            "El tipo de cita no existe. Verifique el servicio seleccionado.",
+        )
+
+    minutes = (end - start).total_seconds() / 60
+    if minutes != appointment_type.duration_minutes:
+        raise Ineligible(
+            f"{appointment_type.name} lasts {appointment_type.duration_minutes} minutes, "
+            f"not {minutes:g}",
+            f"Una cita de {appointment_type.name} dura "
+            f"{appointment_type.duration_minutes} minutos. "
+            f"La solicitud pedía {minutes:g}.",
+        )
+
+    local = start.astimezone(BOGOTA)
+    day = local.date()
+    rules = await _rules_for(session, clinic_id=clinic_id, doctor_id=doctor_id)
+    exceptions = await _exceptions_for(session, clinic_id=clinic_id, doctor_id=doctor_id, day=day)
+    windows = open_windows(day, rules, exceptions)
+    if not windows:
+        raise Ineligible(
+            f"the doctor has no hours on {day.isoformat()}",
+            f"El profesional no atiende el {local.strftime('%d/%m/%Y')}.",
+        )
+
+    # The requested interval has to sit inside one open window, not merely
+    # touch one: an appointment that starts at 11:50 in hours ending at 12:00
+    # runs twenty minutes past closing.
+    for window_start, window_end in (w.as_instants() for w in windows):
+        if window_start <= start and end <= window_end:
+            return
+
+    offered = ", ".join(f"{w.start:%H:%M}-{w.end:%H:%M}" for w in windows)
+    raise Ineligible(
+        f"{start.isoformat()} to {end.isoformat()} falls outside the doctor's hours ({offered})",
+        f"El profesional atiende el {local.strftime('%d/%m/%Y')} de {offered}. "
+        f"La cita solicitada ({local.strftime('%I:%M %p').lstrip('0').lower()}) "
+        f"queda fuera de ese horario.",
+    )
+
+
+async def _rules_for(
+    session: AsyncSession, *, clinic_id: uuid.UUID, doctor_id: uuid.UUID
+) -> list[Rule]:
+    rows = await session.scalars(
+        select(AvailabilityRule).where(
+            AvailabilityRule.clinic_id == clinic_id,
+            AvailabilityRule.doctor_id == doctor_id,
+        )
+    )
+    return [
+        Rule(
+            weekday=r.weekday,
+            start=r.start_time,
+            end=r.end_time,
+            valid_from=r.valid_from,
+            valid_until=r.valid_until,
+        )
+        for r in rows
+    ]
+
+
+async def _exceptions_for(
+    session: AsyncSession, *, clinic_id: uuid.UUID, doctor_id: uuid.UUID, day: dt.date
+) -> list[Exception_]:
+    rows = await session.scalars(
+        select(AvailabilityException).where(
+            AvailabilityException.clinic_id == clinic_id,
+            AvailabilityException.doctor_id == doctor_id,
+            AvailabilityException.on_date == day,
+        )
+    )
+    return [
+        Exception_(on_date=e.on_date, kind=str(e.kind), start=e.start_time, end=e.end_time)
+        for e in rows
+    ]
+
+
+async def _reclaim_expired_holds(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    doctor_id: uuid.UUID,
+    start: dt.datetime,
+    end: dt.datetime,
+    now: dt.datetime,
+) -> int:
+    """Delete the expired holds overlapping this time, in the caller's transaction.
+
+    QA finding 2. `availability` stops counting a hold once it expires, while
+    the exclusion constraint counts every `hold` row whatever its expiry -- so
+    without this, a slot the availability API advertised as free was refused by
+    the booking API until the five-minute sweep caught up.
+
+    Fixed here rather than in the constraint because it cannot be fixed there:
+    an exclusion predicate may only use IMMUTABLE functions, and `now()` is
+    STABLE. PostgreSQL rejects it outright.
+
+    Safe under concurrency for two reasons. The delete and the insert that
+    follows share one transaction, so a rolled-back booking takes the reclaim
+    with it and no hold is lost to a failed attempt. And `FOR UPDATE SKIP
+    LOCKED` means two simultaneous bookings do not deadlock on the same expired
+    row -- the second simply does not see it, and then loses to the constraint
+    on the insert, which is the outcome it should have anyway.
+
+    Only *expired* holds, and only ones overlapping the requested time. A live
+    hold still blocks, which is the whole point of holding a slot.
+    """
+    overlapping = (
+        select(Appointment.id)
+        .where(
+            Appointment.clinic_id == clinic_id,
+            Appointment.doctor_id == doctor_id,
+            Appointment.status == AppointmentStatus.HOLD,
+            Appointment.expires_at.is_not(None),
+            Appointment.expires_at <= now,
+            Appointment.during.op("&&")(Range(start, end)),
+        )
+        .with_for_update(skip_locked=True)
+    )
+    expired = list((await session.scalars(overlapping)).all())
+    if not expired:
+        return 0
+    await session.execute(delete(Appointment).where(Appointment.id.in_(expired)))
+    await session.flush()
+    return len(expired)
+
+
 async def book(
     session: AsyncSession,
     *,
@@ -147,13 +329,24 @@ async def book(
     end: dt.datetime,
     status: AppointmentStatus = AppointmentStatus.SCHEDULED,
     idempotency_key: str | None = None,
+    now: dt.datetime | None = None,
+    override_reason: str | None = None,
 ) -> BookingResult:
     """Book one appointment, or report that the time is taken.
 
-    No availability check happens here. Whether the time is *offerable* is
-    `availability.bookable_slots`; whether it is still *free* is the
-    constraint, decided at the moment of writing. Asking first would be a
-    check-then-act race, and it would also be slower.
+    Two different questions are answered in two different places, and QA
+    finding 3 was that only one of them was being asked. Whether the clinic
+    *offers* this time -- the doctor's hours, the dated exceptions, the public
+    holidays, the appointment type's duration -- is `check_eligible`, called
+    here. Whether the time is still *free* is the exclusion constraint, decided
+    at the moment of writing; this code never checks that first, because
+    between a SELECT and an INSERT another transaction can commit.
+
+    `override_reason` is the authorised manual booking the report asks for: a
+    receptionist squeezing a patient in outside hours is a real thing a clinic
+    does, so it is a named operation with a reason recorded in the audit entry,
+    not a silent bypass. The reason is required, not optional, so an override
+    cannot happen by forgetting an argument.
 
     The audit entry is written only on success, inside the same transaction as
     the appointment, so the log never claims a booking that did not happen.
@@ -164,6 +357,30 @@ async def book(
         raise ValueError(f"{status} does not occupy the doctor's time; use it for an update")
     if status is AppointmentStatus.HOLD:
         raise ValueError("use `hold` to create a hold, which needs an expiry")
+
+    moment = now or dt.datetime.now(tz=dt.UTC)
+    if override_reason is None:
+        await check_eligible(
+            session,
+            clinic_id=clinic_id,
+            doctor_id=doctor_id,
+            appointment_type_id=appointment_type_id,
+            start=start,
+            end=end,
+            now=moment,
+        )
+
+    # QA finding 2: an expired hold still blocks the constraint, so it is
+    # reclaimed here -- in this transaction, before the insert that would
+    # otherwise be refused for a slot availability already called free.
+    await _reclaim_expired_holds(
+        session,
+        clinic_id=clinic_id,
+        doctor_id=doctor_id,
+        start=start,
+        end=end,
+        now=moment,
+    )
 
     result = await _insert(
         session,
@@ -188,6 +405,21 @@ async def book(
                 patient_id=patient_id,
             ),
         )
+        if override_reason is not None:
+            # A second entry, against its own resource, so an auditor can ask
+            # "which bookings bypassed the clinic's hours" and get an answer
+            # without reading every appointment. The reason is the staff
+            # member's own words; it is not patient data and is stored as given.
+            await record_access(
+                session,
+                AccessAction.CREATE,
+                Access(
+                    resource="appointment_overrides",
+                    resource_id=str(result.appointment.id),
+                    patient_id=patient_id,
+                    fields_disclosed=(f"reason={override_reason}",),
+                ),
+            )
     return result
 
 
@@ -204,6 +436,7 @@ async def hold(
     now: dt.datetime,
     minutes: int = DEFAULT_HOLD_MINUTES,
     idempotency_key: str | None = None,
+    override_reason: str | None = None,
 ) -> BookingResult:
     """Hold a slot while the patient decides (ADR-17).
 
@@ -220,6 +453,19 @@ async def hold(
         raise ValueError("a hold must last a positive number of minutes")
     if end <= start:
         raise ValueError("an appointment must end after it starts")
+
+    # QA finding 3 applies to a hold as much as a booking: a hold the clinic
+    # would never honour still blocks the slot for everyone else.
+    if override_reason is None:
+        await check_eligible(
+            session,
+            clinic_id=clinic_id,
+            doctor_id=doctor_id,
+            appointment_type_id=appointment_type_id,
+            start=start,
+            end=end,
+            now=now,
+        )
 
     result = await _insert(
         session,
@@ -402,6 +648,8 @@ async def reschedule(
     end: dt.datetime,
     idempotency_key: str | None = None,
     actor: str = ACTOR_STAFF,
+    now: dt.datetime | None = None,
+    override_reason: str | None = None,
 ) -> BookingResult:
     """Move an appointment to a new time, or report the new time is taken.
 
@@ -422,6 +670,23 @@ async def reschedule(
     original = (await session.execute(stmt)).scalar_one_or_none()
     if original is None or original.status not in ACTIVE_STATUSES:
         return BookingResult(Outcome.TAKEN)
+
+    if end <= start:
+        raise ValueError("an appointment must end after it starts")
+
+    # The destination has to be a time the clinic offers, same as a new
+    # booking: a move is a booking with an extra step, and the reviewer found
+    # it was the looser of the two paths.
+    if override_reason is None:
+        await check_eligible(
+            session,
+            clinic_id=clinic_id,
+            doctor_id=original.doctor_id,
+            appointment_type_id=original.appointment_type_id,
+            start=start,
+            end=end,
+            now=now or dt.datetime.now(tz=dt.UTC),
+        )
 
     result = await _insert(
         session,
@@ -452,12 +717,29 @@ async def reschedule(
         kind=AppointmentEventKind.RESCHEDULED,
         actor=actor,
     )
+    # QA finding 11: both halves of the move, not only the new row. An auditor
+    # reading the log saw an appointment appear and nothing explaining where
+    # the patient's earlier time went -- the release is a write to patient data
+    # and Rule 8 does not distinguish between the two directions.
+    #
+    # The event above and these entries answer different questions: the event
+    # feeds the funnel, the audit entries record who read and wrote whose data.
+    # One does not substitute for the other.
     await record_access(
         session,
         AccessAction.CREATE,
         Access(
             resource="appointments",
             resource_id=str(result.appointment.id),
+            patient_id=original.patient_id,
+        ),
+    )
+    await record_access(
+        session,
+        AccessAction.UPDATE,
+        Access(
+            resource="appointments",
+            resource_id=str(original.id),
             patient_id=original.patient_id,
         ),
     )

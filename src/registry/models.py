@@ -22,6 +22,7 @@ from sqlalchemy import (
     Index,
     LargeBinary,
     String,
+    UniqueConstraint,
     Uuid,
     func,
     text,
@@ -79,7 +80,14 @@ class Clinic(Base):
 
 class Location(Base):
     __tablename__ = "locations"
-    __table_args__ = (Index("ix_locations_clinic_id", "clinic_id"), {"schema": "app"})
+    __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_locations_clinic_id_id"),
+        Index("ix_locations_clinic_id", "clinic_id"),
+        {"schema": "app"},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
@@ -91,6 +99,10 @@ class Location(Base):
 class Doctor(Base):
     __tablename__ = "doctors"
     __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_doctors_clinic_id_id"),
         Index(
             "uq_doctors_clinic_id_external_ref",
             "clinic_id",
@@ -152,6 +164,10 @@ class Patient(Base):
 
     __tablename__ = "patients"
     __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_patients_clinic_id_id"),
         Index(
             "uq_patients_clinic_id_document",
             "clinic_id",
