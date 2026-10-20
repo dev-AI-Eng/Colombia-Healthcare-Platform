@@ -119,7 +119,7 @@ async def test_patient_detail_masks_identifiers_and_includes_related_records(
     assert body["email_masked"] == "a***@example.com"
     assert [c["active"] for c in body["consents"]] == [True]
     assert [b["relationship_kind"] for b in body["phone_bindings"]] == ["self"]
-    assert body["appointments"][0]["start"] == "2026-10-05T09:00:00-05:00"
+    assert body["appointments"][0]["start"] == at(5, 9).isoformat()
 
 
 async def test_identifiers_are_stored_as_ciphertext(
@@ -187,8 +187,8 @@ async def test_appointment_filters(session: AsyncSession, client: TestClient) ->
 
     assert total() == 2
     assert total(status="cancelled") == 1
-    assert total(date_from="2026-10-06") == 1
-    assert total(date_to="2026-10-05") == 1
+    assert total(date_from=at(6, 0).date().isoformat()) == 1
+    assert total(date_to=at(5, 0).date().isoformat()) == 1
     assert total(doctor_id=str(graph.doctor_id)) == 2
     assert client.get("/review/appointments", params={"status": "bogus"}).status_code == 422
 

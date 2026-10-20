@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AuditContext
 from src.audit.models import AccessLogEntry
-from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers
+from src.scheduling.availability import colombian_holidays
 from src.scheduling.models import (
     Appointment,
     AppointmentStatus,
@@ -30,14 +30,41 @@ from src.scheduling.models import (
     ExceptionKind,
 )
 from src.scheduling.offers import SlotSearch
-from tests.integration.factories import Graph, create_graph
+from tests.integration.factories import Graph, at, create_graph
+
 
 #: Monday 5 October 2026 through Friday the 9th. No Colombian holiday falls in
 #: that week, so a holiday cannot silently empty the search.
-MONDAY = dt.date(2026, 10, 5)
-FRIDAY = dt.date(2026, 10, 9)
+# Derived from `at()`'s anchor month rather than written out, so they stay in
+# the future: these were literal October 2026 dates, which stopped being
+# future, and the booking path now refuses a past start.
+#
+# Found by weekday, not by day-of-month, because the tests here assert on
+# weekday filtering -- `at(5, 0)` was a Monday in October 2026 and is not one
+# in any other month, and a "MONDAY" that is actually a Thursday makes three
+# tests fail for a reason that has nothing to do with what they check.
+def _first_open_monday() -> dt.date:
+    """The anchor month's first Monday whose week carries no public holiday.
+
+    A holiday closes the recurring schedule, so a week containing one offers
+    nothing and these tests fail on "no availability" rather than on what they
+    are checking. November 2026 opens on All Souls' (moved to the Monday by the
+    Ley Emiliani), which is exactly that trap.
+    """
+    first = at(1, 0).date()
+    monday = first + dt.timedelta(days=(0 - first.weekday()) % 7)
+    for _ in range(6):
+        week = {monday + dt.timedelta(days=offset) for offset in range(5)}
+        if not week & colombian_holidays(monday.year):
+            return monday
+        monday += dt.timedelta(days=7)
+    raise AssertionError("no holiday-free week found in the anchor month")
+
+
+MONDAY = _first_open_monday()
+FRIDAY = MONDAY + dt.timedelta(days=4)
 #: Before any slot in the week, so "already in the past" never interferes.
-NOW = dt.datetime(2026, 10, 1, 12, tzinfo=BOGOTA)
+NOW = at(1, 12)
 
 
 @pytest.fixture(autouse=True)
@@ -250,8 +277,11 @@ async def test_the_escalation_says_what_was_looked_for(session: AsyncSession) ->
         now=NOW,
     )
     assert result.escalation is not None
-    assert "05/10/2026" in result.escalation.detail_es
-    assert "09/10/2026" in result.escalation.detail_es
+    # Formatted from the same dates the search used, not written out: the
+    # escalation names the window it searched, and a literal here would break
+    # whenever the anchor month moves.
+    assert MONDAY.strftime("%d/%m/%Y") in result.escalation.detail_es
+    assert FRIDAY.strftime("%d/%m/%Y") in result.escalation.detail_es
     assert result.escalation.context["earliest"] == "14:00:00"
     assert result.escalation.context["doctor_id"] == str(graph.doctor_id)
 
