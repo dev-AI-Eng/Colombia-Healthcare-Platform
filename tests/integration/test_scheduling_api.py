@@ -10,7 +10,7 @@ another's rows through a route, and that every write is audited.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -210,7 +210,13 @@ async def test_confirming_an_expired_hold_answers_409(
 ) -> None:
     """Its slot was free in the meantime and may belong to somebody else now."""
     client, graph = scoped
-    stale = appointment(graph, START, status=AppointmentStatus.HOLD, expires_at=at(1, 8))
+    # The expiry has to be behind the *real* clock, because the route reads it
+    # (`_now()`), not a fixture moment. `at(1, 8)` used to be in the past and is
+    # not any more now that `at()` anchors to a future month, so the hold was
+    # live and the confirm succeeded -- the test was passing on a stale date
+    # rather than on expiry.
+    expired = datetime.now(tz=UTC) - timedelta(hours=1)
+    stale = appointment(graph, START, status=AppointmentStatus.HOLD, expires_at=expired)
     session.add(stale)
     await session.commit()
 

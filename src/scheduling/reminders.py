@@ -42,7 +42,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -296,74 +297,90 @@ async def flag_unrecorded_attendance(
     if not candidates:
         return 0
 
-    # One escalation per appointment, ever. `resolved` counts: a receptionist
-    # who answered the question should not be asked it again tomorrow.
-    already = set(
-        (
-            await session.scalars(
-                select(Escalation.appointment_id).where(
-                    Escalation.clinic_id == clinic_id,
-                    Escalation.reason == EscalationReason.ATTENDANCE_UNRECORDED,
-                    Escalation.appointment_id.in_([c.id for c in candidates]),
-                )
-            )
-        ).all()
-    )
-
-    raised = 0
-    # The escalation's own id, not the appointment's: QA finding 12. The entry
-    # said resource="escalations" while carrying the appointment id, so an
-    # investigator asked to account for escalation X found no access that
-    # created it.
-    flagged: list[Escalation] = []
+    # One escalation per appointment, ever, enforced by the partial unique
+    # index migration 0009 added rather than by reading first and hoping.
+    #
+    # The read-then-insert this replaces had two problems. Two overlapping
+    # sweeps could both see "none" and both insert, which is what the index was
+    # added to stop -- and once the index existed, the losing sweep raised an
+    # unhandled IntegrityError instead. `sweep_every_clinic` walks every clinic
+    # inside one transaction, so that error rolled back the clinics already
+    # swept and never reached the ones after: a recurring outage of all
+    # housekeeping, every five minutes, triggered by the exact race the index
+    # was meant to make harmless. Measured with two concurrent workers: one
+    # returned 1, the other raised UniqueViolation.
+    #
+    # ON CONFLICT DO NOTHING makes the loser a no-op, and RETURNING gives back
+    # exactly the rows this sweep created -- so `raised` counts real work and
+    # the audit entries name only escalations that were really written, which
+    # is the property QA finding 12 established.
+    rows_to_insert: list[dict[str, object]] = []
     for row in candidates:
-        if row.id in already:
-            continue
         start = row.during.lower
         if start is None:  # unreachable: the column is NOT NULL and bounded
             continue
         local = start.astimezone(BOGOTA)
-        escalation = Escalation(
-            clinic_id=clinic_id,
-            patient_id=row.patient_id,
-            appointment_id=row.id,
-            reason=EscalationReason.ATTENDANCE_UNRECORDED,
-            status=EscalationStatus.OPEN,
-            detail_es=(
-                f"Nadie registró si el paciente asistió a la cita del "
-                f"{local.strftime('%d/%m/%Y')} a las "
-                f"{local.strftime('%I:%M %p').lstrip('0').lower()}. "
-                f"Confirme si asistió o no asistió."
-            ),
-            context={
-                "appointment_start": start.isoformat(),
-                "status_at_sweep": str(row.status),
-            },
+        rows_to_insert.append(
+            {
+                "id": uuid.uuid4(),
+                "clinic_id": clinic_id,
+                "patient_id": row.patient_id,
+                "appointment_id": row.id,
+                "reason": EscalationReason.ATTENDANCE_UNRECORDED,
+                "status": EscalationStatus.OPEN,
+                "detail_es": (
+                    f"Nadie registró si el paciente asistió a la cita del "
+                    f"{local.strftime('%d/%m/%Y')} a las "
+                    f"{local.strftime('%I:%M %p').lstrip('0').lower()}. "
+                    f"Confirme si asistió o no asistió."
+                ),
+                "context": {
+                    "appointment_start": start.isoformat(),
+                    "status_at_sweep": str(row.status),
+                },
+            }
         )
-        session.add(escalation)
-        flagged.append(escalation)
-        raised += 1
 
-    if raised:
-        # Flush first, so every escalation has the id the audit entry names.
-        await session.flush()
-        # One entry per escalation actually written, taken from the loop rather
-        # than recomputed from `candidates`: a filter that drifted would log an
-        # access that never happened, or miss one that did.
-        await record_accesses(
-            session,
-            AccessAction.CREATE,
-            [
-                Access(
-                    resource="escalations",
-                    resource_id=str(escalation.id),
-                    patient_id=escalation.patient_id,
-                )
-                for escalation in flagged
-            ],
+    if not rows_to_insert:
+        return 0
+
+    created = (
+        await session.execute(
+            pg_insert(Escalation)
+            .values(rows_to_insert)
+            # Targeted by index predicate, not by name: 0009 creates a partial
+            # UNIQUE INDEX, and `ON CONFLICT ON CONSTRAINT <name>` only accepts
+            # a real constraint -- PostgreSQL answers "constraint ... does not
+            # exist". The index_where has to match the index's own predicate
+            # for the planner to pick it.
+            .on_conflict_do_nothing(
+                index_elements=["clinic_id", "appointment_id"],
+                index_where=text("reason = 'attendance_unrecorded' AND appointment_id IS NOT NULL"),
+            )
+            .returning(Escalation.id, Escalation.patient_id)
         )
-        await session.flush()
-    return raised
+    ).all()
+    if not created:
+        return 0
+
+    # One entry per escalation actually written, taken from what the database
+    # returned rather than from what we tried to write: the rows a concurrent
+    # sweep won are absent here, so the log never claims an escalation this
+    # transaction did not create.
+    await record_accesses(
+        session,
+        AccessAction.CREATE,
+        [
+            Access(
+                resource="escalations",
+                resource_id=str(escalation_id),
+                patient_id=patient_id,
+            )
+            for escalation_id, patient_id in created
+        ],
+    )
+    await session.flush()
+    return len(created)
 
 
 __all__ = [

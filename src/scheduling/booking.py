@@ -229,6 +229,7 @@ async def check_eligible(
     start: dt.datetime,
     end: dt.datetime,
     now: dt.datetime,
+    location_id: uuid.UUID | None = None,
 ) -> None:
     """Raise `Ineligible` unless the clinic actually offers this time.
 
@@ -242,6 +243,27 @@ async def check_eligible(
     appointment is eligible and then loses the race, which is the correct pair
     of answers: the clinic does work then, and somebody else got there first.
     """
+    if start < now:
+        # `now` was accepted by this function, threaded through three call
+        # sites and the HTTP layer, and never read -- so nothing refused a
+        # booking in the past. `availability.bookable_slots` drops a past slot
+        # with the comment "offering a patient a time that has already gone is
+        # worse than offering nothing", and the write path had no equivalent:
+        # a slow conversation turn or a redelivered webhook could book a time
+        # that had already passed, and `hold` could mint a hold whose expiry
+        # was already behind the clock -- a dead row still occupying the
+        # exclusion constraint until a sweep ran.
+        #
+        # Transcribing genuine history is what `override_reason` is for, which
+        # is how the spreadsheet importer books; this refusal does not apply to
+        # it, because the caller states that intent explicitly.
+        local = start.astimezone(BOGOTA)
+        raise Ineligible(
+            f"{start.isoformat()} is before {now.isoformat()}",
+            f"Esa hora ya pasó ({local.strftime('%d/%m/%Y %I:%M %p').lower()}). "
+            f"Elija una hora futura.",
+        )
+
     appointment_type = await session.get(AppointmentType, appointment_type_id)
     if appointment_type is None:
         raise Ineligible(
@@ -261,7 +283,9 @@ async def check_eligible(
 
     local = start.astimezone(BOGOTA)
     day = local.date()
-    rules = await _rules_for(session, clinic_id=clinic_id, doctor_id=doctor_id)
+    rules = await _rules_for(
+        session, clinic_id=clinic_id, doctor_id=doctor_id, location_id=location_id
+    )
     exceptions = await _exceptions_for(session, clinic_id=clinic_id, doctor_id=doctor_id, day=day)
     windows = open_windows(day, rules, exceptions)
     if not windows:
@@ -287,14 +311,31 @@ async def check_eligible(
 
 
 async def _rules_for(
-    session: AsyncSession, *, clinic_id: uuid.UUID, doctor_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    doctor_id: uuid.UUID,
+    location_id: uuid.UUID | None = None,
 ) -> list[Rule]:
-    rows = await session.scalars(
-        select(AvailabilityRule).where(
-            AvailabilityRule.clinic_id == clinic_id,
-            AvailabilityRule.doctor_id == doctor_id,
-        )
+    """This doctor's weekly rules, narrowed to one site when given.
+
+    The location filter is the write path's half of QA finding 9. `offers`
+    gained it; this did not, so the eligibility check answered "does the doctor
+    work at 09:00 on a Tuesday" from *every* site's hours and a booking was
+    accepted at a sede where the doctor has no rules at all. Measured: a search
+    at Sede Sur returned 0 slots while a booking at Sede Sur was accepted, on a
+    doctor whose only rule was at Sede Norte.
+
+    `None` means every site, which is right for a single-site clinic and is the
+    behaviour a caller that cannot name a location should get.
+    """
+    stmt = select(AvailabilityRule).where(
+        AvailabilityRule.clinic_id == clinic_id,
+        AvailabilityRule.doctor_id == doctor_id,
     )
+    if location_id is not None:
+        stmt = stmt.where(AvailabilityRule.location_id == location_id)
+    rows = await session.scalars(stmt)
     return [
         Rule(
             weekday=r.weekday,
@@ -421,6 +462,7 @@ async def book(
             clinic_id=clinic_id,
             doctor_id=doctor_id,
             appointment_type_id=appointment_type_id,
+            location_id=location_id,
             start=start,
             end=end,
             now=moment,
@@ -518,6 +560,7 @@ async def hold(
             clinic_id=clinic_id,
             doctor_id=doctor_id,
             appointment_type_id=appointment_type_id,
+            location_id=location_id,
             start=start,
             end=end,
             now=now,
@@ -747,6 +790,9 @@ async def reschedule(
             clinic_id=clinic_id,
             doctor_id=original.doctor_id,
             appointment_type_id=original.appointment_type_id,
+            # A move keeps the site, so the destination has to be a time the
+            # doctor works *there* -- the original's location, not any of them.
+            location_id=original.location_id,
             start=start,
             end=end,
             now=now or dt.datetime.now(tz=dt.UTC),
