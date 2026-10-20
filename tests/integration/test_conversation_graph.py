@@ -753,7 +753,10 @@ async def test_a_generated_turn_records_a_disclosure_per_provider(
     not a second store of the data it discloses.
     """
     graph = await _clinic_with_patient(session)
-    session.add(appointment(graph, at(3, 9, 0), status=AppointmentStatus.CONFIRMED))
+    # Scheduled, not confirmed: a confirm turn looks for an appointment it can
+    # still confirm, and an already-confirmed one stops the turn at
+    # `no_appointment` before `compose` is ever reached.
+    session.add(appointment(graph, at(3, 9, 0)))
     await session.flush()
 
     deps = _deps(session, judge_approves=True)
@@ -805,7 +808,7 @@ async def test_a_templated_turn_discloses_nothing(session: AsyncSession) -> None
     as wrong as missing the ones where it did.
     """
     graph = await _clinic_with_patient(session)
-    session.add(appointment(graph, at(3, 9, 0), status=AppointmentStatus.CONFIRMED))
+    session.add(appointment(graph, at(3, 9, 0)))
     await session.flush()
 
     await _run(session, graph, "Si, confirmo", deps=_deps(session, judge_approves=True))
