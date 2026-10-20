@@ -17,10 +17,11 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.audit.context import AuditContext
+from src.audit.context import AccessAction, AuditContext
+from src.audit.models import AccessLogEntry
 from src.conversation import templates as T
 from src.conversation.graph import CLINIC_PHONE_SETTING, Dependencies, build_graph
 from src.conversation.state import Draft, Intent, Stop, initial
@@ -732,3 +733,88 @@ async def test_medical_advice_from_a_generator_is_also_refused(
     assert any(f.reason.value == "medical_advice" for d in result["drafts"] for f in d.findings), (
         "dosage advice was not caught by the lexicon"
     )
+
+
+async def test_a_generated_turn_records_a_disclosure_per_provider(
+    session: AsyncSession,
+) -> None:
+    """Rule 8: "including every disclosure to a model or speech provider."
+
+    Neither provider call was logged. `AccessAction.DISCLOSE` existed and was
+    documented as "sent to a third-party processor, such as a model provider",
+    and was used in exactly one place in the codebase, unrelated to this
+    pipeline -- while `generator.py` sent the patient's name, doctor, clinic and
+    appointment to OpenAI and `judge.py` sent the rendered draft to Groq. Both
+    files carried a comment claiming the disclosure was recorded elsewhere. It
+    was not recorded anywhere.
+
+    Two processors, two entries. The values are not copied into the log: an
+    audit entry naming the fields is the record that a disclosure happened,
+    not a second store of the data it discloses.
+    """
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0), status=AppointmentStatus.CONFIRMED))
+    await session.flush()
+
+    deps = _deps(session, judge_approves=True)
+    base = deps.generate
+
+    def generated(state):  # type: ignore[no-untyped-def]
+        draft = base(state)
+        return Draft(text=draft.text, kind=draft.kind, templated=False)
+
+    await _run(
+        session,
+        graph,
+        "Si, confirmo",
+        deps=Dependencies(
+            session=deps.session,
+            settings=deps.settings,
+            generate=generated,
+            judge=deps.judge,
+        ),
+    )
+
+    rows = (
+        await session.execute(
+            select(AccessLogEntry.processor, AccessLogEntry.fields_disclosed).where(
+                AccessLogEntry.action == AccessAction.DISCLOSE.value
+            )
+        )
+    ).all()
+    processors = {processor for processor, _ in rows}
+    assert processors == {"generator", "judge"}, (
+        f"expected a disclosure entry for each provider, got {processors or 'none'}"
+    )
+
+    # The generator's entry names the facts it was given, and names them --
+    # it does not carry their values.
+    generator_fields = next(fields for processor, fields in rows if processor == "generator")
+    assert generator_fields is not None
+    assert "patient_given_name" in generator_fields
+    assert "appointment_starts_at" in generator_fields
+    assert not any("@" in field or field.isdigit() for field in generator_fields)
+
+
+async def test_a_templated_turn_discloses_nothing(session: AsyncSession) -> None:
+    """A template is rendered on this machine and reaches no provider, so there
+    is nothing to disclose and no entry to write.
+
+    This is the half that keeps the log honest: an entry written for every turn
+    would say patient data left the machine on turns where it did not, which is
+    as wrong as missing the ones where it did.
+    """
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0), status=AppointmentStatus.CONFIRMED))
+    await session.flush()
+
+    await _run(session, graph, "Si, confirmo", deps=_deps(session, judge_approves=True))
+
+    disclosures = (
+        await session.execute(
+            select(func.count())
+            .select_from(AccessLogEntry)
+            .where(AccessLogEntry.action == AccessAction.DISCLOSE.value)
+        )
+    ).scalar_one()
+    assert disclosures == 0, f"a templated turn recorded {disclosures} disclosure(s)"

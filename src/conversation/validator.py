@@ -122,6 +122,43 @@ _COMPILED: Final[tuple[tuple[re.Pattern[str], str], ...]] = tuple(
     (re.compile(pattern), label) for pattern, label in _ADVICE_PATTERNS
 )
 
+#: Claims no `verified_facts` field can ever support, refused by shape.
+#:
+#: Stage 1 cannot catch these. "El valor es de 8 mil pesos" carries no
+#: fact-shaped token, "clinica-norte.co/confirmar" is not a number or a name,
+#: and "venga en ayunas" is a sentence rather than a value -- all three passed
+#: the token scanner while stating something the clinic never said. Enumerating
+#: every phrasing a model might invent is hopeless, so the test is the opposite
+#: one: the fact set has no price field, no link field and no preparation
+#: field, so a draft that mentions any of them is stating something unverified
+#: whatever the wording, and is refused.
+#:
+#: A templated message that legitimately needs one of these would need the fact
+#: added to `VerifiedFacts` first, which is the correct order.
+_UNVERIFIABLE_PATTERNS: Final[tuple[tuple[str, str], ...]] = (
+    # Money. No fact carries a price, so any amount is invented.
+    (r"\b\d+(?:[.,]\d+)?\s*(?:mil|millones?)?\s*(?:pesos|cop|cup|usd|dolares)\b", "price"),
+    (r"\$\s?\d", "price"),
+    (r"\b(?:valor|costo|precio|tarifa|copago|cuota moderadora)\b", "price"),
+    (r"\bse (?:le )?cobrar[aá]\b", "price"),
+    # A link or an address the clinic never gave us.
+    (r"https?://|www\.", "link"),
+    (r"\b[a-z0-9-]+\.(?:com|co|net|org|io|app)(?:/|\b)", "link"),
+    # A precondition on attending. The clinic's own policy may require one, but
+    # it reaches the patient through an approved template, never a generated
+    # sentence, because an invented one sends them away or has them fast for
+    # nothing.
+    (r"\ben ayunas\b", "precondition"),
+    (r"\b(?:traiga|traer|debe traer|lleve|llevar)\b.{0,40}"
+     r"\b(?:orden|autorizacion|autorización|remision|remisión|formula|fórmula|carta)\b",
+     "precondition"),
+    (r"\b(?:no )?(?:puede|podra|podrá) (?:comer|beber|tomar agua|desayunar)\b", "precondition"),
+)
+
+_COMPILED_UNVERIFIABLE: Final[tuple[tuple[re.Pattern[str], str], ...]] = tuple(
+    (re.compile(pattern), label) for pattern, label in _UNVERIFIABLE_PATTERNS
+)
+
 # ------------------------------------------------------------- stage 1 tokenising
 #
 # What counts as a fact-shaped token: anything a message could get wrong in a
@@ -148,10 +185,54 @@ _DATE = re.compile(
 _PHONE = re.compile(r"\+?\d{2,3}[\s.\-]?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3,4}")
 #: A bare number of two or more digits: a duration, a room.
 _NUMBER = re.compile(r"\b\d{2,}\b")
-#: A capitalised run: a person, a place. Lower-cased sentence starts are not
-#: names, so the pattern requires the capital to be mid-sentence or a title.
+#: A single digit after a word that makes it a place. Separate from `_NUMBER`
+#: because a lone digit anywhere would match the "1" in "1 hora" and every list
+#: marker, while a lone digit *after* `consultorio` is a room a model can
+#: invent. Measured before this existed: "Suba al piso 7" tokenised to nothing
+#: while "piso 17" tokenised to 17 -- the gate caught the two-digit floor and
+#: passed the one-digit floor, and a patient was sent to the wrong room.
+_UNIT_NUMBER = re.compile(
+    r"\b(?:consultorio|piso|torre|oficina|modulo|local|puerta|cubiculo)\s+(\d{1,2})\b",
+    re.IGNORECASE,
+)
+#: A weekday on its own. `tokens()` already registers the appointment's
+#: weekday, so the data needed to catch a wrong one was present and never
+#: consulted: "el lunes 23 de octubre" passed when the 23rd is a Friday,
+#: because "23 de octubre" resolved and "lunes" was invisible. A patient reads
+#: the weekday, not the date number, and comes on the wrong day.
+_WEEKDAY = re.compile(
+    r"\b(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b",
+    re.IGNORECASE,
+)
+#: A date written in words. `_DATE` requires a digit, so a spelled-out date was
+#: never checked: "veintitres de noviembre" tokenised to nothing.
+_SPELLED_DATE = re.compile(
+    r"\b(?:uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece|"
+    r"catorce|quince|dieciseis|diecisiete|dieciocho|diecinueve|veinte|veintiuno|"
+    r"veintidos|veintitres|veinticuatro|veinticinco|veintiseis|veintisiete|"
+    r"veintiocho|veintinueve|treinta|treinta y uno)\s+de\s+[a-z]+\b",
+    re.IGNORECASE,
+)
+#: A capitalised run: a person, a place. A title makes it one unambiguously.
+#: Without a title, two or more capitalised words are still a name or a place
+#: ("Catalina Ortiz", "Sede Chapinero") and have to resolve.
+#:
+#: Two words, not one, is what keeps this usable: a single capitalised word is
+#: a sentence start far more often than a name, and requiring every one to
+#: resolve would refuse correct drafts on "Confirme", "Recuerde", "Su". The
+#: residual gap is a one-word invented place mid-sentence, which is narrower
+#: than what it replaces -- previously *every* untitled name passed, verified
+#: with `_PROPER.findall("Pregunte por Catalina Ortiz")` returning [].
+#:
+#: The title branch accepts a Spanish particle ("Dra. Ana de la Cruz") because
+#: Colombian surnames carry them and the old pattern stopped at the particle,
+#: tokenising "Dra. Ana" and reporting the clinic's own doctor as a fabrication.
+_PARTICLE = r"(?:de|del|la|las|los|y)"
 _PROPER = re.compile(
-    r"\b(?:Dr\.?|Dra\.?|Doctor|Doctora)\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+)*"
+    r"\b(?:Dr\.?|Dra\.?|Doctor|Doctora)\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]+"
+    rf"(?:\s+(?:{_PARTICLE}\s+)*[A-ZÁÉÍÓÚÑ\wáéíóúñ][\wÁÉÍÓÚÑáéíóúñ]*)*"
+    r"|\b[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]{2,}"
+    rf"(?:\s+(?:{_PARTICLE}\s+)*[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÑáéíóúñ]{{2,}})+"
 )
 
 #: Words that look like facts but state none, so they never need to resolve.
@@ -215,10 +296,20 @@ def _fact_tokens(draft: str) -> list[str]:
 
     take(_PROPER, draft)
     lowered = draft.casefold()
+    # Spelled-out dates before `_DATE`: "veintitres de noviembre" has no digit,
+    # so `_DATE` cannot see it, and taking it first keeps "de noviembre" from
+    # being re-taken as part of a weaker span.
+    take(_SPELLED_DATE, lowered)
     take(_DATE, lowered)
     take(_PHONE, lowered)
     take(_TIME, lowered)
+    # Before `_NUMBER`, because the match is the whole "consultorio 4" span and
+    # taking it first stops a two-digit room being counted twice.
+    take(_UNIT_NUMBER, lowered)
     take(_NUMBER, lowered)
+    # Last: a weekday inside an already-taken date span is part of that date,
+    # not a second claim.
+    take(_WEEKDAY, lowered)
     return spans
 
 
@@ -235,13 +326,29 @@ def check_provenance(draft: str, facts: VerifiedFacts) -> list[Finding]:
 
 
 def check_forbidden(draft: str) -> list[Finding]:
-    """Stage 2. Medical advice, dosage, diagnosis (rule 5)."""
+    """Stage 2. Medical advice, dosage, diagnosis (rule 5), and claims no fact
+    could support.
+
+    The second group is here rather than in stage 1 because stage 1 resolves
+    *tokens* against the fact set, and these state something without producing
+    a token to resolve: a price, a link, a precondition on attending. All three
+    passed the token scanner while telling the patient something the clinic
+    never said -- an invented fee, a fake confirmation URL, an instruction to
+    fast. They are refused by shape, because `verified_facts` has no field that
+    could ever justify one.
+    """
     text = normalise(draft)
-    return [
+    findings = [
         Finding(Reason.MEDICAL_ADVICE, match.group(0), label)
         for pattern, label in _COMPILED
         if (match := pattern.search(text))
     ]
+    findings.extend(
+        Finding(Reason.FABRICATED_FACT, match.group(0), label)
+        for pattern, label in _COMPILED_UNVERIFIABLE
+        if (match := pattern.search(text))
+    )
+    return findings
 
 
 def check_omission(draft: str, facts: VerifiedFacts, kind: MessageKind) -> list[Finding]:

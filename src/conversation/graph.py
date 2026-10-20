@@ -414,6 +414,68 @@ def _merge(base: FactsBuilder, extra: FactsBuilder) -> VerifiedFacts:
     return replace(merged, offered_slots=built.offered_slots)
 
 
+async def _record_disclosure(
+    state: ConversationState,
+    deps: Dependencies,
+    *,
+    processor: str,
+    fields: tuple[str, ...],
+) -> None:
+    """Log that patient data left the machine for a third-party processor.
+
+    One entry per provider call. `fields_disclosed` names what was sent rather
+    than carrying it, because the audit log is not a copy of the disclosure --
+    an auditor needs to know a name and an appointment time went to a model
+    provider, not to read them again here.
+
+    `patient_id` may be absent on a turn that never resolved a patient (a
+    stranger's number), and the entry is still written: "we sent something to a
+    provider about a sender we could not identify" is a fact worth having.
+    """
+    patient = state.get("patient")
+    await record_access(
+        deps.session,
+        AccessAction.DISCLOSE,
+        Access(
+            resource="conversation_turns",
+            resource_id=state.get("thread_id"),
+            patient_id=patient.patient_id if patient else None,
+            processor=processor,
+            processor_model=_processor_model(deps.settings, processor),
+            fields_disclosed=fields,
+            zero_retention=False,
+        ),
+    )
+
+
+def _processor_model(settings: Settings, processor: str) -> str:
+    """Which model the disclosure went to, as configured."""
+    return settings.evaluator_model if processor == "judge" else settings.generator_model
+
+
+def _facts_sent(facts: VerifiedFacts) -> tuple[str, ...]:
+    """The names of the fact fields that carry a value, not the values.
+
+    The log records *what kind* of thing was disclosed. Copying the values in
+    would make the audit log a second store of the patient data it exists to
+    account for.
+    """
+    return tuple(
+        name
+        for name in (
+            "patient_given_name",
+            "doctor_name",
+            "specialty",
+            "location_name",
+            "location_address",
+            "clinic_name",
+            "clinic_phone",
+            "appointment_starts_at",
+        )
+        if getattr(facts, name, None) is not None
+    )
+
+
 # -------------------------------------------------------------------- compose
 
 
@@ -426,6 +488,25 @@ async def compose(state: ConversationState, *, deps: Dependencies) -> Conversati
     the gate below does not change.
     """
     draft = deps.generate(state)
+
+    # Rule 8: "including every disclosure to a model or speech provider."
+    # Recorded here rather than inside `generate`, because the generator must
+    # not hold a session (rule 2) and this node already does -- so the
+    # disclosure is logged without handing the generator a database.
+    #
+    # Keyed on `draft.templated`, which is the only honest signal available:
+    # a templated draft was rendered locally and reached no provider, while a
+    # generated one did. A refusal is still a disclosure -- the provider saw
+    # the facts before it failed -- and `generator._refusal` returns
+    # `templated=False`, so those are recorded too.
+    if not draft.templated:
+        await _record_disclosure(
+            state,
+            deps,
+            processor="generator",
+            fields=_facts_sent(state["verified_facts"]),
+        )
+
     return {"drafts": (*state["drafts"], draft)}
 
 
@@ -443,6 +524,14 @@ async def gate(state: ConversationState, *, deps: Dependencies) -> ConversationS
     verdict = validate(draft.text, state["verified_facts"], draft.kind)
 
     if verdict.approved and not draft.templated:
+        # The judge receives the rendered draft, which names the patient and
+        # their appointment. A second processor, a second disclosure.
+        await _record_disclosure(
+            state,
+            deps,
+            processor="judge",
+            fields=("draft_text",),
+        )
         verdict = deps.judge(draft.text)
 
     checked = replace(draft, findings=verdict.findings, approved=verdict.approved)

@@ -188,8 +188,10 @@ def judge(
     except Exception as error:
         # Deliberately broad: an SDK raises a dozen exception types and any of
         # them means the same thing here. The message is logged without the
-        # draft, which may carry patient data (ADR-24 records the disclosure
-        # separately; a log line is not the place for it).
+        # draft, which may carry patient data; a log line is not the place for
+        # it. The disclosure is recorded by the graph's `gate` node before this
+        # call, so a provider that saw the draft and then timed out is still
+        # accounted for.
         logger.warning("judge unavailable: %s", type(error).__name__)
         return _unavailable(type(error).__name__)
 

@@ -48,7 +48,7 @@ async def create_graph(session: AsyncSession, *, name: str = "Clínica Prueba") 
     await session.flush()
     await apply_clinic_scope(session, ClinicScope(clinic_id=clinic.id))
     location = Location(clinic_id=clinic.id, name="Sede", address="Calle 1 # 2-3")
-    doctor = Doctor(clinic_id=clinic.id, full_name="Dra. Prueba", specialty="Medicina General")
+    doctor = Doctor(clinic_id=clinic.id, full_name="Sara Betancur de la Cruz", specialty="Medicina General")
     appointment_type = AppointmentType(clinic_id=clinic.id, name="Consulta", duration_minutes=20)
     patient = Patient(
         clinic_id=clinic.id,

@@ -213,7 +213,11 @@ def generate(
     except Exception as error:
         # Deliberately broad: an SDK raises a dozen types and all of them mean
         # the same thing here. The facts are not logged -- they are patient
-        # data, and ADR-24 records the disclosure separately.
+        # data. The disclosure itself is recorded by the graph's `compose`
+        # node, which holds the session this function deliberately does not
+        # (rule 2); the refusal returned below is still `templated=False`, so
+        # that entry is written even though the call failed -- the provider saw
+        # the facts before it failed.
         logger.warning("generator unavailable: %s", type(error).__name__)
         return _refusal(kind, type(error).__name__)
 

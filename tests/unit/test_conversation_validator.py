@@ -30,7 +30,7 @@ APPOINTMENT = dt.datetime(2026, 10, 23, 10, 30, tzinfo=BOGOTA)
 
 FACTS = VerifiedFacts(
     patient_given_name="Sara",
-    doctor_name="Dra. Sara Betancur",
+    doctor_name="Sara Betancur de la Cruz",
     specialty="Medicina general",
     location_name="Sede Norte",
     clinic_name="Clínica San Rafael",
@@ -43,7 +43,7 @@ FACTS = VerifiedFacts(
 #: What a correct confirmation looks like, rendered from the facts above.
 GOOD_CONFIRMATION = (
     f"Su cita ha sido confirmada para el {spell_date(APPOINTMENT.date())} "
-    f"a las {spell_time(APPOINTMENT)} con Dra. Sara Betancur. "
+    f"a las {spell_time(APPOINTMENT)} con Dra. Sara Betancur de la Cruz. "
     "Por favor llegue 30 minutos antes."
 )
 
@@ -134,11 +134,11 @@ def test_a_correct_confirmation_is_approved() -> None:
     "draft",
     [
         # Accentless, as a Colombian receptionist often types.
-        "Su cita es el viernes 23 de octubre a las 10:30 a.m. con Dra. Sara Betancur.",
+        "Su cita es el viernes 23 de octubre a las 10:30 a.m. con Dra. Sara Betancur de la Cruz.",
         # "a. m." with a space.
-        f"Su cita es el {spell_date(APPOINTMENT.date())} a las 10:30 a. m. con Dra. Sara Betancur.",
+        f"Su cita es el {spell_date(APPOINTMENT.date())} a las 10:30 a. m. con Dra. Sara Betancur de la Cruz.",
         # 24-hour clock.
-        f"Su cita es el {spell_date(APPOINTMENT.date())} a las 10:30 con Dra. Sara Betancur.",
+        f"Su cita es el {spell_date(APPOINTMENT.date())} a las 10:30 con Dra. Sara Betancur de la Cruz.",
     ],
 )
 def test_spanish_variants_of_the_same_fact_are_approved(draft: str) -> None:
@@ -208,7 +208,7 @@ def test_a_confirmation_without_a_time_is_rejected() -> None:
     """The worst failure mode: the patient believes they are booked and does
     not know when."""
     verdict = validate(
-        "Su cita ha sido confirmada con Dra. Sara Betancur.", FACTS, MessageKind.CONFIRMATION
+        "Su cita ha sido confirmada con Dra. Sara Betancur de la Cruz.", FACTS, MessageKind.CONFIRMATION
     )
     assert not verdict.approved
     assert Reason.MISSING_REQUIRED_FACT.value in verdict.reason_codes
