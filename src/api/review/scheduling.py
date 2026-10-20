@@ -41,8 +41,11 @@ from collections.abc import Awaitable
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
+from src.api.review.live import TOPIC_APPOINTMENTS, notify
+from src.api.review.patient_auth import CallerPatientDep, require_owns
 from src.api.review.scheduling_schemas import (
     BookIn,
     CancelIn,
@@ -53,7 +56,7 @@ from src.api.review.schemas import AppointmentOut, EscalationOut, Page, SlotOut,
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers, repository
 from src.scheduling.booking import BookingResult, Outcome
-from src.scheduling.models import AppointmentType, EscalationStatus
+from src.scheduling.models import Appointment, AppointmentType, EscalationStatus
 
 router = APIRouter()
 
@@ -100,6 +103,12 @@ async def _render(
         ),
         "appointment",
     )
+    # Every write route reaches here on success, so one hook covers book,
+    # hold, confirm, cancel and reschedule rather than five call sites that
+    # can drift. The notice carries no patient data -- it says "appointments
+    # changed in this clinic" -- and the dashboard re-fetches through the
+    # audited route, so the disclosure still passes the gate it always did.
+    notify(clinic_id, TOPIC_APPOINTMENTS)
     return AppointmentOut.build(view)
 
 
@@ -276,13 +285,27 @@ async def hold_slot(session: SessionDep, scope: ClinicScopeDep, body: HoldIn) ->
     responses={409: {"description": "The hold had already expired."}},
 )
 async def confirm(
-    session: SessionDep, scope: ClinicScopeDep, appointment_id: uuid.UUID
+    session: SessionDep,
+    scope: ClinicScopeDep,
+    appointment_id: uuid.UUID,
+    caller_patient_id: CallerPatientDep = None,
 ) -> AppointmentOut:
     """Promote a hold to `scheduled`, if it is still live.
 
     An expired hold answers 409 rather than being revived: its slot was free in
     the meantime and may already belong to somebody else.
+
+    Guarded like cancel and reschedule: a patient may confirm only a hold made
+    for them. Confirming somebody else's hold would commit a stranger to an
+    appointment they did not ask for and consume the slot.
     """
+    await require_owns(
+        session,
+        clinic_id=scope.clinic_id,
+        appointment_id=appointment_id,
+        caller_patient_id=caller_patient_id,
+    )
+
     result = await booking.confirm_hold(
         session,
         clinic_id=scope.clinic_id,
@@ -305,12 +328,24 @@ async def cancel_appointment(
     scope: ClinicScopeDep,
     appointment_id: uuid.UUID,
     body: CancelIn,
+    caller_patient_id: CallerPatientDep = None,
 ) -> AppointmentOut:
     """Mark it cancelled, which frees the doctor's time.
 
     The row is kept rather than deleted: a cancellation is part of the
     patient's history, and M4's reporting counts cancellations by reason.
+
+    A caller presenting `X-Patient-Phone` may cancel only their own
+    appointment; see `patient_auth`. Omitting the header is the staff path,
+    which stays as it was until M5 adds staff authentication.
     """
+    await require_owns(
+        session,
+        clinic_id=scope.clinic_id,
+        appointment_id=appointment_id,
+        caller_patient_id=caller_patient_id,
+    )
+
     changed = await booking.cancel(
         session,
         clinic_id=scope.clinic_id,
@@ -339,6 +374,7 @@ async def reschedule_appointment(
     scope: ClinicScopeDep,
     appointment_id: uuid.UUID,
     body: RescheduleIn,
+    caller_patient_id: CallerPatientDep = None,
 ) -> AppointmentOut:
     """Cancel the old row and write a new one pointing back at it.
 
@@ -351,7 +387,31 @@ async def reschedule_appointment(
     insert rolls the cancel back with it. A patient never loses their existing
     appointment to a failed move.
     """
-    end = body.end or body.start + dt.timedelta(minutes=body.duration_minutes or 0)
+    await require_owns(
+        session,
+        clinic_id=scope.clinic_id,
+        appointment_id=appointment_id,
+        caller_patient_id=caller_patient_id,
+    )
+
+    # `_span`, not `duration_minutes or 0`: that arithmetic is the defect
+    # `_span` was written to replace, and this was the one caller still
+    # carrying it -- so a duration a caller could omit on `book` had to be
+    # supplied here. The appointment type comes from the row being moved,
+    # because a reschedule does not change what the appointment is for.
+    original_type = await session.scalar(
+        select(Appointment.appointment_type_id).where(
+            Appointment.clinic_id == scope.clinic_id,
+            Appointment.id == appointment_id,
+        )
+    )
+    end = await _span(
+        session,
+        appointment_type_id=require_found(original_type, "appointment"),
+        start=body.start,
+        end=body.end,
+        duration_minutes=body.duration_minutes,
+    )
     if end <= body.start:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
