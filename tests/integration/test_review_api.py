@@ -8,6 +8,7 @@ Patient-data routes under a new prefix must be added to that pattern.
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 import uuid
 from datetime import time
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.audit.models import AccessLogEntry
 from src.core.config import Settings
 from src.core.tenancy import ClinicScope, apply_clinic_scope
+from src.core.timezones import BOGOTA
 from src.registry.models import Patient
 from src.scheduling.models import (
     AppointmentStatus,
@@ -85,10 +87,37 @@ def _records_returned(body: object) -> int:
     raise AssertionError(f"unexpected response body: {body!r}")
 
 
+async def _finished_yesterday(session: AsyncSession, graph: Graph) -> None:
+    """One completed appointment in the recent past, with both times recorded.
+
+    The reporting routes bucket by date and default to the last 30 days, while
+    `at()` anchors its fixtures to a *future* month -- deliberately, because
+    the booking path refuses a start in the past. So a report of what already
+    happened cannot see them, and `/reports/punctuality` answered with an empty
+    list, which the audit check below rightly refuses to accept as proof that
+    the route audits anything.
+
+    Added here rather than in `_prepare` because it changes the clinic's
+    appointment counts, and other tests in this file assert on those.
+    """
+    yesterday = dt.datetime.now(tz=BOGOTA) - dt.timedelta(days=1)
+    finished = appointment(
+        graph,
+        yesterday.replace(hour=9, minute=0, second=0, microsecond=0),
+        status=AppointmentStatus.COMPLETED,
+    )
+    finished.started_at = yesterday.replace(hour=9, minute=5, second=0, microsecond=0)
+    finished.ended_at = yesterday.replace(hour=9, minute=25, second=0, microsecond=0)
+    session.add(finished)
+    await session.commit()
+    await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
+
+
 async def test_every_patient_data_route_records_an_audit_entry(
     session: AsyncSession, client: TestClient
 ) -> None:
     graph, appointment_id = await _prepare(session, client)
+    await _finished_yesterday(session, graph)
     paths = [
         path
         for path, operations in client.get("/openapi.json").json()["paths"].items()

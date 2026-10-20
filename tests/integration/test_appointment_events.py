@@ -80,7 +80,10 @@ async def test_rescheduling_records_an_event_against_the_original(
     """The funnel counts "this appointment was moved". The replacement's own
     events tell the rest of the story, so recording against the new row would
     double-count the move."""
-    graph = await create_graph(session)
+    # `hours=True`: `reschedule` now refuses a destination the doctor does not
+    # work, so a test that moves an appointment needs the doctor to have a
+    # schedule. The tests here that only insert rows do not.
+    graph = await create_graph(session, hours=True)
     row = await _booked(session, graph)
 
     result = await booking.reschedule(

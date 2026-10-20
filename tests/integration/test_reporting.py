@@ -160,7 +160,10 @@ async def test_the_funnel_counts_what_happened_not_what_is(
     both the move and the cancellation, because a manager asking "how often do
     we move appointments" cannot read that off a status column.
     """
-    graph = await create_graph(session)
+    # `hours=True`: `reschedule` now refuses a destination the doctor does not
+    # work, so a test that moves an appointment needs the doctor to have a
+    # schedule. The tests here that only insert rows do not.
+    graph = await create_graph(session, hours=True)
     row = await _booked(session, graph, 3)
 
     moved = await booking.reschedule(
