@@ -159,16 +159,37 @@ async def test_a_lost_race_writes_no_audit_entry(session: AsyncSession) -> None:
 
 # ------------------------------------------------------------- idempotency
 async def test_a_replayed_request_returns_the_first_appointment(session: AsyncSession) -> None:
-    """A redelivered webhook must not create a second booking (ADR-16)."""
+    """A redelivered webhook must not create a second booking (ADR-16).
+
+    The replay sends the *same* time. An earlier version of this test sent
+    `LATER` and still expected the first appointment back, which is the
+    behaviour QA finding 5 identified as wrong: the key is the caller's
+    assertion that this is the same request, so answering a different time with
+    the first appointment tells the caller it booked something it did not.
+    """
     graph = await create_graph(session, hours=True)
     first = await _book(session, graph, idempotency_key="wh-1")
     assert first.outcome is Outcome.BOOKED
 
-    replay = await _book(session, graph, start=LATER, idempotency_key="wh-1")
+    replay = await _book(session, graph, idempotency_key="wh-1")
     assert replay.outcome is Outcome.DUPLICATE
     assert replay.appointment is not None
     assert replay.appointment.id == first.appointment.id  # type: ignore[union-attr]
     assert await _count(session) == 1, "the replay created nothing"
+
+
+async def test_the_same_key_for_a_different_time_is_refused(session: AsyncSession) -> None:
+    """The other half, which this test used to assert the wrong way round.
+
+    QA finding 5: a key reused for a different time is a conflict, not a
+    replay. Returning the first appointment let a caller believe the patient
+    had been booked at a time nobody had written.
+    """
+    graph = await create_graph(session, hours=True)
+    assert (await _book(session, graph, idempotency_key="wh-2")).outcome is Outcome.BOOKED
+
+    with pytest.raises(booking.KeyReused):
+        await _book(session, graph, start=LATER, idempotency_key="wh-2")
 
 
 # -------------------------------------------------------------------- holds

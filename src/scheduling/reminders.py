@@ -125,6 +125,24 @@ async def reminders_due(
 
     Ordered by start time so a dispatcher works through the soonest first,
     which is the order that matters if it is rate-limited.
+
+    CLAIMING, AND WHAT IS STILL M4'S
+    --------------------------------
+    The rows are selected `FOR UPDATE SKIP LOCKED`, so two workers sweeping the
+    same clinic at once divide the work instead of both reporting the same
+    reminder (QA finding 14, first risk). The lock is held until the caller's
+    transaction ends, which is also when `mark_sent` commits -- so a worker
+    that crashed before marking releases the row and the next sweep picks it
+    up, rather than losing it.
+
+    The two remaining risks in that finding are M4's and are not pretended to
+    be solved here. A reminder can still go stale between discovery and
+    dispatch, because the appointment may be cancelled in between: the
+    dispatcher has to re-read it immediately before sending, which is why
+    `DueReminder` carries ids rather than rendered text. And a send that
+    succeeded at the provider but crashed before `mark_sent` committed will be
+    retried, which is at-least-once delivery; making it exactly-once needs the
+    transactional outbox and a provider message id, both scheduled for M4.
     """
     due: list[DueReminder] = []
     seen: set[uuid.UUID] = set()
@@ -145,6 +163,10 @@ async def reminders_due(
                     func.lower(Appointment.during) <= horizon,
                 )
                 .order_by(func.lower(Appointment.during))
+                # One worker per reminder. Without this both workers in a
+                # two-worker deployment report the same row, and the patient
+                # gets two messages (QA finding 14).
+                .with_for_update(skip_locked=True)
             )
         ).all()
         for row in rows:

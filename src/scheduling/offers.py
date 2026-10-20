@@ -23,6 +23,7 @@ patient is still waiting.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import uuid
 from dataclasses import dataclass
@@ -68,6 +69,12 @@ class SlotSearch:
     appointment_type_id: uuid.UUID
     start_date: dt.date
     end_date: dt.date
+    #: Which site. QA finding 9: without it, a slot derived from one location's
+    #: hours was held against a different location's id, so a multi-site clinic
+    #: could offer a patient a time at a building the doctor is not in that
+    #: day. `None` means every location, which is the right answer for a
+    #: single-site clinic and the only behaviour that existed before.
+    location_id: uuid.UUID | None = None
     #: Clinic-local times the patient can manage, e.g. "mornings only".
     earliest: dt.time | None = None
     latest: dt.time | None = None
@@ -76,11 +83,17 @@ class SlotSearch:
 
 
 async def _load_rules(
-    session: AsyncSession, *, clinic_id: uuid.UUID, doctor_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    doctor_id: uuid.UUID,
+    location_id: uuid.UUID | None = None,
 ) -> list[Rule]:
     stmt = select(AvailabilityRule).where(
         AvailabilityRule.clinic_id == clinic_id, AvailabilityRule.doctor_id == doctor_id
     )
+    if location_id is not None:
+        stmt = stmt.where(AvailabilityRule.location_id == location_id)
     return [
         Rule(
             weekday=r.weekday,
@@ -121,16 +134,23 @@ async def _load_busy(
     start_date: dt.date,
     end_date: dt.date,
 ) -> list[Busy]:
-    """Appointments and holds occupying this doctor across the window.
+    """The spans occupying this doctor across the window, and nothing else.
 
-    No patient data is read -- only the spans -- so this writes no audit entry.
-    A doctor's calendar is not a disclosure about any particular patient, and
-    recording one access per existing appointment every time somebody asks for
-    a slot would bury the log that matters.
+    Three columns, not the row. The comment below used to say "no patient data
+    is read" while `select(Appointment)` loaded every column including
+    `patient_id` -- QA finding 13, and the reviewer was right that the claim
+    and the query disagreed. Now the query is what the comment says it is, so
+    the reasoning that follows actually holds.
+
+    No audit entry: a doctor's calendar is not a disclosure about any
+    particular patient, and recording one access per existing appointment every
+    time somebody asks for a slot would bury the log that matters. That
+    argument depends on no patient identifier leaving the database, which is
+    now enforced by the SELECT rather than asserted in a comment.
     """
     window_start = dt.datetime.combine(start_date, dt.time.min, tzinfo=BOGOTA)
     window_end = dt.datetime.combine(end_date + dt.timedelta(days=1), dt.time.min, tzinfo=BOGOTA)
-    stmt = select(Appointment).where(
+    stmt = select(Appointment.during, Appointment.expires_at).where(
         Appointment.clinic_id == clinic_id,
         Appointment.doctor_id == doctor_id,
         Appointment.status.in_(ACTIVE_STATUSES),
@@ -139,11 +159,11 @@ async def _load_busy(
         Appointment.during.op("&&")(Range(window_start, window_end)),
     )
     out: list[Busy] = []
-    for row in (await session.execute(stmt)).scalars():
-        lower, upper = row.during.lower, row.during.upper
+    for during, expires_at in await session.execute(stmt):
+        lower, upper = during.lower, during.upper
         if lower is None or upper is None:
             continue  # a bounded range is enforced by CHECK; skip defensively
-        out.append(Busy(lower, upper, expires_at=row.expires_at))
+        out.append(Busy(lower, upper, expires_at=expires_at))
     return out
 
 
@@ -178,7 +198,12 @@ async def find_slots(
     if appointment_type is None:
         raise ValueError(f"no appointment type {search.appointment_type_id}")
 
-    rules = await _load_rules(session, clinic_id=search.clinic_id, doctor_id=search.doctor_id)
+    rules = await _load_rules(
+        session,
+        clinic_id=search.clinic_id,
+        doctor_id=search.doctor_id,
+        location_id=search.location_id,
+    )
     exceptions = await _load_exceptions(
         session,
         clinic_id=search.clinic_id,
@@ -284,7 +309,18 @@ async def offer(
     found nothing or because every candidate was taken on the way. From the
     patient's side those are the same situation, and both need a person.
     """
-    slots = await find_slots(session, search, now=now, limit=limit)
+    # QA finding 9: the hold used `location_id` while the search ignored it, so
+    # the two could disagree. The search now carries the location, and this is
+    # where they are reconciled -- a caller that passes both must pass the same
+    # one, because a slot found at one site cannot be held at another.
+    if search.location_id is not None and search.location_id != location_id:
+        raise ValueError(
+            f"the search is for location {search.location_id} but the hold would be "
+            f"placed at {location_id}; a slot found at one site cannot be held at another"
+        )
+    slots = await find_slots(
+        session, dataclasses.replace(search, location_id=location_id), now=now, limit=limit
+    )
 
     held: list[booking.BookingResult] = []
     for slot in slots:

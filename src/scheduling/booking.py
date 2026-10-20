@@ -117,6 +117,39 @@ async def _existing_by_key(session: AsyncSession, idempotency_key: str) -> Appoi
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+#: The fields that make two requests under one key the same request.
+#:
+#: QA finding 5. The key alone was enough to return the earlier appointment,
+#: so a key reused for a different operation -- a hold's key sent with a
+#: booking, a key sent with a second patient's id -- answered with somebody
+#: else's appointment and the API reported it as success. These are the fields
+#: a caller is asserting are unchanged when it replays a request; `status`
+#: covers the hold-versus-booking case, because a hold and a booking differ by
+#: exactly that.
+_IDENTITY: Final = (
+    "clinic_id",
+    "patient_id",
+    "doctor_id",
+    "location_id",
+    "appointment_type_id",
+    "status",
+)
+
+
+def _same_request(existing: Appointment, requested: Appointment) -> bool:
+    """Whether `requested` is a replay of the request that wrote `existing`.
+
+    The time span is compared separately: `during` is a Range, and the bounds
+    are what a caller means by "the same appointment", not the object identity.
+    """
+    if any(getattr(existing, field) != getattr(requested, field) for field in _IDENTITY):
+        return False
+    return (
+        existing.during.lower == requested.during.lower
+        and existing.during.upper == requested.during.upper
+    )
+
+
 async def _insert(session: AsyncSession, appointment: Appointment) -> BookingResult:
     """Insert one appointment, turning a lost race into an outcome.
 
@@ -135,9 +168,34 @@ async def _insert(session: AsyncSession, appointment: Appointment) -> BookingRes
         if state == UNIQUE_VIOLATION and appointment.idempotency_key:
             existing = await _existing_by_key(session, appointment.idempotency_key)
             if existing is not None:
+                if not _same_request(existing, appointment):
+                    # QA finding 5: the key has been used for a different
+                    # request. Returning the earlier appointment would report
+                    # another operation's result as this one's success, and the
+                    # caller would believe it had booked what it asked for.
+                    raise KeyReused(appointment.idempotency_key) from error
                 return BookingResult(Outcome.DUPLICATE, existing)
         raise
     return BookingResult(Outcome.BOOKED, appointment)
+
+
+class KeyReused(Exception):
+    """An idempotency key was sent with a different request than it first carried.
+
+    QA finding 5. The key is the caller's assertion that this is the same
+    operation it already sent; sending it with a different patient, doctor,
+    time or status is either a bug in the caller or a collision, and both have
+    to be loud. Silently returning the first appointment told the caller it had
+    booked something it had not.
+    """
+
+    def __init__(self, idempotency_key: str) -> None:
+        super().__init__(f"idempotency key {idempotency_key!r} was used for a different request")
+        self.idempotency_key = idempotency_key
+        self.detail_es = (
+            "Esa clave de solicitud ya se usó para otra cita. "
+            "Envíe la misma solicitud o use una clave nueva."
+        )
 
 
 class Ineligible(Exception):
@@ -668,6 +726,25 @@ async def reschedule(
         .with_for_update()
     )
     original = (await session.execute(stmt)).scalar_one_or_none()
+
+    # The key is consulted before the status, and the order is the point. A
+    # move that succeeded leaves the original `rescheduled`, so a retried
+    # request -- a timeout, a redelivered webhook -- fell into the status guard
+    # below and was told TAKEN. The caller then concluded the slot had been
+    # lost and offered the patient another time, while the move it asked for
+    # had in fact happened. Found by the QA finding 5 replay test.
+    if idempotency_key is not None:
+        replayed = await _existing_by_key(session, idempotency_key)
+        if replayed is not None:
+            if (
+                original is None
+                or replayed.rescheduled_from_appointment_id != original.id
+                or replayed.during.lower != start
+                or replayed.during.upper != end
+            ):
+                raise KeyReused(idempotency_key)
+            return BookingResult(Outcome.DUPLICATE, replayed)
+
     if original is None or original.status not in ACTIVE_STATUSES:
         return BookingResult(Outcome.TAKEN)
 
@@ -702,6 +779,14 @@ async def reschedule(
             idempotency_key=idempotency_key,
         ),
     )
+    if result.outcome is Outcome.DUPLICATE:
+        # A replay is handled above, against the key, before anything is
+        # written. Reaching here means the key belongs to a row that is not
+        # this move's replacement -- `_same_request` compared the parties and
+        # the time and found them equal, but the row does not point back at
+        # this original. Returning it would report another operation's
+        # appointment as this move's result (QA finding 5).
+        raise KeyReused(idempotency_key or "")
     if result.outcome is not Outcome.BOOKED or result.appointment is None:
         return result  # the new time was taken; the original is untouched
 
