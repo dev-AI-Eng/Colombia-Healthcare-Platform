@@ -215,3 +215,47 @@ def test_the_heartbeat_is_shorter_than_a_common_proxy_timeout() -> None:
     heartbeat has to beat the shortest of those or the stream dies quietly and
     the dashboard goes stale without saying so."""
     assert 0 < live.HEARTBEAT_SECONDS < 30
+
+
+async def test_a_clinic_may_not_open_unlimited_streams(
+    session: AsyncSession, client: TestClient
+) -> None:
+    """The per-listener queue bounds how much one slow dashboard holds; it does
+    not bound how many dashboards connect.
+
+    A QA audit measured 500 listeners registered against one clinic with
+    nothing refusing the 501st, each costing a queue, a set entry and a held
+    connection on a single-worker deployment. A clinic has a handful of screens,
+    so the cap is small and refusing is a 503 somebody can read.
+    """
+    graph = await create_graph(session)
+    await session.commit()
+    scoped = scope_client(client, graph)
+
+    # Fill the clinic's slots directly: opening real streams through
+    # TestClient would block, since each one is a long-lived response.
+    live._listeners[graph.clinic_id] = {
+        asyncio.Queue(maxsize=live.QUEUE_LIMIT) for _ in range(live.LISTENERS_PER_CLINIC)
+    }
+    try:
+        response = scoped.get("/review/live")
+        assert response.status_code == 503, response.text
+        assert "Demasiadas pantallas" in response.json()["detail"]
+    finally:
+        live._listeners.pop(graph.clinic_id, None)
+
+
+async def test_a_stream_for_a_clinic_that_does_not_exist_is_refused(
+    client: TestClient,
+) -> None:
+    """`clinic_scope` deliberately does not reject an unknown clinic -- the
+    row-level policies simply match nothing -- which is right for a route that
+    reads rows and wrong for this one. The stream reads none, so there is
+    nothing for a policy to filter: an arbitrary UUID became a dictionary key
+    that would never be notified and never collected while the connection was
+    held. A typo'd dashboard URL is now a 404 rather than a dead stream.
+    """
+    nobody = uuid.uuid4()
+    response = client.get("/review/live", params={"clinic_id": str(nobody)})
+    assert response.status_code == 404, response.text
+    assert live.listener_count(nobody) == 0, "a listener was registered for an unknown clinic"

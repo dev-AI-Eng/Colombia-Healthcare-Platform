@@ -10,7 +10,9 @@ gate and lands in the audit log. A socket streaming patient names would be a
 second disclosure channel to secure, and rule 8 would need enforcing twice.
 
 That also makes the stream cheap to reason about: it cannot leak, because there
-is nothing in it to leak.
+is nothing in it to leak. It can still be *exhausted*, which is a different
+question and one the caps below answer -- an earlier version bounded how much
+one slow dashboard could queue and not how many dashboards could connect.
 
 **Why SSE rather than WebSockets.** A dashboard needs the server to talk and
 the browser to listen; nothing here is two-way. Browsers implement SSE natively
@@ -40,10 +42,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Final
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.dependencies import ClinicScopeDep
+from src.api.dependencies import ClinicScopeDep, SessionDep
+from src.registry.models import Clinic
 
 router = APIRouter()
 
@@ -56,6 +61,18 @@ HEARTBEAT_SECONDS: Final = 25.0
 #: that cannot keep up with three notices does not need the fourth: it needs to
 #: re-fetch, which is what every notice tells it to do anyway.
 QUEUE_LIMIT: Final = 4
+
+#: How many dashboards may watch one clinic at once, and in total.
+#:
+#: The per-listener queue above bounds how much one slow dashboard can hold; it
+#: does not bound how many dashboards there are. A QA audit measured 500
+#: listeners registered against one clinic with nothing refusing the 501st,
+#: each costing a queue, a set entry and a held HTTP connection on a
+#: single-worker deployment. A clinic has a handful of screens -- reception, a
+#: consulting room, maybe a manager -- so the real requirement is small and a
+#: cap is what turns "unbounded memory" into a 503 somebody can read.
+LISTENERS_PER_CLINIC: Final = 8
+LISTENERS_TOTAL: Final = 64
 
 #: What changed. A closed set so a screen can decide whether it cares: the
 #: follow-up list does not need redrawing because the audit log grew.
@@ -92,6 +109,21 @@ def listener_count(clinic_id: uuid.UUID) -> int:
     return len(_listeners.get(clinic_id, set()))
 
 
+def _total_listeners() -> int:
+    """Across every clinic, for the global cap."""
+    return sum(len(queues) for queues in _listeners.values())
+
+
+async def _clinic_exists(session: AsyncSession, clinic_id: uuid.UUID) -> bool:
+    """Whether this clinic is real.
+
+    Row-level security scopes the query, so this answers "a clinic I am allowed
+    to see" rather than "any clinic", which is the question that matters here.
+    """
+    found = await session.scalar(select(Clinic.id).where(Clinic.id == clinic_id))
+    return found is not None
+
+
 async def _stream(request: Request, clinic_id: uuid.UUID) -> AsyncIterator[str]:
     """One dashboard's connection, until it goes away."""
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_LIMIT)
@@ -126,7 +158,7 @@ async def _stream(request: Request, clinic_id: uuid.UUID) -> AsyncIterator[str]:
     summary="Stream a notice when this clinic's data changes",
     response_class=StreamingResponse,
 )
-async def live(request: Request, scope: ClinicScopeDep) -> StreamingResponse:
+async def live(request: Request, scope: ClinicScopeDep, session: SessionDep) -> StreamingResponse:
     """Open a server-sent event stream for one clinic.
 
     Scoped by the same dependency every other route uses, so a dashboard
@@ -137,7 +169,27 @@ async def live(request: Request, scope: ClinicScopeDep) -> StreamingResponse:
     audits disclosures of patient data, and this stream discloses none -- it
     says a topic changed. The re-fetch it triggers is audited, which is where
     the patient data actually travels.
+
+    The clinic is checked to exist before a listener is filed under it.
+    `clinic_scope` deliberately does not reject an unknown id -- the row-level
+    policies simply match nothing -- which is right for a route that reads
+    rows, and wrong for this one: the stream reads none, so there is nothing
+    for a policy to filter and an arbitrary UUID became a dictionary key that
+    would never be notified and never collected while the connection was held.
+    A typo'd dashboard URL is now a 404 rather than a stream that is silently
+    dead.
     """
+    if not await _clinic_exists(session, scope.clinic_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No existe esa clínica.")
+
+    if listener_count(scope.clinic_id) >= LISTENERS_PER_CLINIC or _total_listeners() >= (
+        LISTENERS_TOTAL
+    ):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Demasiadas pantallas conectadas. Cierre una e intente de nuevo.",
+        )
+
     return StreamingResponse(
         _stream(request, scope.clinic_id),
         media_type="text/event-stream",
