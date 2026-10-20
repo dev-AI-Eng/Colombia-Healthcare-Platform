@@ -116,6 +116,11 @@ async def _attempt(call: Awaitable[BookingResult]) -> BookingResult:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, ineligible.detail_es
         ) from ineligible
+    except booking.KeyReused as reused:
+        # 409, not 422: the request is well formed and the conflict is with
+        # state the server already holds (QA finding 5). A caller that meant to
+        # replay has a bug; one that collided needs a new key.
+        raise HTTPException(status.HTTP_409_CONFLICT, reused.detail_es) from reused
 
 
 async def _span(

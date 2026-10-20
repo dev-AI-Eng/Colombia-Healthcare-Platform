@@ -21,16 +21,19 @@ import uuid
 import psycopg
 import pytest
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.audit.context import AuditContext
 from src.audit.models import AccessLogEntry
 from src.core.config import Settings
+from src.core.crypto import blind_index
 from src.core.tenancy import ClinicScope, apply_clinic_scope
 from src.core.timezones import BOGOTA
+from src.registry.models import DocumentType, Location, Patient
 from src.scheduling import availability, booking, offers, reminders
-from src.scheduling.booking import Outcome
+from src.scheduling.booking import BookingResult, Outcome
 from src.scheduling.models import (
     Appointment,
     AppointmentStatus,
@@ -951,3 +954,453 @@ async def test_a_reschedule_into_closed_hours_is_refused(session: AsyncSession) 
             start=dt.datetime.combine(day, dt.time(22, 0), tzinfo=BOGOTA),
             end=dt.datetime.combine(day, dt.time(22, 20), tzinfo=BOGOTA),
         )
+
+
+# ========================================================= finding 5: idempotency scope
+
+#: The reviewer's six scenarios, as one table. Only the first two are replays.
+# The 13th, a Tuesday. The 12th is Día de la Raza, moved to the Monday by the
+# Ley Emiliani, and open_windows closes a holiday -- so these tests would fail
+# on eligibility rather than on the idempotency behaviour they are about.
+_FIXED = at(13, 9, 0)
+
+
+async def _book_with(
+    session: AsyncSession, graph: Graph, key: str, **over: object
+) -> BookingResult:
+    args: dict[str, object] = {
+        "clinic_id": graph.clinic_id,
+        "patient_id": graph.patient_id,
+        "doctor_id": graph.doctor_id,
+        "location_id": graph.location_id,
+        "appointment_type_id": graph.appointment_type_id,
+        "start": _FIXED,
+        "end": _FIXED + dt.timedelta(minutes=20),
+        "idempotency_key": key,
+        "now": at(13, 8, 0),
+    }
+    args.update(over)
+    return await booking.book(session, **args)  # type: ignore[arg-type]
+
+
+async def test_an_exact_replay_returns_the_first_appointment(session: AsyncSession) -> None:
+    """The reviewer's first scenario, and the one that must keep working.
+
+    "Replay the exact same booking request." A redelivered webhook must not
+    create a second appointment, which is the whole purpose of the key.
+    """
+    graph = await create_graph(session, hours=True)
+    first = await _book_with(session, graph, "replay-1")
+    assert first.appointment is not None, first.outcome
+
+    again = await _book_with(session, graph, "replay-1")
+    assert again.outcome is Outcome.DUPLICATE
+    assert again.appointment is not None
+    assert again.appointment.id == first.appointment.id
+
+
+async def test_an_exact_hold_replay_returns_the_first_hold(session: AsyncSession) -> None:
+    """ "Replay the exact same hold request." A hold carries a status of its own,
+    so the identity check has to allow a hold to replay as a hold."""
+    graph = await create_graph(session, hours=True)
+    common = {
+        "clinic_id": graph.clinic_id,
+        "patient_id": graph.patient_id,
+        "doctor_id": graph.doctor_id,
+        "location_id": graph.location_id,
+        "appointment_type_id": graph.appointment_type_id,
+        "start": _FIXED,
+        "end": _FIXED + dt.timedelta(minutes=20),
+        "now": at(13, 8, 0),
+        "idempotency_key": "hold-replay-1",
+    }
+    first = await booking.hold(session, **common)  # type: ignore[arg-type]
+    assert first.appointment is not None, first.outcome
+
+    again = await booking.hold(session, **common)  # type: ignore[arg-type]
+    assert again.outcome is Outcome.DUPLICATE
+    assert again.appointment is not None
+    assert again.appointment.id == first.appointment.id
+
+
+async def test_a_booking_key_reused_for_a_hold_is_a_conflict(session: AsyncSession) -> None:
+    """The reviewer's third scenario: "Reuse a booking key for a hold."
+
+    Before the fix this returned the booking and the API reported 201, so a
+    caller that asked for a fifteen-minute hold was told it held the slot and
+    had in fact been handed a confirmed appointment it did not create.
+    """
+    graph = await create_graph(session, hours=True)
+    booked = await _book_with(session, graph, "crossed-1")
+    assert booked.appointment is not None, booked.outcome
+
+    with pytest.raises(booking.KeyReused):
+        await booking.hold(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=graph.doctor_id,
+            location_id=graph.location_id,
+            appointment_type_id=graph.appointment_type_id,
+            start=_FIXED,
+            end=_FIXED + dt.timedelta(minutes=20),
+            now=at(13, 8, 0),
+            idempotency_key="crossed-1",
+        )
+
+
+async def test_a_key_reused_for_another_patient_is_a_conflict(session: AsyncSession) -> None:
+    """ "Reuse a key for a different patient's booking."
+
+    This is the one with a patient-safety edge: the first caller's appointment
+    was returned as though it were the second patient's, so a confirmation
+    would have gone to the wrong person about the wrong appointment.
+    """
+    graph = await create_graph(session, hours=True)
+    other = Patient(
+        clinic_id=graph.clinic_id,
+        document_type=DocumentType.CC,
+        document_number="9988776655",
+        document_number_bidx=blind_index("9988776655"),
+        given_names="Beatriz",
+        family_names="Núñez Peña",
+    )
+    session.add(other)
+    await session.flush()
+
+    booked = await _book_with(session, graph, "shared-1")
+    assert booked.appointment is not None, booked.outcome
+
+    with pytest.raises(booking.KeyReused):
+        await _book_with(
+            session,
+            graph,
+            "shared-1",
+            patient_id=other.id,
+            start=_FIXED + dt.timedelta(hours=1),
+            end=_FIXED + dt.timedelta(hours=1, minutes=20),
+        )
+
+
+async def test_a_key_reused_across_clinics_is_a_conflict(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """ "Reuse a key across clinics."
+
+    The column is unique table-wide, so the second clinic's insert collides.
+    Row-level security hides the other clinic's row, so `_existing_by_key`
+    finds nothing and the violation is re-raised -- which is correct, but as a
+    database error rather than an answer. Asserting on the behaviour either way:
+    the second clinic must not be handed the first clinic's appointment.
+    """
+    mine = await create_graph(session, name="Clínica Una", hours=True)
+    booked = await _book_with(session, mine, "cross-clinic-1")
+    assert booked.appointment is not None, booked.outcome
+    await session.commit()
+
+    theirs = await create_graph(session, name="Clínica Dos", hours=True)
+    await session.commit()
+
+    maker = _maker(settings)
+    try:
+        async with maker() as other:
+            await apply_clinic_scope(other, ClinicScope(clinic_id=theirs.clinic_id))
+            with pytest.raises((DBAPIError, booking.KeyReused)):
+                await _book_with(other, theirs, "cross-clinic-1")
+            await other.rollback()
+    finally:
+        await maker.kw["bind"].dispose()
+
+
+async def test_a_key_reused_for_a_different_reschedule_destination_is_a_conflict(
+    session: AsyncSession,
+) -> None:
+    """ "Reuse a key for a different reschedule destination."
+
+    The dangerous version of this one: the first reschedule's appointment was
+    returned for a request naming a different time, so the caller believed the
+    patient had been moved to a time nobody had booked.
+    """
+    graph = await create_graph(session, hours=True)
+    first = await _book_with(session, graph, "resched-origin")
+    assert first.appointment is not None, first.outcome
+
+    moved = await booking.reschedule(
+        session,
+        clinic_id=graph.clinic_id,
+        appointment_id=first.appointment.id,
+        start=at(13, 14, 0),
+        end=at(13, 14, 20),
+        idempotency_key="resched-1",
+        now=at(13, 8, 0),
+    )
+    assert moved.appointment is not None, moved.outcome
+
+    second = await _book_with(session, graph, "resched-second")
+    assert second.appointment is not None, second.outcome
+    with pytest.raises(booking.KeyReused):
+        await booking.reschedule(
+            session,
+            clinic_id=graph.clinic_id,
+            appointment_id=second.appointment.id,
+            start=at(13, 16, 0),  # a different destination under the same key
+            end=at(13, 16, 20),
+            idempotency_key="resched-1",
+            now=at(13, 8, 0),
+        )
+
+
+async def test_an_exact_reschedule_replay_does_not_move_the_patient_twice(
+    session: AsyncSession,
+) -> None:
+    """An exact replay of a reschedule still succeeds, and leaves exactly one
+    active appointment. The original was transitioned by the first call, and
+    `reschedule` now checks that rather than assuming it."""
+    graph = await create_graph(session, hours=True)
+    booked = await _book_with(session, graph, "replay-resched-origin")
+    assert booked.appointment is not None, booked.outcome
+
+    args = {
+        "clinic_id": graph.clinic_id,
+        "appointment_id": booked.appointment.id,
+        "start": at(13, 15, 0),
+        "end": at(13, 15, 20),
+        "idempotency_key": "replay-resched-1",
+        "now": at(13, 8, 0),
+    }
+    first = await booking.reschedule(session, **args)  # type: ignore[arg-type]
+    assert first.appointment is not None, first.outcome
+
+    again = await booking.reschedule(session, **args)  # type: ignore[arg-type]
+    assert again.outcome is Outcome.DUPLICATE
+
+    active = (
+        await session.execute(
+            select(func.count())
+            .select_from(Appointment)
+            .where(
+                Appointment.clinic_id == graph.clinic_id,
+                Appointment.status.in_(booking.ACTIVE_STATUSES),
+            )
+        )
+    ).scalar_one()
+    assert active == 1, f"{active} active appointments after a replayed move; expected 1"
+
+
+# ========================================================= finding 9: location
+
+
+async def test_a_search_for_one_location_ignores_the_others_hours(
+    session: AsyncSession,
+) -> None:
+    """QA finding 9, in the reviewer's own scenario.
+
+    "Configure the same doctor at two locations with different hours. A search
+    for Location A must not return availability that exists only at Location
+    B."
+
+    Before the fix `_load_rules` ignored location entirely, so a slot derived
+    from the north site's afternoon hours could be held against the south
+    site's id -- the patient is told 15:00 at a building the doctor is not in.
+    """
+    graph = await create_graph(session)
+    await _clear_rules(session, graph)
+    north = Location(clinic_id=graph.clinic_id, name="Sede Norte", address="Calle 100")
+    session.add(north)
+    await session.flush()
+
+    target = dt.date(2026, 11, 10)  # a Tuesday
+    session.add_all(
+        [
+            # The original site: mornings only.
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=graph.location_id,
+                weekday=target.weekday(),
+                start_time=dt.time(8, 0),
+                end_time=dt.time(11, 0),
+                valid_from=dt.date(2026, 1, 1),
+            ),
+            # The north site: afternoons only.
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=north.id,
+                weekday=target.weekday(),
+                start_time=dt.time(14, 0),
+                end_time=dt.time(17, 0),
+                valid_from=dt.date(2026, 1, 1),
+            ),
+        ]
+    )
+    await session.flush()
+
+    def search(location_id: uuid.UUID | None) -> offers.SlotSearch:
+        return offers.SlotSearch(
+            clinic_id=graph.clinic_id,
+            doctor_id=graph.doctor_id,
+            appointment_type_id=graph.appointment_type_id,
+            start_date=target,
+            end_date=target,
+            location_id=location_id,
+        )
+
+    now = dt.datetime(2026, 11, 1, 9, 0, tzinfo=BOGOTA)
+    original = await offers.find_slots(session, search(graph.location_id), now=now, limit=100)
+    assert original, "the original site should still offer its mornings"
+    hours = {s.start.astimezone(BOGOTA).hour for s in original}
+    assert hours <= {8, 9, 10}, f"a search for one site returned another's hours: {sorted(hours)}"
+
+    at_north = await offers.find_slots(session, search(north.id), now=now, limit=100)
+    assert at_north, "the north site should offer its afternoons"
+    north_hours = {s.start.astimezone(BOGOTA).hour for s in at_north}
+    assert north_hours <= {14, 15, 16}, sorted(north_hours)
+
+    # And a search with no location still sees everything, which is what a
+    # single-site clinic needs and the only behaviour that existed before.
+    both = await offers.find_slots(session, search(None), now=now, limit=100)
+    assert {s.start.astimezone(BOGOTA).hour for s in both} > hours
+
+
+async def test_offering_refuses_to_hold_a_slot_at_a_different_location(
+    session: AsyncSession,
+) -> None:
+    """The mismatch the reviewer described, made impossible rather than unlikely.
+
+    `offer` took `location_id` for the hold while the search ignored it, so the
+    two could disagree silently. They cannot now: a caller passing both must
+    pass the same one.
+    """
+    graph = await create_graph(session, hours=True)
+    north = Location(clinic_id=graph.clinic_id, name="Sede Norte", address="Calle 100")
+    session.add(north)
+    await session.flush()
+
+    with pytest.raises(ValueError, match="cannot be held at another"):
+        await offers.offer(
+            session,
+            offers.SlotSearch(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                appointment_type_id=graph.appointment_type_id,
+                start_date=dt.date(2026, 11, 10),
+                end_date=dt.date(2026, 11, 10),
+                location_id=graph.location_id,
+            ),
+            patient_id=graph.patient_id,
+            location_id=north.id,  # not the location the search was for
+            now=dt.datetime(2026, 11, 1, 9, 0, tzinfo=BOGOTA),
+        )
+
+
+# ========================================================= finding 14: reminder claim
+
+
+@pytest.mark.concurrency
+async def test_two_workers_do_not_report_the_same_reminder(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """QA finding 14's first risk: "Simulate two workers claiming the same
+    reminder."
+
+    Two sweeps running at once used to both report every due reminder, because
+    the read took no lock and `mark_sent` happened later. The patient then gets
+    the same message twice. `FOR UPDATE SKIP LOCKED` divides the rows instead.
+
+    The two sweeps are deliberately overlapping in time: the first holds its
+    lock until its transaction ends, so the second must see nothing.
+    """
+    graph = await create_graph(session, hours=True)
+    start = dt.datetime.now(tz=dt.UTC) + dt.timedelta(hours=23)
+    session.add(
+        appointment(
+            graph,
+            start.astimezone(BOGOTA).replace(minute=0, second=0, microsecond=0),
+        )
+    )
+    await session.flush()
+    await session.commit()
+
+    maker = _maker(settings)
+    now = dt.datetime.now(tz=dt.UTC)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def first() -> list[reminders.DueReminder]:
+        async with maker() as other:
+            await apply_clinic_scope(other, ClinicScope(clinic_id=graph.clinic_id))
+            due = await reminders.reminders_due(other, clinic_id=graph.clinic_id, now=now)
+            started.set()
+            await release.wait()  # hold the lock while the second sweep runs
+            await other.rollback()
+            return due
+
+    async def second() -> list[reminders.DueReminder]:
+        await started.wait()
+        async with maker() as other:
+            await apply_clinic_scope(other, ClinicScope(clinic_id=graph.clinic_id))
+            try:
+                # The timeout is the assertion. Without SKIP LOCKED this query
+                # blocks on the first sweep's row lock, and the first sweep is
+                # waiting on this one to finish -- the two tasks deadlock and
+                # the suite hangs rather than failing. Ten seconds turns that
+                # into a readable failure; the query takes milliseconds when
+                # the claim is in place.
+                return await asyncio.wait_for(
+                    reminders.reminders_due(other, clinic_id=graph.clinic_id, now=now),
+                    timeout=10,
+                )
+            except TimeoutError:
+                pytest.fail(
+                    "the second sweep blocked on the first sweep's lock: "
+                    "reminders_due is not claiming rows with SKIP LOCKED"
+                )
+            finally:
+                release.set()
+                await other.rollback()
+
+    try:
+        mine, theirs = await asyncio.gather(first(), second())
+    finally:
+        await maker.kw["bind"].dispose()
+
+    assert len(mine) == 1, f"the first sweep should claim the reminder: {mine}"
+    assert theirs == [], f"the second sweep claimed a reminder the first held: {theirs}"
+
+
+async def test_a_reminder_released_without_being_sent_is_found_again(
+    session: AsyncSession, settings: Settings
+) -> None:
+    """The other half of the claim: a worker that crashes must not lose the
+    reminder. The lock ends with the transaction, so the next sweep sees it --
+    at-least-once, which is the behaviour M4's outbox builds on."""
+    graph = await create_graph(session, hours=True)
+    start = dt.datetime.now(tz=dt.UTC) + dt.timedelta(hours=23)
+    session.add(
+        appointment(
+            graph,
+            start.astimezone(BOGOTA).replace(minute=0, second=0, microsecond=0),
+        )
+    )
+    await session.flush()
+    await session.commit()
+
+    maker = _maker(settings)
+    now = dt.datetime.now(tz=dt.UTC)
+    try:
+        # A worker that found it and died.
+        async with maker() as crashed:
+            await apply_clinic_scope(crashed, ClinicScope(clinic_id=graph.clinic_id))
+            found = await reminders.reminders_due(crashed, clinic_id=graph.clinic_id, now=now)
+            assert len(found) == 1
+            await crashed.rollback()
+
+        async with maker() as retry:
+            await apply_clinic_scope(retry, ClinicScope(clinic_id=graph.clinic_id))
+            again = await reminders.reminders_due(retry, clinic_id=graph.clinic_id, now=now)
+            await retry.rollback()
+    finally:
+        await maker.kw["bind"].dispose()
+
+    assert len(again) == 1, "a reminder nobody sent was lost when the worker died"
