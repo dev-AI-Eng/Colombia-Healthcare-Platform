@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import Final
 
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects.postgresql import Range
@@ -133,9 +134,29 @@ def scope_client(client: TestClient, graph: Graph) -> TestClient:
     return client
 
 
+#: The month every `at()` date falls in: the next one that has not started.
+#:
+#: These dates used to be hard-coded to October 2026, which was in the future
+#: when they were written and is in the past now. That was harmless until
+#: `booking.check_eligible` began refusing a start before `now` -- then twenty
+#: tests across the API and sweeper suites began failing on a correct refusal,
+#: because they book through HTTP where the clock is the real one. Anchoring to
+#: a future month fixes them all and stops the clock doing it again.
+#:
+#: A whole month ahead, not a few days, so that `at(28, ...)` is still in the
+#: future and a test running at 23:50 on the last day of a month does not see
+#: its own dates slide into the past mid-run.
+_ANCHOR: Final = (datetime.now(tz=BOGOTA).replace(day=1) + timedelta(days=40)).replace(day=1)
+
+
 def at(day: int, hour: int, minute: int = 0) -> datetime:
-    """A Bogotá-local time in October 2026."""
-    return datetime(2026, 10, day, hour, minute, tzinfo=BOGOTA)
+    """A Bogotá-local time on `day` of the anchor month, which is always future.
+
+    The day-of-month is kept as the caller gives it, because several tests
+    depend on two `at()` values being the same or different days, and on a
+    specific weekday only via `date.weekday()` rather than a literal.
+    """
+    return _ANCHOR.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
 
 
 async def add_patient_records(session: AsyncSession, graph: Graph) -> uuid.UUID:

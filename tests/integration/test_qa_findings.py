@@ -336,6 +336,10 @@ async def test_a_booking_within_one_clinic_still_works(session: AsyncSession) ->
         appointment_type_id=graph.appointment_type_id,
         start=at(8, 9, 0),
         end=at(8, 9, 20),
+        # The fixture dates are fixed, and the real clock has passed them.
+        # Since the past-booking refusal, a test booking a fixture date has to
+        # say which moment it is booking from.
+        now=at(8, 8, 0),
     )
     assert result.appointment is not None, result.outcome
 
@@ -374,6 +378,7 @@ async def test_two_sessions_rescheduling_one_appointment_admit_exactly_one(
                     appointment_id=original_id,
                     start=at(9, hour, 0),
                     end=at(9, hour, 20),
+                    now=at(9, 8, 0),
                 )
                 await other.commit()
                 return result.outcome
@@ -428,6 +433,7 @@ async def test_two_appointments_cannot_reschedule_into_the_same_slot(
                     appointment_id=appointment_id,
                     start=destination,
                     end=destination + dt.timedelta(minutes=20),
+                    now=at(10, 8, 0),
                 )
                 await other.commit()
                 return result.outcome
@@ -474,22 +480,32 @@ async def test_two_concurrent_attendance_sweeps_raise_one_escalation(
     now = at(5, 9, 0)  # the appointment ended before today began
 
     async def sweep() -> int:
+        # No try/except. An earlier version of this test caught every exception
+        # and returned 0, which supplied the error handling production lacked:
+        # the sweep was crashing on the unique index with an IntegrityError and
+        # this harness hid it, so the test passed while one losing sweep rolled
+        # back every clinic's housekeeping. Letting it propagate is what makes
+        # the test sensitive to the defect it claims to guard.
         async with maker() as other:
             await apply_clinic_scope(other, ClinicScope(clinic_id=graph.clinic_id))
-            try:
-                raised = await reminders.flag_unrecorded_attendance(
-                    other, clinic_id=graph.clinic_id, now=now
-                )
-                await other.commit()
-                return raised
-            except Exception:
-                await other.rollback()
-                return 0
+            raised = await reminders.flag_unrecorded_attendance(
+                other, clinic_id=graph.clinic_id, now=now
+            )
+            await other.commit()
+            return raised
 
     try:
-        await asyncio.gather(sweep(), sweep())
+        raised = await asyncio.gather(sweep(), sweep())
     finally:
         await maker.kw["bind"].dispose()
+
+    # Both sweeps complete, and between them they raise the question once. The
+    # loser returning 0 is the ON CONFLICT no-op; a loser that raised would
+    # abort the whole sweep, which is the failure this asserts against.
+    assert sorted(raised) == [0, 1], (
+        f"the two sweeps returned {raised}; exactly one should have raised the "
+        f"escalation and the other should have found it already taken"
+    )
 
     await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
     count = (
@@ -630,6 +646,7 @@ async def test_rescheduling_audits_both_appointments(session: AsyncSession) -> N
         appointment_id=original_id,
         start=at(11, 15, 0),
         end=at(11, 15, 20),
+        now=at(11, 8, 0),
     )
     assert result.appointment is not None, result.outcome
 
@@ -1404,3 +1421,197 @@ async def test_a_reminder_released_without_being_sent_is_found_again(
         await maker.kw["bind"].dispose()
 
     assert len(again) == 1, "a reminder nobody sent was lost when the worker died"
+
+
+# ===================================================== round 2: F1, location in the write path
+
+
+async def test_a_booking_is_refused_at_a_location_where_the_doctor_has_no_hours(
+    session: AsyncSession,
+) -> None:
+    """Round-2 finding 1: QA finding 9's fix landed in `offers` and not in the
+    write path.
+
+    `offers._load_rules` gained a location filter; `booking._rules_for` did not,
+    so `check_eligible` answered "does the doctor work at this hour" from every
+    site's hours at once. Measured against the code as fixed-for-finding-9: a
+    search at Sede Sur returned 0 slots while a booking at Sede Sur was
+    accepted, for a doctor whose only rule was at Sede Norte.
+
+    The patient travels to the wrong building, the doctor is across town, and
+    the appointment still occupies the doctor's time in the exclusion
+    constraint -- so a real Sede Norte patient is refused that slot.
+    """
+    graph = await create_graph(session)
+    await _clear_rules(session, graph)
+    south = Location(clinic_id=graph.clinic_id, name="Sede Sur", address="Calle 80")
+    session.add(south)
+    await session.flush()
+
+    day = dt.date(2026, 11, 10)  # a Tuesday
+    session.add(
+        AvailabilityRule(
+            clinic_id=graph.clinic_id,
+            doctor_id=graph.doctor_id,
+            location_id=graph.location_id,  # the original site only
+            weekday=day.weekday(),
+            start_time=dt.time(8, 0),
+            end_time=dt.time(12, 0),
+            valid_from=dt.date(2026, 1, 1),
+        )
+    )
+    await session.flush()
+
+    morning = dt.datetime.combine(day, dt.time(9, 0), tzinfo=BOGOTA)
+    before = dt.datetime.combine(day, dt.time(7, 0), tzinfo=BOGOTA)
+
+    # The site with hours still works.
+    ok = await booking.book(
+        session,
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        doctor_id=graph.doctor_id,
+        location_id=graph.location_id,
+        appointment_type_id=graph.appointment_type_id,
+        start=morning,
+        end=morning + dt.timedelta(minutes=20),
+        now=before,
+    )
+    assert ok.appointment is not None, ok.outcome
+
+    # The site without hours does not.
+    with pytest.raises(booking.Ineligible):
+        await booking.book(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=graph.doctor_id,
+            location_id=south.id,
+            appointment_type_id=graph.appointment_type_id,
+            start=morning + dt.timedelta(hours=1),
+            end=morning + dt.timedelta(hours=1, minutes=20),
+            now=before,
+        )
+
+
+async def test_a_hold_is_refused_at_a_location_where_the_doctor_has_no_hours(
+    session: AsyncSession,
+) -> None:
+    """The same for a hold, which is the path a conversation actually takes --
+    and a hold at the wrong site blocks the slot for everyone while it lives."""
+    graph = await create_graph(session)
+    await _clear_rules(session, graph)
+    south = Location(clinic_id=graph.clinic_id, name="Sede Sur", address="Calle 80")
+    session.add(south)
+    await session.flush()
+
+    day = dt.date(2026, 11, 11)  # a Wednesday
+    session.add(
+        AvailabilityRule(
+            clinic_id=graph.clinic_id,
+            doctor_id=graph.doctor_id,
+            location_id=graph.location_id,
+            weekday=day.weekday(),
+            start_time=dt.time(8, 0),
+            end_time=dt.time(12, 0),
+            valid_from=dt.date(2026, 1, 1),
+        )
+    )
+    await session.flush()
+
+    morning = dt.datetime.combine(day, dt.time(9, 0), tzinfo=BOGOTA)
+    with pytest.raises(booking.Ineligible):
+        await booking.hold(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=graph.doctor_id,
+            location_id=south.id,
+            appointment_type_id=graph.appointment_type_id,
+            start=morning,
+            end=morning + dt.timedelta(minutes=20),
+            now=dt.datetime.combine(day, dt.time(7, 0), tzinfo=BOGOTA),
+        )
+
+
+# ===================================================== round 2: F2, bookings in the past
+
+
+async def test_a_booking_in_the_past_is_refused(session: AsyncSession) -> None:
+    """Round-2 finding 2: `check_eligible` took `now` and never read it.
+
+    Nothing refused a booking whose time had already gone. `bookable_slots`
+    drops a past slot -- "offering a patient a time that has already gone is
+    worse than offering nothing" -- and the write path had no equivalent, so a
+    slow conversation turn or a redelivered webhook could book into the past.
+    """
+    graph = await create_graph(session, hours=True)
+    day = dt.date(2026, 11, 12)  # a Thursday
+    past = dt.datetime.combine(day, dt.time(9, 0), tzinfo=BOGOTA)
+
+    with pytest.raises(booking.Ineligible) as refused:
+        await booking.book(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=graph.doctor_id,
+            location_id=graph.location_id,
+            appointment_type_id=graph.appointment_type_id,
+            start=past,
+            end=past + dt.timedelta(minutes=20),
+            now=past + dt.timedelta(days=1),  # a day later
+        )
+    # A receptionist reads this, so it says the hour has gone rather than
+    # naming a rule.
+    assert "pasó" in refused.value.detail_es
+
+
+async def test_a_hold_in_the_past_is_refused(session: AsyncSession) -> None:
+    """A hold minted in the past expires before it is created: a dead row that
+    still occupies the exclusion constraint until a sweep runs, which is QA
+    finding 2's failure mode re-entered through another door."""
+    graph = await create_graph(session, hours=True)
+    day = dt.date(2026, 11, 12)
+    past = dt.datetime.combine(day, dt.time(11, 0), tzinfo=BOGOTA)
+
+    with pytest.raises(booking.Ineligible):
+        await booking.hold(
+            session,
+            clinic_id=graph.clinic_id,
+            patient_id=graph.patient_id,
+            doctor_id=graph.doctor_id,
+            location_id=graph.location_id,
+            appointment_type_id=graph.appointment_type_id,
+            start=past,
+            end=past + dt.timedelta(minutes=20),
+            now=past + dt.timedelta(hours=2),
+        )
+
+
+async def test_the_importer_may_still_transcribe_a_past_appointment(
+    session: AsyncSession,
+) -> None:
+    """The past-booking refusal must not break the import.
+
+    An import records appointments the clinic already held, which are all in
+    the past by definition. `override_reason` is how that intent is stated, and
+    the refusal does not apply to it -- the same reasoning that lets an import
+    book outside today's configured hours.
+    """
+    graph = await create_graph(session, hours=True)
+    day = dt.date(2026, 11, 12)
+    past = dt.datetime.combine(day, dt.time(15, 0), tzinfo=BOGOTA)
+
+    result = await booking.book(
+        session,
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        doctor_id=graph.doctor_id,
+        location_id=graph.location_id,
+        appointment_type_id=graph.appointment_type_id,
+        start=past,
+        end=past + dt.timedelta(minutes=20),
+        now=past + dt.timedelta(days=30),
+        override_reason="imported from the clinic's own records",
+    )
+    assert result.appointment is not None, result.outcome
