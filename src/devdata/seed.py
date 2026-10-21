@@ -34,6 +34,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from typing import Final
 
 from faker import Faker
 from sqlalchemy import select
@@ -97,9 +98,39 @@ class SeedReport:
     appointments: int
 
 
+#: Colombian mobile prefixes that actually exist, from libphonenumber's own
+#: metadata (`is_valid_number` accepts these and rejects the rest of 3xx).
+#:
+#: The generator used to be "+573 then nine random digits", which produced
+#: numbers like +573954336730 — possible-looking and invalid, because the 39x
+#: and 33x ranges are not assigned. Nothing noticed until the patient-facing
+#: cancel route began validating the number it was given: a seeded patient
+#: could not prove who they were, because their own number was not real. The
+#: same reasoning as CLAUDE.md §11 — libphonenumber's metadata tracks the 2021
+#: renumbering and a hand-rolled rule does not — applies to generating a
+#: number as much as to checking one.
+#: 324 and 333 are deliberately absent although libphonenumber accepts them:
+#: only part of each range is assigned, so random digits inside them produce an
+#: invalid number a few percent of the time. Twenty-two fully-assigned prefixes
+#: is ample variety for synthetic data, and modelling sub-ranges here would be
+#: re-implementing the metadata this list exists to respect.
+_MOBILE_PREFIXES: Final = (
+    300, 301, 302, 303, 304, 305,
+    310, 311, 312, 313, 314, 315, 316, 317, 318, 319,
+    320, 321, 322, 323,
+    350, 351,
+)  # fmt: skip
+
+
 def _colombian_mobile(rng: random.Random) -> str:
-    """A Colombian mobile number in E.164: +57, then 10 digits starting with 3."""
-    return "+573" + "".join(str(rng.randrange(10)) for _ in range(9))
+    """A valid Colombian mobile number in E.164.
+
+    Valid, not merely well-shaped: `phonenumbers.is_valid_number` accepts every
+    number this returns, which is what the import path and the patient-facing
+    routes both require.
+    """
+    prefix = rng.choice(_MOBILE_PREFIXES)
+    return f"+57{prefix}" + "".join(str(rng.randrange(10)) for _ in range(7))
 
 
 def _next_weekday(today: date) -> date:
