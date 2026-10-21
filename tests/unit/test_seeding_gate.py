@@ -7,11 +7,15 @@ real patient data is enabled.
 
 from __future__ import annotations
 
+import random
+
+import phonenumbers
 import pytest
 
 from main import seeding_decision
 from src.core.config import Settings
 from src.devdata import seed
+from src.devdata.seed import _colombian_mobile
 
 STRONG = "s" * 40
 
@@ -72,3 +76,30 @@ async def test_the_seeder_refuses_once_real_data_is_enabled(
     monkeypatch.setattr(seed, "get_settings", lambda: _settings("staging", allow_real=True))
     with pytest.raises(RuntimeError, match="never be mixed with real patient data"):
         await seed.run_seed()
+
+
+def test_every_seeded_phone_number_is_a_real_colombian_mobile() -> None:
+    """A seeded patient must be able to prove who they are.
+
+    The generator was "+573 then nine random digits", which produces
+    possible-looking invalid numbers: the 39x and 33x ranges are not assigned,
+    so +573954336730 parses and fails validation. Nothing noticed until the
+    patient-facing cancel route began validating the number it was handed --
+    a seeded patient presenting their own number got "el número de teléfono no
+    es válido", because it was not a real number.
+
+    Checked against libphonenumber rather than a regex, for CLAUDE.md §11's
+    reason: its metadata tracks the 2021 renumbering and a hand-rolled rule
+    does not. That applies to generating a number as much as to checking one.
+
+    Five thousand, not five: the defect was a minority of draws, so a handful
+    of samples would have passed against the broken generator.
+    """
+    # Synthetic data, not crypto: the seed makes the failure reproducible.
+    rng = random.Random(20261021)  # noqa: S311
+    invalid = [
+        number
+        for number in (_colombian_mobile(rng) for _ in range(5000))
+        if not phonenumbers.is_valid_number(phonenumbers.parse(number, "CO"))
+    ]
+    assert not invalid, f"{len(invalid)} of 5000 seeded numbers are not valid: {invalid[:5]}"
