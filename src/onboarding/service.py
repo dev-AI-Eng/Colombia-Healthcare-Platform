@@ -27,7 +27,9 @@ from typing import Any, Final
 
 import phonenumbers
 
+from src.core.colombian_ids import check_document_for_age
 from src.core.config import get_settings
+from src.core.timezones import BOGOTA
 from src.onboarding import normalizers as norm
 from src.onboarding.canonical import (
     ALL_FIELDS,
@@ -532,6 +534,7 @@ def validate(
     decisions: ColumnDecisions | None = None,
     excluded_rows: set[int] | None = None,
     corrections: dict[int, dict[str, str]] | None = None,
+    today: dt.date | None = None,
 ) -> tuple[list[RowResult], tuple[ColumnReport, ...]]:
     """Run every normalizer over every row of one sheet.
 
@@ -543,9 +546,13 @@ def validate(
     surname?" supplies the value; it is still converted by the same normalizer
     as every other cell, so a corrected value that is itself invalid is caught
     exactly like an original one.
+
+    `today` is the date ages are measured against, in Bogotá, and exists so a
+    test does not depend on the day it runs.
     """
     decisions = decisions or {}
     index = _column_index(sheet)
+    today = today or dt.datetime.now(BOGOTA).date()
 
     # Date order is decided once per column, from the whole column, before any
     # row is converted. Deciding per row would let one file contain both
@@ -672,6 +679,9 @@ def validate(
                     "This row is hidden in the file. Hiding is not deleting, so confirm "
                     "whether it should be imported."
                 )
+            age_note = document_age_review(produced, today)
+            if age_note is not None:
+                produced.reviews.append(age_note)
         rows.extend(by_entity.values())
 
     # In the file's own column order, and including the columns nobody mapped.
@@ -793,6 +803,46 @@ REFERENCE_FIELDS: Final[dict[Entity, tuple[tuple[str, str], ...]]] = {
     ),
     Entity.AVAILABILITY: (("doctor_ref", "the doctor"),),
 }
+
+
+def document_age_review(row: RowResult, today: dt.date) -> str | None:
+    """A review note when this patient's document type does not fit their age.
+
+    A review, never a refusal and never a block. `find_duplicates` and the
+    reference check stop the whole import because the file cannot be committed
+    as it stands; this cannot be decided from the file at all. An RC on a
+    nine-year-old is the ordinary case -- the clinic registered the child at
+    four and never updated the record -- and the right outcome is a receptionist
+    looking at the document, which is what a review row is. The type is not
+    "fixed" here either: the number on a stale RC is usually still right, and
+    rewriting the type would turn a question into an unexamined assertion
+    (CLAUDE.md §7).
+
+    Needs both values to have converted cleanly. A document type that went to
+    review for being unrecognised has no value here to compare, and a missing
+    birth date is simply nothing to check against: the field is optional.
+    """
+    if row.entity is not Entity.PATIENT:
+        return None
+    document_type = row.values.get("document_type")
+    birth_date = row.values.get("birth_date")
+    if document_type is None or birth_date is None:
+        return None
+    if isinstance(birth_date, dt.datetime):
+        birth_date = birth_date.date()
+    if not isinstance(birth_date, dt.date):
+        return None
+
+    mismatch = check_document_for_age(str(document_type), birth_date, today)
+    if mismatch is None:
+        return None
+    # Named by the clinic's own heading, as every other refusal is.
+    column = next(
+        (cell.column for cell in row.cells if cell.target_field == "document_type"),
+        "document_type",
+    )
+    return f"{column}: {mismatch.message}"
+
 
 IDENTITY_FIELDS: Final[dict[Entity, tuple[str, ...]]] = {
     # What `_apply_patients` matches on.

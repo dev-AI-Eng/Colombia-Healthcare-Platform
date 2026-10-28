@@ -713,6 +713,11 @@ async def _apply_doctors(
             target.external_ref = str(reference)
         if (office := row.values.get("office_number")) is not None:
             target.office_number = str(office)
+        # Only what the file supplied. A re-import of a sheet without a phone
+        # column must not blank the number staff already hold for the doctor.
+        for field_name in ("phone", "secondary_phone", "email"):
+            if (supplied := row.values.get(field_name)) is not None:
+                setattr(target, field_name, str(supplied))
 
         if existing is None:
             session.add(target)

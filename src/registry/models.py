@@ -123,6 +123,11 @@ class Doctor(Base):
     specialty: Mapped[str] = mapped_column(String(100))
     specialty_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app.specialties.id"))
     office_number: Mapped[str | None] = mapped_column(String(32))
+    # How staff reach the doctor. Encrypted like every direct identifier, with no
+    # blind index because nothing looks a doctor up by phone (migration 0010).
+    phone: Mapped[str | None] = mapped_column(EncryptedString)
+    secondary_phone: Mapped[str | None] = mapped_column(EncryptedString)
+    email: Mapped[str | None] = mapped_column(EncryptedString)
     external_ref: Mapped[str | None] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

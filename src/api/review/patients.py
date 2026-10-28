@@ -13,6 +13,7 @@ from fastapi import APIRouter, Query
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
 from src.api.review.auth import UNMASKED_FIELDS, RoleDep
+from src.api.review.patient_auth import canonical_phone
 from src.api.review.schemas import (
     AppointmentOut,
     ConsentOut,
@@ -26,6 +27,7 @@ from src.audit.context import AccessAction
 from src.audit.service import Access, record_accesses
 from src.core.timezones import BOGOTA
 from src.identity import repository as identity
+from src.onboarding import normalizers
 from src.registry import repository as registry
 from src.scheduling import repository as scheduling
 from src.scheduling.models import AppointmentStatus
@@ -65,6 +67,22 @@ async def _record_disclosure(session: SessionDep, patients: list[uuid.UUID]) -> 
     )
 
 
+def _searchable_document(raw: str | None) -> str | None:
+    """A typed document number in the form it is stored in.
+
+    Run through the importer's own normalizer, so the form a patient is stored
+    in and the form they are searched for in cannot drift apart: the dotted
+    thousands form loses its dots, a passport is upper-cased, a float-shaped
+    "1020304050.0" loses its ".0". Input the normalizer cannot make sense of
+    falls back to the trimmed text, which matches nobody -- the right answer for
+    a string that is not a document number.
+    """
+    if raw is None or not raw.strip():
+        return None
+    outcome = normalizers.document_number(raw)
+    return outcome.value if isinstance(outcome.value, str) else raw.strip()
+
+
 @router.get("/patients", response_model=Page[PatientOut])
 async def list_patients(
     session: SessionDep,
@@ -72,21 +90,32 @@ async def list_patients(
     role: RoleDep,
     page: PageDep,
     phone: Annotated[
-        str | None, Query(description="Exact E.164 number, for example +573001112233")
+        str | None,
+        Query(description="Exact phone number, written however staff write it"),
     ] = None,
-    document_number: Annotated[str | None, Query(description="Exact document number")] = None,
+    document_number: Annotated[
+        str | None, Query(description="Exact document number, with or without dots")
+    ] = None,
 ) -> Page[PatientOut]:
     """Active patients of the clinic, oldest first.
 
     Names and identifiers are encrypted at rest, so there is no name search.
     `phone` and `document_number` match exactly through the blind indexes.
+
+    What staff type is brought to the form the index was built from before it is
+    looked up. A blind index of "300 111 2233" and of "+573001112233" are
+    unrelated values, so without this a receptionist typing a number the way
+    people say it, or a cédula the way Colombians write it ("1.020.304.050"),
+    got an empty list that read as "no such patient". That is the failure this
+    exists to prevent: an empty result is the one answer a search box must never
+    give for a patient who is in the clinic.
     """
     result = await registry.list_patients(
         session,
         clinic_id=scope.clinic_id,
         page=page,
-        phone_e164=phone,
-        document_number=document_number,
+        phone_e164=None if phone is None or not phone.strip() else canonical_phone(phone),
+        document_number=_searchable_document(document_number),
     )
     today = _today()
     unmasked = role.sees_unmasked
