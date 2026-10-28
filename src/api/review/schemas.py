@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from src.api.review.masking import mask_email, mask_tail
 from src.audit.models import AccessLogEntry
 from src.audit.service import ChainVerification
+from src.core.colombian_ids import age_on
 from src.core.pagination import PageResult
 from src.core.timezones import BOGOTA
 from src.identity.models import Consent, PhoneBinding
@@ -131,6 +132,13 @@ class DoctorOut(_Out):
     full_name: str
     specialty: str
     active: bool
+    #: How staff reach the doctor. Returned in full to staff: the masking on the
+    #: patient screens protects patients from the people browsing them, and a
+    #: colleague's phone number is what this screen is for. Encrypted at rest
+    #: regardless (migration 0010).
+    phone: str | None = None
+    secondary_phone: str | None = None
+    email: str | None = None
 
     @classmethod
     def build(cls, doctor: Doctor) -> DoctorOut:
@@ -155,9 +163,17 @@ class PatientOut(BaseModel):
     is_minor: bool | None
     phone_masked: str | None
     email_masked: str | None
+    #: The patient's health insurer as the clinic wrote it ("Sanitas", "Sura").
+    #: Not an identifier, so never masked.
+    eps: str | None
+    #: Who to try when the patient does not answer: a child, a spouse, a friend.
+    #: The importer has carried both fields since migration 0005; the API simply
+    #: never returned them, so the screen could not show what the import held.
+    secondary_contact_name: str | None
+    secondary_contact_phone_masked: str | None
     created_at: datetime
 
-    #: False when the three identifier fields carry real values rather than
+    #: False when the identifier fields carry real values rather than
     #: masked ones. The field names keep their `_masked` suffix because they
     #: are a published wire contract, and renaming them would break every
     #: existing caller; this flag is how a caller knows which it received.
@@ -186,6 +202,13 @@ class PatientOut(BaseModel):
             is_minor=None if age is None else age < 18,
             phone_masked=patient.phone_e164 if unmasked else mask_tail(patient.phone_e164),
             email_masked=patient.email if unmasked else mask_email(patient.email),
+            eps=patient.eps,
+            secondary_contact_name=patient.secondary_contact_name,
+            secondary_contact_phone_masked=(
+                patient.secondary_contact_phone
+                if unmasked
+                else mask_tail(patient.secondary_contact_phone)
+            ),
             created_at=patient.created_at,
             identifiers_masked=not unmasked,
         )
@@ -363,10 +386,7 @@ class ChainVerificationOut(BaseModel):
 
 
 def _age_on(birth_date: date | None, today: date) -> int | None:
-    if birth_date is None:
-        return None
-    before_birthday = (today.month, today.day) < (birth_date.month, birth_date.day)
-    return today.year - birth_date.year - before_birthday
+    return None if birth_date is None else age_on(birth_date, today)
 
 
 class SlotOut(BaseModel):

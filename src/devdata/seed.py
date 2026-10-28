@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AccessAction, ActorKind, AuditContext, audit_context
 from src.audit.service import Access, record_accesses
+from src.core.colombian_ids import MAJORITY_AGE, TI_MIN_AGE, age_on
 from src.core.config import get_settings
 from src.core.crypto import blind_index
 from src.core.db import configure_event_loop_policy, dispose_engine, get_sessionmaker
@@ -85,6 +86,45 @@ DOCUMENT_TYPES: tuple[DocumentType, ...] = (
     DocumentType.RC,
 )
 DOCUMENT_TYPE_WEIGHTS: tuple[int, ...] = (70, 12, 8, 6, 4)
+
+#: Foreign documents sit outside the age ladder, so a draw of one is kept as is.
+FOREIGN_DOCUMENT_TYPES: frozenset[DocumentType] = frozenset({DocumentType.CE, DocumentType.PT})
+
+#: Insurers as clinics write them. Free text in the schema, because the official
+#: list changes and historical rows name defunct ones.
+EPS_NAMES: tuple[str, ...] = (
+    "Sanitas",
+    "Sura",
+    "Colsanitas",
+    "Salud Total",
+    "Nueva EPS",
+    "Compensar",
+    "Famisanar",
+)
+
+
+def _document_type_for_age(drawn: DocumentType, born: date, today: date) -> DocumentType:
+    """The document a person of this age can actually hold.
+
+    The weighted draw used to be the type outright, independent of the birth
+    date beside it, so 36 of 200 seeded patients held a document their age rules
+    out -- a cédula on a five-year-old, a tarjeta de identidad on a man of
+    sixty. The client then asked for exactly that check on the import, and the
+    demo data he would be shown broke it on a fifth of its rows.
+
+    The draw is still made, so every other seeded value is unchanged; it only
+    stops deciding the RC/TI/CC question, which age settles.
+    """
+    if drawn in FOREIGN_DOCUMENT_TYPES:
+        return drawn
+    age = age_on(born, today)
+    if age < TI_MIN_AGE:
+        return DocumentType.RC
+    if age < MAJORITY_AGE:
+        return DocumentType.TI
+    return DocumentType.CC
+
+
 APPOINTMENT_MINUTES = 20
 APPOINTMENTS_PER_DOCTOR = 12
 SHARED_HANDSET_PATIENTS = 3
@@ -140,29 +180,50 @@ def _next_weekday(today: date) -> date:
     return day
 
 
+def _secondary_contact(extra: random.Random, fake: Faker) -> dict[str, str | None]:
+    """Who to try when the patient does not answer, for about six in ten.
+
+    Not every record has one, which is the point of the column being optional.
+    """
+    if extra.random() > 0.6:
+        return {"secondary_contact_name": None, "secondary_contact_phone": None}
+    return {
+        "secondary_contact_name": f"{fake.first_name()} {fake.last_name()}",
+        "secondary_contact_phone": _colombian_mobile(extra),
+    }
+
+
 async def _create_patients(
     session: AsyncSession, clinic: Clinic, count: int, fake: Faker, rng: random.Random
 ) -> list[Patient]:
     patients: list[Patient] = []
     used_numbers: set[str] = set()
+    today = datetime.now(BOGOTA).date()
+    extra = random.Random(RANDOM_SEED + 1)
     for _ in range(count):
         document_number = str(rng.randrange(10_000_000, 2_000_000_000))
         while document_number in used_numbers:
             document_number = str(rng.randrange(10_000_000, 2_000_000_000))
         used_numbers.add(document_number)
         phone = _colombian_mobile(rng)
+        drawn = rng.choices(DOCUMENT_TYPES, DOCUMENT_TYPE_WEIGHTS)[0]
+        born = fake.date_of_birth(minimum_age=1, maximum_age=92)
+        # A separate stream for the fields added later, so adding them did not
+        # shift a single phone number or date the rest of the seed produces.
         patients.append(
             Patient(
                 clinic_id=clinic.id,
-                document_type=rng.choices(DOCUMENT_TYPES, DOCUMENT_TYPE_WEIGHTS)[0],
+                document_type=_document_type_for_age(drawn, born, today),
                 document_number=document_number,
                 document_number_bidx=blind_index(document_number),
                 given_names=fake.first_name(),
                 family_names=f"{fake.last_name()} {fake.last_name()}",
-                birth_date=fake.date_of_birth(minimum_age=1, maximum_age=92),
+                birth_date=born,
                 phone_e164=phone,
                 phone_e164_bidx=blind_index(phone),
                 email=fake.email(),
+                eps=extra.choice(EPS_NAMES),
+                **_secondary_contact(extra, fake),
             )
         )
     session.add_all(patients)
@@ -212,11 +273,16 @@ async def seed_synthetic_data(
     appointment_type = AppointmentType(
         clinic_id=clinic.id, name="Consulta general", duration_minutes=APPOINTMENT_MINUTES
     )
+    doctor_rng = random.Random(RANDOM_SEED + 2)
     doctor_rows = [
         Doctor(
             clinic_id=clinic.id,
             full_name=f"Dr(a). {fake.first_name()} {fake.last_name()} {fake.last_name()}",
             specialty=SPECIALTIES[index % len(SPECIALTIES)],
+            phone=_colombian_mobile(doctor_rng),
+            # Not every doctor has a second number.
+            secondary_phone=_colombian_mobile(doctor_rng) if index % 2 == 0 else None,
+            email=fake.email(),
         )
         for index in range(doctors)
     ]
