@@ -73,7 +73,7 @@ class NotYourAppointment(Exception):
     detail_es: Final = "Esa cita no está a su nombre. Si necesita cambiarla, llame a la clínica."
 
 
-def _canonical(raw: str) -> str:
+def canonical_phone(raw: str) -> str:
     """The number in E.164, or raise 422.
 
     Canonicalised before indexing, as §7 requires: the blind index of
@@ -132,7 +132,7 @@ async def caller_patient(
             select(PhoneBinding.patient_id)
             .where(
                 PhoneBinding.clinic_id == scope.clinic_id,
-                PhoneBinding.phone_e164_bidx == blind_index(_canonical(phone)),
+                PhoneBinding.phone_e164_bidx == blind_index(canonical_phone(phone)),
                 PhoneBinding.revoked_at.is_(None),
             )
             .order_by(PhoneBinding.created_at)
