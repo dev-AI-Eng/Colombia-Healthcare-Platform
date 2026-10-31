@@ -208,7 +208,9 @@ def test_a_confirmation_without_a_time_is_rejected() -> None:
     """The worst failure mode: the patient believes they are booked and does
     not know when."""
     verdict = validate(
-        "Su cita ha sido confirmada con Dra. Sara Betancur de la Cruz.", FACTS, MessageKind.CONFIRMATION
+        "Su cita ha sido confirmada con Dra. Sara Betancur de la Cruz.",
+        FACTS,
+        MessageKind.CONFIRMATION,
     )
     assert not verdict.approved
     assert Reason.MISSING_REQUIRED_FACT.value in verdict.reason_codes

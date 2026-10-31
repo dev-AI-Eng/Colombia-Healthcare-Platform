@@ -149,9 +149,11 @@ _UNVERIFIABLE_PATTERNS: Final[tuple[tuple[str, str], ...]] = (
     # sentence, because an invented one sends them away or has them fast for
     # nothing.
     (r"\ben ayunas\b", "precondition"),
-    (r"\b(?:traiga|traer|debe traer|lleve|llevar)\b.{0,40}"
-     r"\b(?:orden|autorizacion|autorización|remision|remisión|formula|fórmula|carta)\b",
-     "precondition"),
+    (
+        r"\b(?:traiga|traer|debe traer|lleve|llevar)\b.{0,40}"
+        r"\b(?:orden|autorizacion|autorización|remision|remisión|formula|fórmula|carta)\b",
+        "precondition",
+    ),
     (r"\b(?:no )?(?:puede|podra|podrá) (?:comer|beber|tomar agua|desayunar)\b", "precondition"),
 )
 
