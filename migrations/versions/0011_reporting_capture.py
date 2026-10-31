@@ -1,19 +1,19 @@
 """M4 reporting capture: appointment events, actual times, patient zone.
 
-Numbered 0010, not 0009. It was written as 0009 on this branch while M2's
-`0009_qa_integrity` was written as 0009 on that one, and two files declaring
-the same revision is not something Alembic tolerates quietly: with both
-present `alembic heads` reports `['0009', '0009']` behind a UserWarning and
-`alembic upgrade head` fails outright with "Multiple head revisions are
-present". `main.py` and CI both run `upgrade head`, so whoever merged second
-could not deploy.
+Numbered 0011, after M2's `0010_doctor_contact`. This file was written as 0009
+on this branch while M2's `0009_qa_integrity` was written as 0009 on that one,
+then renumbered 0010 -- and M2's doctor-contact migration took 0010 in turn.
+Two files declaring the same revision is not something Alembic tolerates
+quietly: with both present `alembic heads` reports two heads behind a
+UserWarning and `alembic upgrade head` fails outright with "Multiple head
+revisions are present". `main.py` and CI both run `upgrade head`, so whoever
+merged second could not deploy.
 
-Chained after 0009 rather than beside it because the order matters in one
-direction: 0009 adds the composite foreign keys on `appointments`, and the
-events table here references that table.
+Chained after 0010, and so after 0009, because 0009 adds the composite
+foreign keys on `appointments` that the events table here references.
 
-Revision ID: 0009
-Revises: 0008
+Revision ID: 0011
+Revises: 0010
 Create Date: 2026-10-17
 
 ADR-14: management reporting is computed from an append-only
@@ -53,8 +53,8 @@ from alembic import op
 
 from src.core.config import get_settings
 
-revision: str = "0010"
-down_revision: str | None = "0009"
+revision: str = "0011"
+down_revision: str | None = "0010"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
