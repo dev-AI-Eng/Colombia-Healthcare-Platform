@@ -35,12 +35,18 @@ def _audited(staff_context: AuditContext) -> AuditContext:
 
 
 def _filters(graph: Graph) -> ReportFilter:
-    """A range wide enough to contain everything `at()` builds."""
+    """A range wide enough to contain everything these tests create.
+
+    Events are stamped with the real clock, appointments sit in `at()`'s anchor
+    month. That month skips any month with a public holiday, so it can be
+    several months out: a fixed "today plus 60 days" stopped reaching it when
+    the anchor moved to February 2027, and the report counted nothing.
+    """
     today = dt.datetime.now(tz=BOGOTA).date()
     return ReportFilter(
         clinic_id=graph.clinic_id,
         start_date=today - dt.timedelta(days=30),
-        end_date=today + dt.timedelta(days=60),
+        end_date=max(today + dt.timedelta(days=60), at(28, 23).date()),
     )
 
 
