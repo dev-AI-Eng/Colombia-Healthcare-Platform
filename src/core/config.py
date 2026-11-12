@@ -103,10 +103,33 @@ class Settings(BaseSettings):
     # waiting for inside a request a person is watching.
     mapping_timeout_seconds: float = Field(default=30.0, gt=0)
 
+    # M3's conversation pipeline. The generator drafts and the evaluator judges,
+    # and they must come from **different model families**: self-preference bias
+    # is measured and real, so a model grading its own prose is not a second
+    # opinion. Defaults put the generator on OpenAI and the judge on Groq's
+    # open-weights model, which is a different family reached through the same
+    # SDK. With neither key set both fall back to deterministic behaviour and
+    # the graph still runs end to end (§6: tests never call a provider).
+    generator_model: str = "gpt-5-mini"
+    evaluator_model: str = "openai/gpt-oss-120b"
+    #: A patient is waiting on this, so it is far tighter than the import's.
+    conversation_timeout_seconds: float = Field(default=12.0, gt=0)
+
     @property
     def mapping_llm_available(self) -> bool:
         """Whether a model can be asked about an ambiguous column at all."""
         return bool(self.openai_api_key.get_secret_value() or self.groq_api_key.get_secret_value())
+
+    @property
+    def conversation_llm_available(self) -> bool:
+        """Whether the generator and an independent judge can both be reached.
+
+        Both keys, not either: one key means one family, and an evaluator from
+        the generator's own family is the failure mode CLAUDE.md §11 names.
+        Without both, the graph uses its templated path, which is a complete
+        and safe behaviour rather than a degraded one.
+        """
+        return bool(self.openai_api_key.get_secret_value() and self.groq_api_key.get_secret_value())
 
     @property
     def synthetic_data_mode(self) -> bool:
