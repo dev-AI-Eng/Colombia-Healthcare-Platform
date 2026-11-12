@@ -69,7 +69,12 @@ SESSION_SECONDS: Final = 8 * 60 * 60
 
 #: The fields an unmasked read discloses. Recorded on the audit entry so the
 #: log says what was seen, not merely that something was.
-UNMASKED_FIELDS: Final = ("document_number", "phone_e164", "email")
+UNMASKED_FIELDS: Final = (
+    "document_number",
+    "phone_e164",
+    "email",
+    "secondary_contact_phone",
+)
 
 
 class Role(StrEnum):

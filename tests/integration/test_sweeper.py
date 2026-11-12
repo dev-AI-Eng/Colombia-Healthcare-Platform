@@ -52,7 +52,7 @@ async def _count(session: AsyncSession) -> int:
 
 
 async def test_the_sweep_removes_a_lapsed_hold(session: AsyncSession) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _hold(session, graph, SLOT, minutes=15)  # lapses 08:15
 
     holds, clinics, _due, _flagged = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
@@ -62,7 +62,7 @@ async def test_the_sweep_removes_a_lapsed_hold(session: AsyncSession) -> None:
 
 async def test_the_sweep_leaves_a_live_hold_alone(session: AsyncSession) -> None:
     """Deleting a hold a patient is still deciding on would lose their slot."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _hold(session, graph, SLOT, minutes=120)  # lapses 10:00
 
     removed, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
@@ -72,7 +72,7 @@ async def test_the_sweep_leaves_a_live_hold_alone(session: AsyncSession) -> None
 
 async def test_the_sweep_never_touches_a_real_booking(session: AsyncSession) -> None:
     """A booking has no expiry, so nothing about it can look lapsed."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await booking.book(
         session,
         clinic_id=graph.clinic_id,
@@ -93,7 +93,7 @@ async def test_the_sweep_never_touches_a_real_booking(session: AsyncSession) -> 
 
 async def test_running_the_sweep_twice_is_harmless(session: AsyncSession) -> None:
     """Two scheduled runs can overlap; the second must find nothing to do."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _hold(session, graph, SLOT, minutes=15)
 
     first, *_ = await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
@@ -108,11 +108,11 @@ async def test_the_sweep_covers_every_clinic(session: AsyncSession) -> None:
     statement: a job able to reach across clinics would be the only code that
     can, which is not a privilege worth creating for housekeeping.
     """
-    first = await create_graph(session, name="Clínica Uno")
+    first = await create_graph(session, name="Clínica Uno", hours=True)
     await _hold(session, first, SLOT, minutes=15)
     await session.commit()
 
-    second = await create_graph(session, name="Clínica Dos")
+    second = await create_graph(session, name="Clínica Dos", hours=True)
     await _hold(session, second, SLOT, minutes=15)
     await session.commit()
 
@@ -127,7 +127,7 @@ async def test_the_sweep_covers_every_clinic(session: AsyncSession) -> None:
 
 async def test_the_slot_is_bookable_again_after_a_sweep(session: AsyncSession) -> None:
     """The visible outcome: the time a lapsed hold occupied comes back."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, hours=True)
     await _hold(session, graph, SLOT, minutes=15)
     await sweeper.sweep_every_clinic(session, now=AFTER_THE_FIRST)
 

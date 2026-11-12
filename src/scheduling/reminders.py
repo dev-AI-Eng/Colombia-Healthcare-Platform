@@ -42,7 +42,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -125,6 +126,24 @@ async def reminders_due(
 
     Ordered by start time so a dispatcher works through the soonest first,
     which is the order that matters if it is rate-limited.
+
+    CLAIMING, AND WHAT IS STILL M4'S
+    --------------------------------
+    The rows are selected `FOR UPDATE SKIP LOCKED`, so two workers sweeping the
+    same clinic at once divide the work instead of both reporting the same
+    reminder (QA finding 14, first risk). The lock is held until the caller's
+    transaction ends, which is also when `mark_sent` commits -- so a worker
+    that crashed before marking releases the row and the next sweep picks it
+    up, rather than losing it.
+
+    The two remaining risks in that finding are M4's and are not pretended to
+    be solved here. A reminder can still go stale between discovery and
+    dispatch, because the appointment may be cancelled in between: the
+    dispatcher has to re-read it immediately before sending, which is why
+    `DueReminder` carries ids rather than rendered text. And a send that
+    succeeded at the provider but crashed before `mark_sent` committed will be
+    retried, which is at-least-once delivery; making it exactly-once needs the
+    transactional outbox and a provider message id, both scheduled for M4.
     """
     due: list[DueReminder] = []
     seen: set[uuid.UUID] = set()
@@ -145,6 +164,10 @@ async def reminders_due(
                     func.lower(Appointment.during) <= horizon,
                 )
                 .order_by(func.lower(Appointment.during))
+                # One worker per reminder. Without this both workers in a
+                # two-worker deployment report the same row, and the patient
+                # gets two messages (QA finding 14).
+                .with_for_update(skip_locked=True)
             )
         ).all()
         for row in rows:
@@ -274,69 +297,90 @@ async def flag_unrecorded_attendance(
     if not candidates:
         return 0
 
-    # One escalation per appointment, ever. `resolved` counts: a receptionist
-    # who answered the question should not be asked it again tomorrow.
-    already = set(
-        (
-            await session.scalars(
-                select(Escalation.appointment_id).where(
-                    Escalation.clinic_id == clinic_id,
-                    Escalation.reason == EscalationReason.ATTENDANCE_UNRECORDED,
-                    Escalation.appointment_id.in_([c.id for c in candidates]),
-                )
-            )
-        ).all()
-    )
-
-    raised = 0
-    flagged_patients: list[tuple[uuid.UUID, uuid.UUID | None]] = []
+    # One escalation per appointment, ever, enforced by the partial unique
+    # index migration 0009 added rather than by reading first and hoping.
+    #
+    # The read-then-insert this replaces had two problems. Two overlapping
+    # sweeps could both see "none" and both insert, which is what the index was
+    # added to stop -- and once the index existed, the losing sweep raised an
+    # unhandled IntegrityError instead. `sweep_every_clinic` walks every clinic
+    # inside one transaction, so that error rolled back the clinics already
+    # swept and never reached the ones after: a recurring outage of all
+    # housekeeping, every five minutes, triggered by the exact race the index
+    # was meant to make harmless. Measured with two concurrent workers: one
+    # returned 1, the other raised UniqueViolation.
+    #
+    # ON CONFLICT DO NOTHING makes the loser a no-op, and RETURNING gives back
+    # exactly the rows this sweep created -- so `raised` counts real work and
+    # the audit entries name only escalations that were really written, which
+    # is the property QA finding 12 established.
+    rows_to_insert: list[dict[str, object]] = []
     for row in candidates:
-        if row.id in already:
-            continue
         start = row.during.lower
         if start is None:  # unreachable: the column is NOT NULL and bounded
             continue
         local = start.astimezone(BOGOTA)
-        session.add(
-            Escalation(
-                clinic_id=clinic_id,
-                patient_id=row.patient_id,
-                appointment_id=row.id,
-                reason=EscalationReason.ATTENDANCE_UNRECORDED,
-                status=EscalationStatus.OPEN,
-                detail_es=(
+        rows_to_insert.append(
+            {
+                "id": uuid.uuid4(),
+                "clinic_id": clinic_id,
+                "patient_id": row.patient_id,
+                "appointment_id": row.id,
+                "reason": EscalationReason.ATTENDANCE_UNRECORDED,
+                "status": EscalationStatus.OPEN,
+                "detail_es": (
                     f"Nadie registró si el paciente asistió a la cita del "
                     f"{local.strftime('%d/%m/%Y')} a las "
                     f"{local.strftime('%I:%M %p').lstrip('0').lower()}. "
                     f"Confirme si asistió o no asistió."
                 ),
-                context={
+                "context": {
                     "appointment_start": start.isoformat(),
                     "status_at_sweep": str(row.status),
                 },
-            )
+            }
         )
-        flagged_patients.append((row.id, row.patient_id))
-        raised += 1
 
-    if raised:
-        # One entry per escalation actually written, taken from the loop rather
-        # than recomputed from `candidates`: a filter that drifted would log an
-        # access that never happened, or miss one that did.
-        await record_accesses(
-            session,
-            AccessAction.CREATE,
-            [
-                Access(
-                    resource="escalations",
-                    resource_id=str(appointment_id),
-                    patient_id=patient_id,
-                )
-                for appointment_id, patient_id in flagged_patients
-            ],
+    if not rows_to_insert:
+        return 0
+
+    created = (
+        await session.execute(
+            pg_insert(Escalation)
+            .values(rows_to_insert)
+            # Targeted by index predicate, not by name: 0009 creates a partial
+            # UNIQUE INDEX, and `ON CONFLICT ON CONSTRAINT <name>` only accepts
+            # a real constraint -- PostgreSQL answers "constraint ... does not
+            # exist". The index_where has to match the index's own predicate
+            # for the planner to pick it.
+            .on_conflict_do_nothing(
+                index_elements=["clinic_id", "appointment_id"],
+                index_where=text("reason = 'attendance_unrecorded' AND appointment_id IS NOT NULL"),
+            )
+            .returning(Escalation.id, Escalation.patient_id)
         )
-        await session.flush()
-    return raised
+    ).all()
+    if not created:
+        return 0
+
+    # One entry per escalation actually written, taken from what the database
+    # returned rather than from what we tried to write: the rows a concurrent
+    # sweep won are absent here, so the log never claims an escalation this
+    # transaction did not create.
+    await record_accesses(
+        session,
+        AccessAction.CREATE,
+        [
+            Access(
+                resource="escalations",
+                resource_id=str(escalation_id),
+                patient_id=patient_id,
+            )
+            for escalation_id, patient_id in created
+        ],
+    )
+    await session.flush()
+    return len(created)
 
 
 __all__ = [

@@ -30,11 +30,13 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     SmallInteger,
     String,
     Time,
+    UniqueConstraint,
     Uuid,
     func,
     text,
@@ -80,6 +82,8 @@ class ExceptionKind(StrEnum):
 class AppointmentType(Base):
     __tablename__ = "appointment_types"
     __table_args__ = (
+        # See the registry models: the target for 0009's composite key.
+        UniqueConstraint("clinic_id", "id", name="uq_appointment_types_clinic_id_id"),
         CheckConstraint("duration_minutes > 0", name="duration_positive"),
         CheckConstraint("buffer_minutes >= 0", name="buffer_non_negative"),
         Index("ix_appointment_types_clinic_id", "clinic_id"),
@@ -154,6 +158,31 @@ class AvailabilityException(Base):
 class Appointment(Base):
     __tablename__ = "appointments"
     __table_args__ = (
+        # QA finding 4: an id-only foreign key proves the row exists,
+        # not that it belongs to this clinic. Demonstrated, not theorised --
+        # an appointment in clinic A referencing clinic B's doctor was
+        # accepted. Row-level security compares the row's own clinic_id,
+        # never what it points at, so the key carries the clinic.
+        ForeignKeyConstraint(
+            ["clinic_id", "patient_id"],
+            ["app.patients.clinic_id", "app.patients.id"],
+            name="fk_appointments_clinic_id_patient_id_patients",
+        ),
+        ForeignKeyConstraint(
+            ["clinic_id", "doctor_id"],
+            ["app.doctors.clinic_id", "app.doctors.id"],
+            name="fk_appointments_clinic_id_doctor_id_doctors",
+        ),
+        ForeignKeyConstraint(
+            ["clinic_id", "location_id"],
+            ["app.locations.clinic_id", "app.locations.id"],
+            name="fk_appointments_clinic_id_location_id_locations",
+        ),
+        ForeignKeyConstraint(
+            ["clinic_id", "appointment_type_id"],
+            ["app.appointment_types.clinic_id", "app.appointment_types.id"],
+            name="fk_appointments_clinic_id_appointment_type_id_appointment_types",
+        ),
         ExcludeConstraint(
             ("doctor_id", "="),
             ("during", "&&"),
@@ -182,10 +211,10 @@ class Appointment(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
-    patient_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.patients.id"))
-    doctor_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.doctors.id"))
-    location_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.locations.id"))
-    appointment_type_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.appointment_types.id"))
+    patient_id: Mapped[uuid.UUID] = mapped_column()
+    doctor_id: Mapped[uuid.UUID] = mapped_column()
+    location_id: Mapped[uuid.UUID] = mapped_column()
+    appointment_type_id: Mapped[uuid.UUID] = mapped_column()
     # Half-open [start, end) interval, so back-to-back appointments do not overlap.
     during: Mapped[Range[datetime]] = mapped_column(TSTZRANGE)
     status: Mapped[AppointmentStatus] = mapped_column(
@@ -254,6 +283,21 @@ class Escalation(Base):
     __tablename__ = "escalations"
     __table_args__ = (
         Index("ix_escalations_clinic_id_status", "clinic_id", "status"),
+        # QA finding 10: the attendance sweep read the existing escalations and
+        # then inserted for the rest, so two overlapping sweeps could both see
+        # "none" and both insert. Enforced here rather than checked in Python,
+        # because a check-then-insert has a window and a constraint does not.
+        # Partial: the rule is specific to this reason, and a patient may
+        # legitimately have several escalations of other kinds.
+        Index(
+            "uq_escalations_attendance_per_appointment",
+            "clinic_id",
+            "appointment_id",
+            unique=True,
+            postgresql_where=text(
+                "reason = 'attendance_unrecorded' AND appointment_id IS NOT NULL"
+            ),
+        ),
         {"schema": "app"},
     )
 

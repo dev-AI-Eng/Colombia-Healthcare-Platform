@@ -437,6 +437,59 @@ _DOCTOR: Final = (
         ),
         examples=("12",),
     ),
+    # How staff reach the doctor. Matching is scoped to the sheet's own entity,
+    # so on a doctors sheet the plain headings below mean the doctor's number --
+    # the opposite of the patient's `secondary_contact_phone`, whose aliases all
+    # had to name whose number it was because a bare "Teléfono de contacto" was
+    # the patient's own in most exports. Nobody else's number is on this sheet.
+    Field(
+        "phone",
+        Entity.DOCTOR,
+        Requirement.OPTIONAL,
+        "The doctor's mobile number, for staff to reach them.",
+        aliases=(
+            "celular",
+            "movil",
+            "telefono",
+            "telefono celular",
+            "celular medico",
+            "celular del medico",
+            "telefono medico",
+            "telefono del medico",
+            "celular doctor",
+            "telefono doctor",
+            "whatsapp",
+        ),
+        normalizer="phone",
+        examples=("3000000000", "+573000000000"),
+    ),
+    Field(
+        "secondary_phone",
+        Entity.DOCTOR,
+        Requirement.OPTIONAL,
+        "A second number for the doctor, tried when the first does not answer.",
+        aliases=(
+            "telefono 2",
+            "celular 2",
+            "telefono secundario",
+            "celular secundario",
+            "telefono alterno",
+            "celular alterno",
+            "segundo telefono",
+            "otro telefono",
+            "telefono fijo",
+        ),
+        normalizer="phone",
+        examples=("6010000000",),
+    ),
+    Field(
+        "email",
+        Entity.DOCTOR,
+        Requirement.OPTIONAL,
+        "The doctor's email address.",
+        aliases=("correo", "correo electronico", "email", "e-mail", "mail", "correo medico"),
+        examples=("medico@ejemplo.invalid",),
+    ),
 )
 
 _SPECIALTY: Final = (

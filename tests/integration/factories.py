@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from typing import Final
 
 from fastapi.testclient import TestClient
 from sqlalchemy.dialects.postgresql import Range
@@ -22,7 +23,13 @@ from src.identity.models import (
     PhoneBinding,
 )
 from src.registry.models import Clinic, Doctor, DocumentType, Location, Patient
-from src.scheduling.models import Appointment, AppointmentStatus, AppointmentType
+from src.scheduling.availability import colombian_holidays
+from src.scheduling.models import (
+    Appointment,
+    AppointmentStatus,
+    AppointmentType,
+    AvailabilityRule,
+)
 
 PHONE = "+573001112233"
 DOCUMENT = "1020304050"
@@ -37,11 +44,24 @@ class Graph:
     patient_id: uuid.UUID
 
 
-async def create_graph(session: AsyncSession, *, name: str = "Clínica Prueba") -> Graph:
-    """A clinic with one location, doctor, appointment type and patient. Flushed, not committed.
+async def create_graph(
+    session: AsyncSession, *, name: str = "Clínica Prueba", hours: bool = False
+) -> Graph:
+    """A clinic with one location, doctor, appointment type and patient.
 
-    The clinic scope is left bound to the session's transaction, because row-level
-    security rejects every child insert without it.
+    Flushed, not committed. The clinic scope is left bound to the session's
+    transaction, because row-level security rejects every child insert without
+    it.
+
+    `hours=True` also gives the doctor 06:00-22:00 every day. Since QA finding
+    3, `booking.book` refuses a time the doctor does not work, so a test that
+    books needs a schedule -- but it is opt-in rather than the default,
+    because a test that *asserts on* the schedule (the availability, offers and
+    doctor-detail suites) must start from a doctor with none, and a factory
+    that always added rules made nine of those fail.
+
+    Not 00:00-24:00: a `Window` must be ordered, and a 24-hour day would hide
+    an off-by-one at midnight.
     """
     clinic = Clinic(name=name)
     session.add(clinic)
@@ -63,6 +83,22 @@ async def create_graph(session: AsyncSession, *, name: str = "Clínica Prueba") 
     )
     session.add_all([location, doctor, appointment_type, patient])
     await session.flush()
+    if hours:
+        session.add_all(
+            [
+                AvailabilityRule(
+                    clinic_id=clinic.id,
+                    doctor_id=doctor.id,
+                    location_id=location.id,
+                    weekday=weekday,
+                    start_time=time(6, 0),
+                    end_time=time(22, 0),
+                    valid_from=date(2020, 1, 1),
+                )
+                for weekday in range(7)
+            ]
+        )
+        await session.flush()
     return Graph(
         clinic_id=clinic.id,
         doctor_id=doctor.id,
@@ -99,9 +135,45 @@ def scope_client(client: TestClient, graph: Graph) -> TestClient:
     return client
 
 
+def _without_holidays(month: datetime) -> datetime:
+    """`month`, or the first month after it with no holiday on days 1-28."""
+    while any(d.month == month.month and d.day <= 28 for d in colombian_holidays(month.year)):
+        month = (month + timedelta(days=32)).replace(day=1)
+    return month
+
+
+#: The month every `at()` date falls in: at least a month ahead, with no holidays.
+#:
+#: These dates used to be hard-coded to October 2026, which was in the future
+#: when they were written and is in the past now. That was harmless until
+#: `booking.check_eligible` began refusing a start before `now` -- then twenty
+#: tests across the API and sweeper suites began failing on a correct refusal,
+#: because they book through HTTP where the clock is the real one. Anchoring to
+#: a future month fixes them all and stops the clock doing it again.
+#:
+#: A whole month ahead, not a few days, so that `at(28, ...)` is still in the
+#: future and a test running at 23:50 on the last day of a month does not see
+#: its own dates slide into the past mid-run.
+#:
+#: And a month with no Colombian public holiday on days 1-28. `create_graph`
+#: opens the doctor every day, but `open_windows` closes a holiday, so a fixed
+#: day number booked whatever the anchor month put under it: when the anchor
+#: rolled into December, `at(8, ...)` became 8 December, Inmaculada Concepción,
+#: and a test about clinic ownership failed on "no hours". In practice this
+#: picks the next February or September.
+_ANCHOR: Final = _without_holidays(
+    (datetime.now(tz=BOGOTA).replace(day=1) + timedelta(days=40)).replace(day=1)
+)
+
+
 def at(day: int, hour: int, minute: int = 0) -> datetime:
-    """A Bogotá-local time in October 2026."""
-    return datetime(2026, 10, day, hour, minute, tzinfo=BOGOTA)
+    """A Bogotá-local time on `day` of the anchor month, which is always future.
+
+    The day-of-month is kept as the caller gives it, because several tests
+    depend on two `at()` values being the same or different days, and on a
+    specific weekday only via `date.weekday()` rather than a literal.
+    """
+    return _ANCHOR.replace(day=day, hour=hour, minute=minute, second=0, microsecond=0)
 
 
 async def add_patient_records(session: AsyncSession, graph: Graph) -> uuid.UUID:

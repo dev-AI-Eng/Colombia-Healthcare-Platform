@@ -216,3 +216,59 @@ async def test_the_sweep_deletes_only_idle_threads(settings: Settings) -> None:
         ).fetchall()
     assert ("stale-thread",) not in remaining
     assert ("fresh-thread",) in remaining
+
+
+async def test_seeded_patients_hold_a_document_their_age_allows(
+    session: AsyncSession, staff_context: AuditContext
+) -> None:
+    """The demo data must obey the rule the importer enforces.
+
+    The seeder drew the document type by weight, independent of the birth date
+    beside it, so 36 of 200 seeded patients held a document their age rules out
+    -- a cédula on a five-year-old. The client then asked for exactly that check
+    on the import, and the database he would be shown broke it on a fifth of its
+    rows. Two hundred, not twenty: the defect was a minority of draws.
+    """
+    from src.core.colombian_ids import check_document_for_age
+
+    await seed_synthetic_data(session, patients=200, doctors=2)
+    today = datetime.now(BOGOTA).date()
+
+    clinic_id = await session.scalar(select(Patient.clinic_id).limit(1))
+    assert clinic_id is not None
+    await apply_clinic_scope(session, ClinicScope(clinic_id=clinic_id))
+    rows = (await session.execute(select(Patient.document_type, Patient.birth_date))).all()
+
+    assert len(rows) >= 200
+    wrong = [
+        (str(kind), born)
+        for kind, born in rows
+        if born is not None and check_document_for_age(str(kind), born, today) is not None
+    ]
+    assert not wrong, f"{len(wrong)} of {len(rows)} seeded patients break the age rule: {wrong[:3]}"
+
+
+async def test_seeded_patients_and_doctors_carry_the_contact_fields(
+    session: AsyncSession, staff_context: AuditContext
+) -> None:
+    """EPS and a secondary contact on the patients, a phone and an email on the
+    doctors -- the fields the client asked about, so the demo has something to
+    show. Not every record has a secondary contact, which is the point of the
+    column being optional."""
+    from src.registry.models import Doctor
+
+    await seed_synthetic_data(session, patients=60, doctors=4)
+    clinic_id = await session.scalar(select(Patient.clinic_id).limit(1))
+    assert clinic_id is not None
+    await apply_clinic_scope(session, ClinicScope(clinic_id=clinic_id))
+
+    patients = (await session.scalars(select(Patient))).all()
+    assert all(p.eps for p in patients)
+    with_contact = [p for p in patients if p.secondary_contact_phone]
+    assert 0 < len(with_contact) < len(patients)
+    assert all(p.secondary_contact_name for p in with_contact)
+
+    doctors = (await session.scalars(select(Doctor))).all()
+    assert all(d.phone and d.email for d in doctors)
+    assert any(d.secondary_phone for d in doctors)
+    assert any(d.secondary_phone is None for d in doctors)

@@ -713,6 +713,11 @@ async def _apply_doctors(
             target.external_ref = str(reference)
         if (office := row.values.get("office_number")) is not None:
             target.office_number = str(office)
+        # Only what the file supplied. A re-import of a sheet without a phone
+        # column must not blank the number staff already hold for the doctor.
+        for field_name in ("phone", "secondary_phone", "email"):
+            if (supplied := row.values.get(field_name)) is not None:
+                setattr(target, field_name, str(supplied))
 
         if existing is None:
             session.add(target)
@@ -936,6 +941,13 @@ async def _apply_appointments(
             start=start,
             end=start + duration,
             status=status,
+            # An import records appointments the clinic has already made, and
+            # the hours it configures here are today's. A consultation booked
+            # last March under last March's schedule is not an error to refuse
+            # -- refusing it would drop real history and leave a diary that
+            # looks emptier than the clinic's own records. QA finding 3's
+            # eligibility check is for a *new* booking; this is a transcription.
+            override_reason="imported from the clinic's own records",
         )
         if result.ok:
             already.add((doctor_id, start))

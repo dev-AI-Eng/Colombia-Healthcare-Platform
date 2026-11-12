@@ -22,6 +22,7 @@ from sqlalchemy import (
     Index,
     LargeBinary,
     String,
+    UniqueConstraint,
     Uuid,
     func,
     text,
@@ -79,7 +80,14 @@ class Clinic(Base):
 
 class Location(Base):
     __tablename__ = "locations"
-    __table_args__ = (Index("ix_locations_clinic_id", "clinic_id"), {"schema": "app"})
+    __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_locations_clinic_id_id"),
+        Index("ix_locations_clinic_id", "clinic_id"),
+        {"schema": "app"},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
@@ -91,6 +99,10 @@ class Location(Base):
 class Doctor(Base):
     __tablename__ = "doctors"
     __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_doctors_clinic_id_id"),
         Index(
             "uq_doctors_clinic_id_external_ref",
             "clinic_id",
@@ -111,6 +123,11 @@ class Doctor(Base):
     specialty: Mapped[str] = mapped_column(String(100))
     specialty_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("app.specialties.id"))
     office_number: Mapped[str | None] = mapped_column(String(32))
+    # How staff reach the doctor. Encrypted like every direct identifier, with no
+    # blind index because nothing looks a doctor up by phone (migration 0010).
+    phone: Mapped[str | None] = mapped_column(EncryptedString)
+    secondary_phone: Mapped[str | None] = mapped_column(EncryptedString)
+    email: Mapped[str | None] = mapped_column(EncryptedString)
     external_ref: Mapped[str | None] = mapped_column(String(64))
     active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -152,6 +169,10 @@ class Patient(Base):
 
     __tablename__ = "patients"
     __table_args__ = (
+        # The target migration 0009's composite foreign key needs:
+        # an appointment references (clinic_id, id) so the database
+        # itself refuses a reference into another clinic.
+        UniqueConstraint("clinic_id", "id", name="uq_patients_clinic_id_id"),
         Index(
             "uq_patients_clinic_id_document",
             "clinic_id",
