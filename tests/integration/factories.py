@@ -23,6 +23,7 @@ from src.identity.models import (
     PhoneBinding,
 )
 from src.registry.models import Clinic, Doctor, DocumentType, Location, Patient
+from src.scheduling.availability import colombian_holidays
 from src.scheduling.models import (
     Appointment,
     AppointmentStatus,
@@ -134,7 +135,14 @@ def scope_client(client: TestClient, graph: Graph) -> TestClient:
     return client
 
 
-#: The month every `at()` date falls in: the next one that has not started.
+def _without_holidays(month: datetime) -> datetime:
+    """`month`, or the first month after it with no holiday on days 1-28."""
+    while any(d.month == month.month and d.day <= 28 for d in colombian_holidays(month.year)):
+        month = (month + timedelta(days=32)).replace(day=1)
+    return month
+
+
+#: The month every `at()` date falls in: at least a month ahead, with no holidays.
 #:
 #: These dates used to be hard-coded to October 2026, which was in the future
 #: when they were written and is in the past now. That was harmless until
@@ -146,7 +154,16 @@ def scope_client(client: TestClient, graph: Graph) -> TestClient:
 #: A whole month ahead, not a few days, so that `at(28, ...)` is still in the
 #: future and a test running at 23:50 on the last day of a month does not see
 #: its own dates slide into the past mid-run.
-_ANCHOR: Final = (datetime.now(tz=BOGOTA).replace(day=1) + timedelta(days=40)).replace(day=1)
+#:
+#: And a month with no Colombian public holiday on days 1-28. `create_graph`
+#: opens the doctor every day, but `open_windows` closes a holiday, so a fixed
+#: day number booked whatever the anchor month put under it: when the anchor
+#: rolled into December, `at(8, ...)` became 8 December, Inmaculada Concepción,
+#: and a test about clinic ownership failed on "no hours". In practice this
+#: picks the next February or September.
+_ANCHOR: Final = _without_holidays(
+    (datetime.now(tz=BOGOTA).replace(day=1) + timedelta(days=40)).replace(day=1)
+)
 
 
 def at(day: int, hour: int, minute: int = 0) -> datetime:

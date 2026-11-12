@@ -730,6 +730,18 @@ async def _schedule(session: AsyncSession, graph: Graph, day: dt.date) -> None:
     await session.flush()
 
 
+def _before(day: dt.date) -> dt.datetime:
+    """06:00 on `day`, the moment these tests book from.
+
+    Their dates are fixed, so against the real clock they slid into the past
+    and every booking was refused as "Esa hora ya pasó". The refusal tests kept
+    passing, for the wrong reason: remove the holiday check and the holiday
+    test still went green. Booking from the morning of the day keeps each test
+    about the rule it names.
+    """
+    return dt.datetime.combine(day, dt.time(6, 0), tzinfo=BOGOTA)
+
+
 async def test_a_booking_outside_the_doctors_hours_is_refused(
     session: AsyncSession,
 ) -> None:
@@ -757,6 +769,7 @@ async def test_a_booking_outside_the_doctors_hours_is_refused(
             appointment_type_id=graph.appointment_type_id,
             start=afternoon,
             end=afternoon + dt.timedelta(minutes=20),
+            now=_before(day),
         )
     # The receptionist reads this, so it names the hours rather than a rule id.
     assert "08:00-12:00" in refused.value.detail_es
@@ -780,6 +793,7 @@ async def test_a_booking_inside_the_doctors_hours_is_allowed(
         appointment_type_id=graph.appointment_type_id,
         start=morning,
         end=morning + dt.timedelta(minutes=20),
+        now=_before(day),
     )
     assert result.appointment is not None, result.outcome
 
@@ -803,6 +817,7 @@ async def test_a_booking_on_a_public_holiday_is_refused(session: AsyncSession) -
             appointment_type_id=graph.appointment_type_id,
             start=morning,
             end=morning + dt.timedelta(minutes=20),
+            now=_before(holiday),
         )
 
 
@@ -833,6 +848,7 @@ async def test_a_booking_during_a_dated_closure_is_refused(session: AsyncSession
             appointment_type_id=graph.appointment_type_id,
             start=morning,
             end=morning + dt.timedelta(minutes=20),
+            now=_before(day),
         )
 
 
@@ -860,6 +876,7 @@ async def test_a_duration_that_is_not_the_appointment_types_is_refused(
             appointment_type_id=graph.appointment_type_id,
             start=morning,
             end=morning + dt.timedelta(minutes=10),
+            now=_before(day),
         )
     assert "20" in refused.value.detail_es
 
@@ -887,6 +904,7 @@ async def test_a_refused_booking_writes_no_appointment_and_no_audit_entry(
             appointment_type_id=graph.appointment_type_id,
             start=afternoon,
             end=afternoon + dt.timedelta(minutes=20),
+            now=_before(day),
         )
 
     appointments = (
@@ -927,6 +945,7 @@ async def test_an_authorised_override_books_outside_hours_and_is_audited(
         appointment_type_id=graph.appointment_type_id,
         start=afternoon,
         end=afternoon + dt.timedelta(minutes=20),
+        now=_before(day),
         override_reason="La paciente viaja mañana; la doctora autorizó la cita.",
     )
     assert result.appointment is not None, result.outcome
@@ -960,6 +979,7 @@ async def test_a_reschedule_into_closed_hours_is_refused(session: AsyncSession) 
         appointment_type_id=graph.appointment_type_id,
         start=morning,
         end=morning + dt.timedelta(minutes=20),
+        now=_before(day),
     )
     assert booked.appointment is not None
 
@@ -970,15 +990,15 @@ async def test_a_reschedule_into_closed_hours_is_refused(session: AsyncSession) 
             appointment_id=booked.appointment.id,
             start=dt.datetime.combine(day, dt.time(22, 0), tzinfo=BOGOTA),
             end=dt.datetime.combine(day, dt.time(22, 20), tzinfo=BOGOTA),
+            now=_before(day),
         )
 
 
 # ========================================================= finding 5: idempotency scope
 
 #: The reviewer's six scenarios, as one table. Only the first two are replays.
-# The 13th, a Tuesday. The 12th is Día de la Raza, moved to the Monday by the
-# Ley Emiliani, and open_windows closes a holiday -- so these tests would fail
-# on eligibility rather than on the idempotency behaviour they are about.
+# The anchor month has no public holiday (see factories._ANCHOR), so these
+# tests fail on idempotency, the behaviour they are about, never on eligibility.
 _FIXED = at(13, 9, 0)
 
 

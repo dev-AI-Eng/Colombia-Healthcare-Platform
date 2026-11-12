@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AuditContext
 from src.audit.models import AccessLogEntry
+from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers
 from src.scheduling.availability import colombian_holidays
 from src.scheduling.models import (
@@ -63,8 +64,11 @@ def _first_open_monday() -> dt.date:
 
 MONDAY = _first_open_monday()
 FRIDAY = MONDAY + dt.timedelta(days=4)
-#: Before any slot in the week, so "already in the past" never interferes.
-NOW = at(1, 12)
+#: Before any slot in the week, so "already in the past" never interferes: noon
+#: the day before MONDAY. It used to be noon on the 1st, which is the test
+#: Monday itself whenever the anchor month starts on one (February 2027 does),
+#: and then that Monday's morning slots were already gone.
+NOW = dt.datetime.combine(MONDAY - dt.timedelta(days=1), dt.time(12), tzinfo=BOGOTA)
 
 
 @pytest.fixture(autouse=True)
