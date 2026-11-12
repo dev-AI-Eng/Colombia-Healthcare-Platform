@@ -33,8 +33,8 @@ for module in (
     audit,
     scheduling,
     session,
-    conversation,
     live,
+    conversation,
 ):
     router.include_router(module.router)
 
