@@ -166,6 +166,30 @@ class VerifiedFacts:
                 if len(part) > 2:
                     add(part)
 
+        # And by the titled forms a message actually prints. The database holds
+        # the name as the clinic wrote it -- "Ana Restrepo", or the seeder's own
+        # "Dr(a). Ana Restrepo Gomez" -- while a patient-facing draft says
+        # "Dra. Ana Restrepo". Without these the two never met: a confirmation
+        # could not satisfy its required `doctor_name` fact unless the database
+        # value happened to carry a bare "Dra. " prefix, which is the one shape
+        # the test fixtures used and the shape no clinic stores. Measured: the
+        # seeder's format was refused as `missing_required_fact`, and a name
+        # with a particle was refused as a *fabrication*.
+        if self.doctor_name:
+            bare = re.sub(
+                r"^\s*(?:dr|dra|drs|doctor|doctora)\s*\(?a?\)?\s*\.?\s*",
+                "",
+                self.doctor_name,
+                flags=re.IGNORECASE,
+            ).strip()
+            if bare:
+                add(bare)
+                for title in ("Dr.", "Dra.", "Doctor", "Doctora"):
+                    add(f"{title} {bare}")
+                for part in bare.split():
+                    if len(part) > 2:
+                        add(part)
+
         if self.clinic_phone:
             digits = re.sub(r"\D", "", self.clinic_phone)
             add(digits)
