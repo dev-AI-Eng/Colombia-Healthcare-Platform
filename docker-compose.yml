@@ -40,6 +40,7 @@ services:
       APP_DB_PASSWORD: ${APP_DB_PASSWORD:-change-me-locally-app}
       PHI_ENCRYPTION_KEY: ${PHI_ENCRYPTION_KEY:-local-dev-key-not-for-production-000000000}
       PHI_BLIND_INDEX_KEY: ${PHI_BLIND_INDEX_KEY:-local-dev-bidx-not-for-production-00000000}
+      AUDIT_CHAIN_KEY: ${AUDIT_CHAIN_KEY:-local-dev-audit-chain-not-for-production}
       ALLOW_REAL_PATIENT_DATA: ${ALLOW_REAL_PATIENT_DATA:-false}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
     command: ["python", "main.py", "--host", "0.0.0.0", "--port", "8000"]

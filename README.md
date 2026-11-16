@@ -7,11 +7,15 @@ and voice replies to confirm, cancel or reschedule, and offers new times from ea
 doctor's real availability. Every model-written message is checked by an independent
 evaluator before it reaches a patient.
 
-**Status: milestone M1 (data onboarding).** This repository contains the data
-model, encryption, audit logging, database provisioning, LangGraph checkpoint
-storage, a read-only review API over synthetic data, CI, and the spreadsheet
-importer that brings a clinic's existing patients, doctors and specialties into
-the system. No patient messaging exists yet.
+**Status: milestones M0-M3 delivered.** This repository contains the data
+model, encryption, audit logging, database provisioning, CI, the spreadsheet
+importer (M1), the scheduling engine with database-enforced conflict prevention
+and background sweeps (M2), and the conversational pipeline prototype (M3):
+LangGraph orchestration, a generator that writes only courtesy wording while
+code renders every appointment fact (ADR-02), a deterministic validator, and
+an independent model judge. Patient messaging over WhatsApp arrives in M4; the
+pipeline is exercised today through `/review/conversation/turn` and the
+dashboard's conversation simulator.
 
 ---
 
@@ -238,7 +242,7 @@ migrations/          Alembic migrations
 tests/               unit/ and integration/
 ```
 
-## Known limitations at M0
+## Known limitations
 
 - Staff authentication does not exist. The review API is the only data interface and is enabled
   only in synthetic-data mode; while it is enabled the server refuses to bind anywhere but the
@@ -250,11 +254,11 @@ tests/               unit/ and integration/
 - Patient data must not be stored in a conversation channel whose value is a bare string, number
   or boolean: LangGraph writes those into the `checkpoints` row without consulting the encrypting
   serializer. Structured values are encrypted.
-- The checkpoint retention sweep is run by hand (`python -m src.conversation.checkpointer`) until
-  background jobs arrive in M2.
+- The checkpoint retention sweep runs in the background worker (`python -m src.scheduling.jobs
+  worker`, every five minutes) with the other sweeps; it does not run unless the worker does.
 - The audit chain is keyed and anchored, but an anchor bounds the loss only up to the last anchor
-  taken; the API anchors on startup and shutdown, so entries written since then are not yet
-  witnessed. Scheduled anchoring arrives with M2.
+  taken; the API anchors on startup and shutdown only, so entries written since then are not yet
+  witnessed. Scheduled anchoring is not built yet; it belongs with M5's audit hardening.
 - The document type list follows MinSalud's Documento Técnico 1 under Resolución 948 de 2026.
   That table now lives outside the resolution and can change without a new norm, so it needs
   re-checking before real clinic files are imported in M1.
