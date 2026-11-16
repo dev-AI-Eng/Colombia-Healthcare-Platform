@@ -327,6 +327,42 @@ def check_provenance(draft: str, facts: VerifiedFacts) -> list[Finding]:
     return findings
 
 
+#: What a model may never write, because ADR-02 gives it no facts to write.
+#: Stricter than provenance on purpose: provenance asks "does this resolve to
+#: a verified fact", which a model *copying* the right date would pass. The
+#: model is handed no date, so any date, time, number or name it writes is one
+#: it made up -- even a correct-looking one.
+_ANY_DIGIT = re.compile(r"\d")
+_MONTH = re.compile(
+    r"\b(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|"
+    r"octubre|noviembre|diciembre)\b"
+)
+_RELATIVE_DAY = re.compile(r"\b(?:hoy|manana|ayer|anoche|pasado manana)\b")
+_SPELLED_NUMBER = re.compile(
+    r"\b(?:dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece|catorce|"
+    r"quince|dieciseis|diecisiete|dieciocho|diecinueve|veinte|veinti\w+|treinta|"
+    r"cuarenta|cincuenta|sesenta|media hora)\b"
+)
+_CONTACT = re.compile(r"@|https?:|www\.")
+
+
+def check_authored(authored: str) -> list[Finding]:
+    """Stage 0, for model-written wording only: it states no fact at all.
+
+    ADR-02: "a deterministic validator rejects any draft whose free text
+    contains a date, time, number or doctor name." Facts are appended by code
+    after this check, so anything fact-shaped here came from the model.
+    """
+    lowered = normalise(authored)
+    spans = list(_fact_tokens(authored))
+    for pattern in (_ANY_DIGIT, _MONTH, _RELATIVE_DAY, _SPELLED_NUMBER, _CONTACT):
+        spans.extend(match.group(0) for match in pattern.finditer(lowered))
+    return [
+        Finding(Reason.FABRICATED_FACT, span, "model-written text may state no fact (ADR-02)")
+        for span in dict.fromkeys(spans)
+    ]
+
+
 def check_forbidden(draft: str) -> list[Finding]:
     """Stage 2. Medical advice, dosage, diagnosis (rule 5), and claims no fact
     could support.

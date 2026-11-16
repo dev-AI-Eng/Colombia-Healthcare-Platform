@@ -39,6 +39,12 @@ class Intent(StrEnum):
     CONFIRM = "confirm"
     CANCEL = "cancel"
     RESCHEDULE = "reschedule"
+    #: Picked one of the times offered in an earlier turn. Never produced by
+    #: `classify`: `act` sets it once the reply's number resolves against
+    #: offers this system holds for the patient, because "1" alone means
+    #: "confirm" when nothing was offered and "the first time" when something
+    #: was, and only the database knows which.
+    CHOOSE = "choose"
     OPT_OUT = "opt_out"
     HUMAN = "human"
     #: Understood as a question the bot must not answer: anything clinical.
@@ -107,6 +113,10 @@ class Draft:
     #: model. Templated text still passes provenance (ADR-13), but never the
     #: model judge: there is no generated wording for it to judge.
     templated: bool = False
+    #: The words a model wrote, when one did -- `text` minus the facts block
+    #: code appended (ADR-02). The gate checks this part on its own: it must
+    #: state no fact at all, and it is the only part the judge reads.
+    authored: str | None = None
 
 
 class ConversationState(TypedDict, total=False):

@@ -1,35 +1,37 @@
-"""The generator: drafts one Spanish message from verified facts (ADR-02).
+"""The generator: writes the wording around facts that code renders (ADR-02).
 
-Rule 2 shapes this file more than anything else. **The generator never gets a
-database session.** It receives a `verified_facts` object that deterministic
-code built from tool calls, and nothing else that looks like a fact. There is
-no query it can run, no record it can choose, and no patient it can name that a
-tool did not already name.
+ADR-02, as Rev3 states it: "Appointment facts (date, time, doctor, site) are
+never written by the LLM ... code renders the facts from the database, and a
+deterministic validator rejects any draft whose free text contains a date,
+time, number or doctor name."
 
-Three further constraints, each with a reason:
+So the model is given **no facts at all** -- not the date, not the doctor, not
+the patient's name. It is told only what kind of message this is, and writes
+one or two sentences of courtesy for it. Code then appends the facts block,
+rendered by the same pre-approved templates the templated path uses
+(`templates.py`), so every date, time, name and phone number a patient reads
+came from the database through code. The gate checks the model's wording on
+its own first (`validator.check_authored`): any digit, date, weekday, month,
+relative day, spelled-out number, name or contact detail in it is refused,
+even one that happens to be right, because the model had nothing to copy it
+from.
 
-**The facts are rendered by code before they reach the model.** ADR-02 says
-"appointment facts rendered by code", and `facts.spell_date` / `spell_time` are
-that: the model is handed "viernes 23 de octubre" and "10:30 a.m." as strings to
-place in a sentence, never a timestamp to format. A model formatting 10:30 as
-11:30 is the failure the whole pipeline exists to prevent, and the only way to
-remove it is to not ask.
+An earlier version handed the model the verified facts as pre-rendered strings
+and relied on the validator to catch a mis-copied one. That is a weaker
+boundary than the one Rev3 agreed, and it also sent the patient's name and
+appointment to the provider on every turn. Neither is true now.
 
-**The patient's own words are never in the prompt.** Not as context, not as
-"the patient said". Rule 3 makes patient text data, and a generator that read it
-would be a generator that could be instructed by it — prompt injection against
-medical LLMs succeeded in 94.4% of evaluations at the decision turn (JAMA
-Network Open, 19 Dec 2025). The *intent* reaches the generator, as an enum
-deterministic code chose.
+Two constraints carried over unchanged:
+
+**The patient's own words are never in the prompt.** Rule 3 makes patient text
+data; a generator that read it could be instructed by it -- prompt injection
+against medical LLMs succeeded in 94.4% of evaluations at the decision turn
+(JAMA Network Open, 19 Dec 2025). The *intent* reaches the generator, as an
+enum deterministic code chose.
 
 **A failure is a refusal, never a sentence.** No key, a timeout, an empty
 response: all return a draft that cannot be approved, and the gate then does
-what it always does. A generator that invented an apology on error would be
-putting unchecked text one step from a patient.
-
-What the model actually adds over `templates.py` is phrasing: a reply that
-reads as written for this patient rather than filled from a form. It adds no
-facts, and the gate refuses it if it tries.
+what it always does.
 """
 
 from __future__ import annotations
@@ -40,6 +42,15 @@ from typing import Final, Protocol
 
 from src.conversation.facts import VerifiedFacts
 from src.conversation.state import ConversationState, Draft, Intent
+from src.conversation.templates import (
+    CANCELLED,
+    CONFIRMED,
+    REMINDER,
+    STAFF_WILL_CALL,
+    MissingFact,
+    render,
+    render_offer,
+)
 from src.conversation.validator import MessageKind
 from src.core.config import Settings
 
@@ -52,37 +63,43 @@ KIND_FOR: Final[dict[Intent, MessageKind]] = {
     Intent.CONFIRM: MessageKind.CONFIRMATION,
     Intent.CANCEL: MessageKind.CANCELLATION,
     Intent.RESCHEDULE: MessageKind.SLOT_OFFER,
+    Intent.CHOOSE: MessageKind.CONFIRMATION,
     Intent.UNCLEAR: MessageKind.FALLBACK,
 }
 
-#: What the message must contain, per type, stated to the model as a
-#: requirement rather than left to its judgement. The gate checks this
-#: independently (stage 3) -- saying it here only reduces how often a draft is
-#: refused for something avoidable.
-MUST_STATE: Final[dict[MessageKind, str]] = {
-    MessageKind.CONFIRMATION: "la fecha, la hora y el nombre del médico",
-    MessageKind.CANCELLATION: "que la cita fue cancelada, y el teléfono de la clínica",
-    MessageKind.SLOT_OFFER: "cada horario ofrecido, numerado",
-    MessageKind.REMINDER: "la fecha y la hora",
-    MessageKind.FALLBACK: "que una persona de la clínica se pondrá en contacto",
+#: Which pre-approved template renders the facts for each kind. The offer is
+#: rendered by `render_offer`, because the number of slots varies.
+FACTS_TEMPLATE: Final[dict[MessageKind, str]] = {
+    MessageKind.CONFIRMATION: CONFIRMED,
+    MessageKind.CANCELLATION: CANCELLED,
+    MessageKind.REMINDER: REMINDER,
+    MessageKind.FALLBACK: STAFF_WILL_CALL,
+}
+
+#: What each message is about, told to the model in words that carry no fact.
+PURPOSE: Final[dict[MessageKind, str]] = {
+    MessageKind.CONFIRMATION: "La cita del paciente quedó confirmada.",
+    MessageKind.CANCELLATION: "La cita del paciente fue cancelada.",
+    MessageKind.SLOT_OFFER: "Se le ofrecen al paciente horarios para reprogramar su cita.",
+    MessageKind.REMINDER: "Se le recuerda al paciente su próxima cita.",
+    MessageKind.FALLBACK: "Una persona de la clínica se pondrá en contacto con el paciente.",
 }
 
 SYSTEM_PROMPT: Final = """\
-Escribes mensajes de WhatsApp para los pacientes de una clínica colombiana.
+Escribes la frase inicial de un mensaje de WhatsApp de una clínica colombiana \
+a uno de sus pacientes. El sistema de la clínica añade después, por su cuenta, \
+todos los datos de la cita.
 
 REGLAS ABSOLUTAS:
-1. Usa ÚNICAMENTE los datos que se te entregan. No inventes ni deduzcas \
-fechas, horas, nombres, direcciones, números de teléfono ni duraciones. Si un \
-dato no está en la lista, no existe para ti.
-2. Copia las fechas y horas EXACTAMENTE como aparecen. Ya están escritas en el \
-formato correcto; no las reformatees ni las recalcules.
-3. Nunca des información médica: ni diagnóstico, ni dosis, ni tratamiento, ni \
+1. No escribas NINGÚN dato: ni fechas, ni días, ni meses, ni horas, ni \
+números (tampoco en letras), ni nombres de personas, médicos o lugares, ni \
+direcciones, teléfonos o correos. No los conoces; el sistema los añade.
+2. Nunca des información médica: ni diagnóstico, ni dosis, ni tratamiento, ni \
 interpretación de síntomas, ni tranquilización sobre la gravedad de algo.
-4. Escribe en español de Colombia, con usted. Tono claro y respetuoso, sin \
-tecnicismos. Dos o tres frases cortas.
-5. No saludes con el nombre del paciente más de una vez, y no firmes.
+3. Escribe en español de Colombia, con usted. Tono claro y respetuoso. Una o \
+dos frases cortas. No saludes por el nombre y no firmes.
 
-Responde solo con el texto del mensaje. Sin comillas, sin explicaciones."""
+Responde solo con esas frases. Sin comillas, sin explicaciones."""
 
 
 class GeneratorClient(Protocol):
@@ -126,50 +143,26 @@ class OpenAIGenerator:
         return (response.choices[0].message.content or "").strip()
 
 
-def build_user_message(facts: VerifiedFacts, kind: MessageKind) -> str:
+def build_user_message(kind: MessageKind) -> str:
     """The exact payload sent to a provider. Nothing else is transmitted.
 
-    Every value here came from a tool. Dates and times arrive pre-rendered by
-    `facts.spell_date` and `spell_time`, so the model places strings in a
-    sentence rather than formatting an instant -- ADR-02's "facts rendered by
-    code", which is what removes the class of error where a model writes 11:30
-    for a 10:30 appointment.
-
-    The patient's own message is deliberately absent. Rule 3.
+    The message type and what it is about, and nothing more: no patient, no
+    appointment, no clinic. The provider learns that some patient of some
+    clinic is having an appointment confirmed, which is not patient data.
     """
-    lines: list[str] = [f"Tipo de mensaje: {kind.value}", "", "Datos verificados:"]
+    return f"Tipo de mensaje: {kind.value}\nSituación: {PURPOSE[kind]}"
 
-    simple = (
-        ("Nombre del paciente", facts.patient_given_name),
-        ("Médico", facts.doctor_name),
-        ("Especialidad", facts.specialty),
-        ("Sede", facts.location_name),
-        ("Dirección", facts.location_address),
-        ("Clínica", facts.clinic_name),
-        ("Teléfono de la clínica", facts.clinic_phone),
-    )
-    for label, value in simple:
-        if value:
-            lines.append(f"- {label}: {value}")
 
-    if facts.arrive_minutes_early is not None:
-        lines.append(f"- Llegar antes (minutos): {facts.arrive_minutes_early}")
+def facts_block(facts: VerifiedFacts, kind: MessageKind) -> str:
+    """The facts a patient reads, rendered by code from verified facts only.
 
-    if facts.appointment_starts_at is not None:
-        slot = facts.all_times()[0]
-        lines.append(f"- Fecha de la cita: {slot.date_text}")
-        lines.append(f"- Hora de la cita: {slot.time_text}")
-
-    for index, slot in enumerate(facts.offered_slots, start=1):
-        lines.append(f"- Horario {index}: {slot.date_text} a las {slot.time_text}")
-
-    lines.extend(
-        [
-            "",
-            f"El mensaje debe indicar {MUST_STATE[kind]}.",
-        ]
-    )
-    return "\n".join(lines)
+    The same pre-approved wording the templated path sends, so a generated
+    message and a templated one state their facts identically. Raises
+    `MissingFact` when a fact the block needs was not verified.
+    """
+    if kind is MessageKind.SLOT_OFFER:
+        return render_offer(facts)
+    return render(FACTS_TEMPLATE[kind], facts)
 
 
 def _refusal(kind: MessageKind, detail: str) -> Draft:
@@ -189,39 +182,37 @@ def generate(
     client: GeneratorClient | None = None,
     settings: Settings | None = None,
 ) -> Draft:
-    """Draft one message from the verified facts in this state.
+    """Draft one message: model wording, then the facts block code rendered.
 
-    Returns a non-templated draft, so the full gate applies including the model
-    judge (ADR-13 exempts only pre-approved template wording). Never raises:
-    every failure path is a draft the gate will refuse.
+    Returns a non-templated draft carrying the model's words in `authored`, so
+    the gate checks them on their own (they may state no fact) and the judge
+    reads them (ADR-01). Never raises: every failure path is a draft the gate
+    will refuse.
     """
     kind = KIND_FOR.get(state["intent"], MessageKind.FALLBACK)
     facts = state["verified_facts"]
+
+    try:
+        block = facts_block(facts, kind)
+    except MissingFact as missing:
+        # Nothing verified to state, so the model is not asked: there would
+        # be no facts to attach its words to.
+        return _refusal(kind, str(missing))
 
     if client is None:
         if settings is None or not settings.openai_api_key.get_secret_value():
             return _refusal(kind, "no generator key configured")
         client = OpenAIGenerator(settings)
 
-    if facts.is_empty() and kind is not MessageKind.FALLBACK:
-        # Nothing verified to say. A model asked to write a confirmation with
-        # no appointment would invent one, so it is not asked.
-        return _refusal(kind, "no verified facts to state")
-
     try:
-        text = client.complete(SYSTEM_PROMPT, build_user_message(facts, kind))
+        authored = client.complete(SYSTEM_PROMPT, build_user_message(kind)).strip()
     except Exception as error:
         # Deliberately broad: an SDK raises a dozen types and all of them mean
-        # the same thing here. The facts are not logged -- they are patient
-        # data. The disclosure itself is recorded by the graph's `compose`
-        # node, which holds the session this function deliberately does not
-        # (rule 2); the refusal returned below is still `templated=False`, so
-        # that entry is written even though the call failed -- the provider saw
-        # the facts before it failed.
+        # the same thing here.
         logger.warning("generator unavailable: %s", type(error).__name__)
         return _refusal(kind, type(error).__name__)
 
-    if not text.strip():
+    if not authored:
         return _refusal(kind, "empty response")
 
-    return Draft(text=text.strip(), kind=kind, templated=False)
+    return Draft(text=f"{authored}\n\n{block}", kind=kind, templated=False, authored=authored)

@@ -23,6 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.audit.context import AccessAction, AuditContext
 from src.audit.models import AccessLogEntry
 from src.conversation import templates as T
+from src.conversation.generator import facts_block
+from src.conversation.generator import generate as model_generate
 from src.conversation.graph import CLINIC_PHONE_SETTING, Dependencies, build_graph
 from src.conversation.state import Draft, Intent, Stop, initial
 from src.conversation.validator import MessageKind, Verdict, validate
@@ -39,6 +41,7 @@ from src.identity.models import (
 )
 from src.registry.models import Clinic
 from src.scheduling.models import (
+    Appointment,
     AppointmentStatus,
     AvailabilityRule,
     Escalation,
@@ -790,13 +793,12 @@ async def test_a_generated_turn_records_a_disclosure_per_provider(
         f"expected a disclosure entry for each provider, got {processors or 'none'}"
     )
 
-    # The generator's entry names the facts it was given, and names them --
-    # it does not carry their values.
-    generator_fields = next(fields for processor, fields in rows if processor == "generator")
-    assert generator_fields is not None
-    assert "patient_given_name" in generator_fields
-    assert "appointment_starts_at" in generator_fields
-    assert not any("@" in field or field.isdigit() for field in generator_fields)
+    # ADR-02: the generator is sent the message type and nothing else, and
+    # the judge only the model's own wording. The entries say exactly that --
+    # no patient field is named, because none was sent.
+    fields = {processor: tuple(f or ()) for processor, f in rows}
+    assert fields["generator"] == ("message_kind",)
+    assert fields["judge"] == ("authored_text",)
 
 
 async def test_a_templated_turn_discloses_nothing(session: AsyncSession) -> None:
@@ -821,3 +823,315 @@ async def test_a_templated_turn_discloses_nothing(session: AsyncSession) -> None
         )
     ).scalar_one()
     assert disclosures == 0, f"a templated turn recorded {disclosures} disclosure(s)"
+
+
+# ------------------------------------------- ADR-02 through the graph
+#
+# The generator unit tests prove the model is sent no fact and that its wording
+# is refused if it writes one. These prove the same through the assembled
+# graph, with the real `generator.generate` behind a scripted provider: what a
+# patient receives is either the model's courtesy plus facts code rendered, or
+# the static fallback -- never a fact the model wrote.
+
+
+class _Scripted:
+    """A provider double: returns one fixed reply and records every prompt."""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+        self.prompts: list[str] = []
+
+    def complete(self, system: str, user: str) -> str:
+        self.prompts.append(system + "\n" + user)
+        return self.reply
+
+
+def _model_deps(session: AsyncSession, client: _Scripted, judged: list[str]) -> Dependencies:
+    def judge(text: str) -> Verdict:
+        judged.append(text)
+        return Verdict(approved=True)
+
+    return Dependencies(
+        session=session,
+        settings=Settings(_env_file=None),
+        generate=lambda state: model_generate(state, client=client),
+        judge=judge,
+    )
+
+
+async def test_a_model_draft_reaches_the_patient_with_facts_code_rendered(
+    session: AsyncSession,
+) -> None:
+    """The ordinary case through the real generator: the model's courtesy goes
+    out, followed by the date, time and doctor the template rendered."""
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    client = _Scripted("Gracias por confirmar su asistencia.")
+    judged: list[str] = []
+    result = await _run(session, graph, "Si, confirmo", deps=_model_deps(session, client, judged))
+
+    out = result["outbound_text"]
+    assert out is not None and out.startswith("Gracias por confirmar su asistencia.")
+    assert out.endswith(facts_block(result["verified_facts"], MessageKind.CONFIRMATION))
+    # The judge read the model's words only, so it saw no patient data.
+    assert judged == ["Gracias por confirmar su asistencia."]
+    # And the provider was sent no fact: not the doctor, not the time.
+    facts = result["verified_facts"]
+    slot = facts.all_times()[0]
+    for prompt in client.prompts:
+        for fact in (facts.doctor_name, slot.date_text, slot.time_text, facts.patient_given_name):
+            assert fact and fact not in prompt, f"a fact reached the provider: {fact}"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "Le confirmamos su cita del viernes.",
+        "Lo esperamos a las 9:00 a.m.",
+        "Su cita es con la Dra. Prueba.",
+        "Lo esperamos mañana sin falta.",
+    ],
+)
+async def test_a_model_that_writes_any_fact_never_reaches_the_patient(
+    session: AsyncSession, reply: str
+) -> None:
+    """ADR-02 end to end: the model's wording states a fact, true or not, and
+    every attempt is refused at stage 0 -- even with a judge that approves
+    everything. The patient gets the static template, staff get the case."""
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    judged: list[str] = []
+    result = await _run(
+        session, graph, "Si, confirmo", deps=_model_deps(session, _Scripted(reply), judged)
+    )
+
+    assert result["stop"] is Stop.GATE_EXHAUSTED
+    assert result["outbound_text"] == T.STAFF_WILL_CALL
+    assert result["escalation_id"] is not None
+    assert all(not draft.approved for draft in result["drafts"])
+    assert all(
+        {f.reason.value for f in draft.findings} == {"fabricated_fact"}
+        for draft in result["drafts"]
+    )
+    assert judged == [], "a draft with a model-written fact reached the judge"
+
+
+# ------------------------------------- M3's third exit criterion: reschedule
+#
+# Rev3: "A full confirm/cancel/reschedule conversation completes correctly in
+# the prototype." A reschedule is two turns -- the offer, then the patient's
+# pick -- and the offer holds each time it names (ADR-17), linked to the
+# appointment it would replace. These drive both turns through the real graph.
+
+_BY_INTENT = {
+    Intent.CONFIRM: (MessageKind.CONFIRMATION, T.CONFIRMED),
+    Intent.CHOOSE: (MessageKind.CONFIRMATION, T.CONFIRMED),
+    Intent.CANCEL: (MessageKind.CANCELLATION, T.CANCELLED),
+    Intent.RESCHEDULE: (MessageKind.SLOT_OFFER, T.OFFER_INTRO),
+    Intent.UNCLEAR: (MessageKind.FALLBACK, T.STAFF_WILL_CALL),
+}
+
+
+def _by_intent_deps(session: AsyncSession) -> Dependencies:
+    """The prototype's templated generator: the template follows the intent,
+    as `/review/conversation/turn` does, so one dependency set serves every
+    turn of a multi-turn conversation."""
+
+    def generate(state) -> Draft:
+        kind, template = _BY_INTENT[state["intent"]]
+        try:
+            text = (
+                T.render_offer(state["verified_facts"])
+                if kind is MessageKind.SLOT_OFFER
+                else T.render(template, state["verified_facts"])
+            )
+        except T.MissingFact as error:
+            return Draft(text=str(error), kind=kind, templated=True)
+        return Draft(text=text, kind=kind, templated=True)
+
+    return Dependencies(
+        session=session,
+        settings=Settings(_env_file=None),
+        generate=generate,
+        judge=lambda text: Verdict(approved=True),
+    )
+
+
+async def _bookable_week(session: AsyncSession, graph: Graph) -> Appointment:
+    """The patient's appointment, and a doctor who works weekday mornings."""
+    booked = appointment(graph, at(3, 9, 0))
+    session.add(booked)
+    for weekday in range(5):
+        session.add(
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=graph.location_id,
+                weekday=weekday,
+                start_time=dt.time(8, 0),
+                end_time=dt.time(12, 0),
+                valid_from=dt.date(2026, 1, 1),
+            )
+        )
+    await session.flush()
+    return booked
+
+
+async def _offer_holds(session: AsyncSession, original: Appointment) -> list[Appointment]:
+    return list(
+        (
+            await session.execute(
+                select(Appointment)
+                .where(
+                    Appointment.rescheduled_from_appointment_id == original.id,
+                    Appointment.status == AppointmentStatus.HOLD,
+                )
+                .order_by(Appointment.during)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def test_a_full_reschedule_conversation_moves_the_appointment(
+    session: AsyncSession,
+) -> None:
+    """The whole reschedule, in two turns. The offer holds every time it
+    names; "2" moves the appointment into the second one, confirms it, marks
+    the original rescheduled and gives the other held times back."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    offered = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    assert offered["intent"] is Intent.RESCHEDULE
+    assert offered["outbound_text"] and "\n2. " in offered["outbound_text"]
+    holds = await _offer_holds(session, original)
+    slots = offered["verified_facts"].offered_slots
+    assert len(holds) == len(slots) >= 2, "every offered time must be held"
+    second = slots[1]
+
+    chosen = await _run(session, graph, "2", deps=deps, now=now + dt.timedelta(minutes=2))
+    assert chosen["intent"] is Intent.CHOOSE
+    assert chosen["stop"] is None, chosen.get("stop")
+    out = chosen["outbound_text"]
+    assert out and "confirmada" in out
+    assert second.date_text in out and second.time_text in out
+
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.RESCHEDULED
+    moved = (
+        await session.execute(
+            select(Appointment).where(
+                Appointment.rescheduled_from_appointment_id == original.id,
+                Appointment.status == AppointmentStatus.CONFIRMED,
+            )
+        )
+    ).scalar_one()
+    assert moved.during.lower == second.starts_at
+    assert await _offer_holds(session, original) == [], "unchosen offers were not released"
+
+
+async def test_one_after_an_offer_picks_the_first_time_not_a_confirmation(
+    session: AsyncSession,
+) -> None:
+    """Without an offer "1" means confirm; after one it names the first
+    offered time. Deciding that needs the database, which is why `act`
+    decides it rather than the classifier."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    offered = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    first = offered["verified_facts"].offered_slots[0]
+    chosen = await _run(session, graph, "1", deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert chosen["intent"] is Intent.CHOOSE
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.RESCHEDULED
+    assert first.time_text in (chosen["outbound_text"] or "")
+
+
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [("Si, confirmo", AppointmentStatus.CONFIRMED), ("Cancelar", AppointmentStatus.CANCELLED)],
+)
+async def test_after_an_offer_si_or_cancelar_act_on_the_real_appointment(
+    session: AsyncSession, reply: str, expected: AppointmentStatus
+) -> None:
+    """The offers are held for the patient but are not their appointment. An
+    offered time earlier than the original would otherwise be "the next
+    appointment", and "cancelar" would cancel an offer instead."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    assert await _offer_holds(session, original)
+    await _run(session, graph, reply, deps=deps, now=now + dt.timedelta(minutes=1))
+
+    await session.refresh(original)
+    assert original.status is expected
+    assert await _offer_holds(session, original) == [], "the offers outlived the answer"
+
+
+async def test_a_choice_after_the_offers_expire_is_offered_again(
+    session: AsyncSession,
+) -> None:
+    """ADR-17: "A reply after expiry triggers a re-offer." Booking the expired
+    time could hand the patient a slot that has gone to somebody else."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    late = await _run(session, graph, "2", deps=deps, now=now + dt.timedelta(minutes=20))
+
+    assert late["intent"] is Intent.RESCHEDULE
+    assert late["outbound_text"] and "\n1. " in late["outbound_text"]
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED, "an expired offer moved the appointment"
+    holds = await _offer_holds(session, original)
+    assert holds and all(
+        h.expires_at is not None and h.expires_at > now + dt.timedelta(minutes=20) for h in holds
+    ), "the re-offer must hold fresh times"
+
+
+async def test_asking_again_replaces_the_offer_rather_than_adding_to_it(
+    session: AsyncSession,
+) -> None:
+    """A second "otra fecha" releases the first offer's holds before holding
+    new ones, so a patient asking twice does not tie up twice the diary."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    count = len(first["verified_facts"].offered_slots)
+    await _run(session, graph, "otra fecha por favor", deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert len(await _offer_holds(session, original)) == count
+
+
+async def test_a_number_that_names_no_offer_moves_nothing(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    result = await _run(session, graph, "9", deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert result["intent"] is not Intent.CHOOSE
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED

@@ -51,6 +51,7 @@ _TEMPLATE_FOR: Final[dict[str, tuple[MessageKind, str]]] = {
     "confirm": (MessageKind.CONFIRMATION, T.CONFIRMED),
     "cancel": (MessageKind.CANCELLATION, T.CANCELLED),
     "reschedule": (MessageKind.SLOT_OFFER, T.OFFER_INTRO),
+    "choose": (MessageKind.CONFIRMATION, T.CONFIRMED),
     "unclear": (MessageKind.FALLBACK, T.STAFF_WILL_CALL),
 }
 
@@ -87,6 +88,9 @@ class DraftOut(BaseModel):
     """
 
     text: str
+    #: What the model wrote, when one did; the rest of `text` is the facts
+    #: block code rendered (ADR-02). Shown so a reviewer can see the split.
+    authored: str | None
     kind: str
     approved: bool
     templated: bool
@@ -233,6 +237,7 @@ async def run_turn(
         drafts=[
             DraftOut(
                 text=draft.text,
+                authored=draft.authored,
                 kind=draft.kind.value,
                 approved=draft.approved,
                 templated=draft.templated,

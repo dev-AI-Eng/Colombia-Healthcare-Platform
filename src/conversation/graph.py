@@ -44,6 +44,7 @@ building against WhatsApp before the legal question about it is answered.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -52,14 +53,14 @@ from typing import Final, Protocol
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
 from src.conversation import templates as T
 from src.conversation import tools
-from src.conversation.classify import classify_intent
+from src.conversation.classify import chosen_slot, classify_intent
 from src.conversation.facts import FactsBuilder, VerifiedFacts
 from src.conversation.state import (
     ConversationState,
@@ -68,13 +69,18 @@ from src.conversation.state import (
     PatientContext,
     Stop,
 )
-from src.conversation.validator import Verdict, validate
+from src.conversation.validator import Verdict, check_authored, validate
 from src.core.config import Settings
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
 from src.registry import repository as registry
 from src.registry.models import Clinic, Doctor
-from src.scheduling import offers
-from src.scheduling.models import ACTIVE_STATUSES, Appointment, EscalationReason
+from src.scheduling import booking, offers
+from src.scheduling.models import (
+    ACTIVE_STATUSES,
+    Appointment,
+    AppointmentStatus,
+    EscalationReason,
+)
 
 
 class Node(Protocol):
@@ -260,6 +266,42 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
             )
         )
 
+    offers = await _offers(state, deps, appointment) if appointment else []
+    live = [o for o in offers if o.expires_at is not None and o.expires_at > state["now"]]
+    if appointment is not None and offers and intent in {Intent.CONFIRM, Intent.UNCLEAR}:
+        # The previous turn offered numbered times and holds them. A reply
+        # naming one of them is a choice; "1" is a choice here, not "confirm",
+        # because the patient is answering the offer.
+        if not live and chosen_slot(state["inbound_text"], len(offers)) is not None:
+            # The patient answered the offer after its holds expired (the
+            # sweep has not removed them yet). ADR-17: offer again, rather
+            # than book a time that may have gone to somebody else.
+            intent = Intent.RESCHEDULE
+        index = chosen_slot(state["inbound_text"], len(live)) if live else None
+        if index is not None:
+            offers = live
+            moved = await tools.move_to_offered_slot(
+                deps.session,
+                clinic_id=state["clinic_id"],
+                hold_id=offers[index - 1].id,
+                now=state["now"],
+            )
+            if moved.ok:
+                return {
+                    "intent": Intent.CHOOSE,
+                    "appointment_id": offers[index - 1].id,
+                    "verified_facts": _merge(facts, moved.facts),
+                }
+            # Expired between the read and the lock: offer again (ADR-17).
+            intent = Intent.RESCHEDULE
+
+    if appointment is not None and offers and intent in {Intent.CONFIRM, Intent.CANCEL}:
+        # The patient answered about the appointment itself, so the times
+        # held as alternatives go back now rather than at expiry.
+        await booking.release_offers(
+            deps.session, clinic_id=state["clinic_id"], appointment_id=appointment.id
+        )
+
     if intent in {Intent.CONFIRM, Intent.CANCEL}:
         if appointment is None:
             return {"stop": Stop.NO_APPOINTMENT, "verified_facts": facts.build()}
@@ -298,9 +340,39 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         )
         if not result.ok:
             return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
+        # Each offered time is held (ADR-17), linked to the appointment it
+        # would replace, so the patient's later "2" names a time nobody else
+        # can take meanwhile. A fresh offer replaces any earlier one.
+        await booking.release_offers(
+            deps.session, clinic_id=state["clinic_id"], appointment_id=appointment.id
+        )
+        held = FactsBuilder()
+        for slot in result.facts.build().offered_slots:
+            end = slot.starts_at + dt.timedelta(minutes=slot.duration_minutes)
+            taken = await tools.hold_slot(
+                deps.session,
+                clinic_id=state["clinic_id"],
+                patient_id=patient_id,
+                doctor_id=appointment.doctor_id,
+                location_id=appointment.location_id,
+                appointment_type_id=appointment.appointment_type_id,
+                start=slot.starts_at,
+                end=end,
+                now=state["now"],
+                idempotency_key=(
+                    f"offer:{appointment.id}:{slot.starts_at.isoformat()}:"
+                    f"{state['now'].isoformat()}"
+                ),
+                replaces_appointment_id=appointment.id,
+            )
+            if taken.ok:
+                held.offer(slot.starts_at, slot.duration_minutes)
+        if not held.build().offered_slots:
+            return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
         return {
+            "intent": Intent.RESCHEDULE,
             "appointment_id": appointment.id,
-            "verified_facts": _merge(facts, result.facts),
+            "verified_facts": _merge(facts, held),
         }
 
     # UNCLEAR reached `act` only to gather the clinic's own facts, so the
@@ -347,6 +419,37 @@ async def _clinic_facts(state: ConversationState, deps: Dependencies) -> FactsBu
     return builder
 
 
+async def _offers(
+    state: ConversationState, deps: Dependencies, appointment: Appointment
+) -> list[Appointment]:
+    """The times held as offers to replace `appointment`, live or expired but
+    not yet swept, in the order they were offered (by start time, as
+    `render_offer` numbered them). Each is patient data read, so each is
+    recorded (rule 8)."""
+    rows = list(
+        (
+            await deps.session.execute(
+                select(Appointment)
+                .where(
+                    Appointment.clinic_id == state["clinic_id"],
+                    Appointment.rescheduled_from_appointment_id == appointment.id,
+                    Appointment.status == AppointmentStatus.HOLD,
+                )
+                .order_by(Appointment.during)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        await record_access(
+            deps.session,
+            AccessAction.READ,
+            Access(resource="appointments", resource_id=str(row.id), patient_id=row.patient_id),
+        )
+    return rows
+
+
 async def _active_appointment(
     state: ConversationState, deps: Dependencies, patient_id: uuid.UUID
 ) -> Appointment | None:
@@ -364,6 +467,13 @@ async def _active_appointment(
                 Appointment.clinic_id == state["clinic_id"],
                 Appointment.patient_id == patient_id,
                 Appointment.status.in_([s.value for s in ACTIVE_STATUSES]),
+                # An offered slot is held for the patient but is not their
+                # appointment: "sí" or "cancelar" after an offer act on the
+                # appointment the offer would replace, never on the offer.
+                or_(
+                    Appointment.status != AppointmentStatus.HOLD,
+                    Appointment.rescheduled_from_appointment_id.is_(None),
+                ),
             )
             .order_by(Appointment.during)
             .limit(1)
@@ -453,29 +563,6 @@ def _processor_model(settings: Settings, processor: str) -> str:
     return settings.evaluator_model if processor == "judge" else settings.generator_model
 
 
-def _facts_sent(facts: VerifiedFacts) -> tuple[str, ...]:
-    """The names of the fact fields that carry a value, not the values.
-
-    The log records *what kind* of thing was disclosed. Copying the values in
-    would make the audit log a second store of the patient data it exists to
-    account for.
-    """
-    return tuple(
-        name
-        for name in (
-            "patient_given_name",
-            "doctor_name",
-            "specialty",
-            "location_name",
-            "location_address",
-            "clinic_name",
-            "clinic_phone",
-            "appointment_starts_at",
-        )
-        if getattr(facts, name, None) is not None
-    )
-
-
 # -------------------------------------------------------------------- compose
 
 
@@ -500,11 +587,15 @@ async def compose(state: ConversationState, *, deps: Dependencies) -> Conversati
     # the facts before it failed -- and `generator._refusal` returns
     # `templated=False`, so those are recorded too.
     if not draft.templated:
+        # Since ADR-02 was enforced the generator is sent the message type and
+        # nothing else (`generator.build_user_message`), so that is what the
+        # entry names. Still recorded: a call to a processor on this patient's
+        # turn is an event an auditor asks about, even when it carried no data.
         await _record_disclosure(
             state,
             deps,
             processor="generator",
-            fields=_facts_sent(state["verified_facts"]),
+            fields=("message_kind",),
         )
 
     return {"drafts": (*state["drafts"], draft)}
@@ -521,18 +612,26 @@ async def gate(state: ConversationState, *, deps: Dependencies) -> ConversationS
     would introduce a model into a path that has none (ADR-13).
     """
     draft = state["drafts"][-1]
-    verdict = validate(draft.text, state["verified_facts"], draft.kind)
+    # Stage 0 (ADR-02): the words a model wrote may state no fact. Facts are
+    # appended by code, so anything fact-shaped in this part is invented --
+    # even a correct-looking one -- and the draft is refused before the
+    # whole-message stages run.
+    if draft.authored is not None and (authored := check_authored(draft.authored)):
+        verdict = Verdict(approved=False, findings=tuple(authored))
+    else:
+        verdict = validate(draft.text, state["verified_facts"], draft.kind)
 
     if verdict.approved and not draft.templated:
-        # The judge receives the rendered draft, which names the patient and
-        # their appointment. A second processor, a second disclosure.
+        # ADR-01: the evaluator screens the free text. That is the model's
+        # wording; the facts block is pre-approved template text. Judging only
+        # the wording also means the judge is sent no patient data.
         await _record_disclosure(
             state,
             deps,
             processor="judge",
-            fields=("draft_text",),
+            fields=("authored_text",),
         )
-        verdict = deps.judge(draft.text)
+        verdict = deps.judge(draft.authored if draft.authored is not None else draft.text)
 
     checked = replace(draft, findings=verdict.findings, approved=verdict.approved)
     updated = (*state["drafts"][:-1], checked)
