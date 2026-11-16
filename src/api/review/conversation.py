@@ -17,7 +17,7 @@ where the access gate already is. `require_synthetic_review` mounts it only in
 synthetic-data mode, and `app.py` requires a loopback Host for the whole
 surface.
 
-No provider is called. `generate` renders a pre-approved template (ADR-13), so
+No provider is called. `generate` renders a pre-approved template (ADR-01a), so
 the graph runs deterministically and the gate still inspects every draft. M4
 swaps a model generator in behind the same seam, and nothing here changes.
 """
@@ -150,7 +150,7 @@ def _generator_for(settings: SettingsDep) -> Callable[[ConversationState], Draft
     pipeline M3's deliverable names.
 
     A generated draft is marked non-templated, so it also faces the model
-    judge; a templated one does not, because ADR-13 exempts wording a person
+    judge; a templated one does not, because ADR-01a exempts wording a person
     already approved.
     """
     if settings.openai_api_key.get_secret_value():
@@ -207,7 +207,7 @@ async def run_turn(
     def judge(text: str) -> Verdict:
         # The real judge when both provider keys are set; otherwise it reports
         # unavailable and the graph escalates. Templated drafts never reach it
-        # (ADR-13), so the prototype runs either way.
+        # (ADR-01a), so the prototype runs either way.
         return model_judge(text, settings=settings)
 
     graph = build_graph(

@@ -110,7 +110,7 @@ class Draft:
     findings: tuple[Finding, ...] = ()
     approved: bool = False
     #: True when the text came from a pre-approved template rather than a
-    #: model. Templated text still passes provenance (ADR-13), but never the
+    #: model. Templated text still passes provenance (ADR-01a), but never the
     #: model judge: there is no generated wording for it to judge.
     templated: bool = False
     #: The words a model wrote, when one did -- `text` minus the facts block

@@ -103,7 +103,7 @@ async def _clinic_with_patient(
 
 
 def _templated_generator(kind: MessageKind, template: str):
-    """A generator that renders one pre-approved template (ADR-13).
+    """A generator that renders one pre-approved template (ADR-01a).
 
     M3's prototype: no model, so the whole pipeline runs deterministically and
     the gate still sees every draft. M4 swaps a model generator in behind the
@@ -401,7 +401,7 @@ async def test_a_rejected_draft_is_retried_then_falls_back(session: AsyncSession
 
     # A judge that rejects everything: the generated draft can never pass.
     deps = _deps(session, judge_approves=False)
-    # The draft must be non-templated for the judge to see it at all (ADR-13).
+    # The draft must be non-templated for the judge to see it at all (ADR-01a).
     base = deps.generate
 
     def generated(state):

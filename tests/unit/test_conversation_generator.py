@@ -234,7 +234,7 @@ def test_the_fallback_needs_no_facts() -> None:
 
 
 def test_a_generated_draft_is_not_marked_templated() -> None:
-    """ADR-13 exempts only pre-approved template wording from the model judge.
+    """ADR-01a exempts only pre-approved template wording from the model judge.
     A generated draft must face the whole gate, stage 4 included."""
     draft = generate(_state(Intent.CONFIRM), client=Fixed("Su cita quedó confirmada."))
     assert draft.templated is False

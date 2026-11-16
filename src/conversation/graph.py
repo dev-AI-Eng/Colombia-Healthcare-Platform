@@ -569,7 +569,7 @@ def _processor_model(settings: Settings, processor: str) -> str:
 async def compose(state: ConversationState, *, deps: Dependencies) -> ConversationState:
     """Produce a candidate message.
 
-    In M3's prototype this renders a pre-approved template (ADR-13), so the
+    In M3's prototype this renders a pre-approved template (ADR-01a), so the
     whole pipeline is exercised without a provider. The seam is
     `deps.generate`: M4 passes a model generator with the same signature, and
     the gate below does not change.
@@ -609,7 +609,7 @@ async def gate(state: ConversationState, *, deps: Dependencies) -> ConversationS
 
     A templated draft skips the model judge: its wording was approved by a
     person, there is no generated text to judge, and sending it to a judge
-    would introduce a model into a path that has none (ADR-13).
+    would introduce a model into a path that has none (ADR-01a).
     """
     draft = state["drafts"][-1]
     # Stage 0 (ADR-02): the words a model wrote may state no fact. Facts are

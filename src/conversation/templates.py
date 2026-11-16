@@ -1,6 +1,6 @@
 """Pre-approved Spanish text, and the facts each piece is allowed to carry.
 
-Two message classes exist (ADR-13). Generated text goes generator → evaluator.
+Two message classes exist (ADR-01a). Generated text goes generator → evaluator.
 Templated text is wording a person approved once, with positional variables
 filled by code, and it is gated by **provenance validation** instead: there is
 no model in its path, so there is nothing for a judge to judge, and routing it
