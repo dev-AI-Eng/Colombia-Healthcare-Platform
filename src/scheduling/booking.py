@@ -535,8 +535,15 @@ async def hold(
     minutes: int = DEFAULT_HOLD_MINUTES,
     idempotency_key: str | None = None,
     override_reason: str | None = None,
+    replaces_appointment_id: uuid.UUID | None = None,
 ) -> BookingResult:
     """Hold a slot while the patient decides (ADR-17).
+
+    `replaces_appointment_id` marks the hold as an *offer*: a time held for a
+    patient who asked to move that appointment. It is stored in
+    `rescheduled_from_appointment_id`, the same link a completed move leaves,
+    and it is what lets the conversation tell an offer from a held booking --
+    so "sí" or "cancelar" after an offer still act on the real appointment.
 
     A hold is an appointment in `hold` status with an expiry, so it takes part
     in the same exclusion constraint: a hold blocks a booking and a booking
@@ -578,6 +585,7 @@ async def hold(
             status=AppointmentStatus.HOLD,
             expires_at=now + dt.timedelta(minutes=minutes),
             idempotency_key=idempotency_key,
+            rescheduled_from_appointment_id=replaces_appointment_id,
         ),
     )
     if result.outcome is Outcome.BOOKED and result.appointment is not None:
@@ -663,6 +671,113 @@ async def release_hold(
         Access(resource="appointments", resource_id=str(appointment_id), patient_id=patient_id),
     )
     return True
+
+
+async def release_offers(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    keep: uuid.UUID | None = None,
+) -> int:
+    """Give back every offered slot held to replace this appointment.
+
+    Called when the patient picks one (the rest go back), asks for other
+    times (a fresh offer replaces the old one), or confirms or cancels the
+    appointment instead. Deleted like any unaccepted hold (`release_hold`):
+    an offer nobody took is not part of the patient's history.
+    """
+    stmt = (
+        select(Appointment)
+        .where(
+            Appointment.clinic_id == clinic_id,
+            Appointment.rescheduled_from_appointment_id == appointment_id,
+            Appointment.status == AppointmentStatus.HOLD,
+        )
+        .with_for_update()
+    )
+    released = 0
+    for held in (await session.execute(stmt)).scalars().all():
+        if held.id == keep:
+            continue
+        await session.delete(held)
+        await session.flush()
+        await record_access(
+            session,
+            AccessAction.DELETE,
+            Access(resource="appointments", resource_id=str(held.id), patient_id=held.patient_id),
+        )
+        released += 1
+    return released
+
+
+async def move_into_hold(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    hold_id: uuid.UUID,
+    now: dt.datetime,
+) -> BookingResult:
+    """Complete a reschedule onto a slot that was held as an offer.
+
+    The patient picked a time we offered and held, so the destination is
+    already reserved under the exclusion constraint and cannot have gone to
+    anybody else. This turns that hold into the appointment, marks the one it
+    replaces `rescheduled`, and releases the other offers -- all in the caller's
+    transaction, so either the whole move happens or none of it does.
+
+    Refused as `TAKEN` (nothing changed) when the hold has expired or was
+    released, when it is not an offer, or when the appointment it replaces is
+    no longer active. The conversation then offers again (ADR-17).
+
+    The new appointment is `confirmed`, not `scheduled`: the patient chose
+    this exact time in the same message, which is a confirmation.
+    """
+    held = (
+        await session.execute(
+            select(Appointment)
+            .where(Appointment.clinic_id == clinic_id, Appointment.id == hold_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        held is None
+        or held.status is not AppointmentStatus.HOLD
+        or held.rescheduled_from_appointment_id is None
+        or (held.expires_at is not None and held.expires_at <= now)
+    ):
+        return BookingResult(Outcome.TAKEN)
+
+    original = (
+        await session.execute(
+            select(Appointment)
+            .where(
+                Appointment.clinic_id == clinic_id,
+                Appointment.id == held.rescheduled_from_appointment_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        original is None
+        or original.status not in ACTIVE_STATUSES
+        or original.patient_id != held.patient_id
+    ):
+        return BookingResult(Outcome.TAKEN)
+
+    held.status = AppointmentStatus.CONFIRMED
+    held.expires_at = None
+    original.status = AppointmentStatus.RESCHEDULED
+    original.expires_at = None
+    await session.flush()
+    for row in (held, original):
+        await record_access(
+            session,
+            AccessAction.UPDATE,
+            Access(resource="appointments", resource_id=str(row.id), patient_id=row.patient_id),
+        )
+    await release_offers(session, clinic_id=clinic_id, appointment_id=original.id, keep=held.id)
+    return BookingResult(Outcome.BOOKED, held)
 
 
 async def sweep_expired_holds(

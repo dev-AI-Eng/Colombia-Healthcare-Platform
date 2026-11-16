@@ -221,8 +221,12 @@ async def hold_slot(
     end: dt.datetime,
     now: dt.datetime,
     idempotency_key: str,
+    replaces_appointment_id: uuid.UUID | None = None,
 ) -> ToolResult:
     """Reserve a slot while the patient decides.
+
+    With `replaces_appointment_id` the hold is an offer for moving that
+    appointment (`booking.hold`), which `move_to_offered_slot` completes.
 
     `idempotency_key` is required rather than optional, because §9 says node
     resumption re-executes a node from its start: without a key a resumed graph
@@ -239,6 +243,7 @@ async def hold_slot(
         end=end,
         now=now,
         idempotency_key=idempotency_key,
+        replaces_appointment_id=replaces_appointment_id,
     )
     facts = FactsBuilder()
     if result.appointment is None:
@@ -247,6 +252,32 @@ async def hold_slot(
         return ToolResult(ok=False, facts=facts, detail="taken")
 
     facts.set(appointment_starts_at=start, appointment_duration_minutes=_minutes(start, end))
+    return ToolResult(ok=True, facts=facts)
+
+
+async def move_to_offered_slot(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    hold_id: uuid.UUID,
+    now: dt.datetime,
+) -> ToolResult:
+    """Move the appointment into the offered slot the patient picked.
+
+    The hold is chosen by deterministic code -- the patient's number indexes
+    the offer this system sent (`classify.chosen_slot`) -- never by the text.
+    An expired or released offer is `ok=False`, and the conversation offers
+    again rather than reporting a fault.
+    """
+    result = await booking.move_into_hold(session, clinic_id=clinic_id, hold_id=hold_id, now=now)
+    facts = FactsBuilder()
+    if result.appointment is None:
+        return ToolResult(ok=False, facts=facts, detail="expired_or_taken")
+    moved = result.appointment
+    facts.set(
+        appointment_starts_at=moved.during.lower,
+        appointment_duration_minutes=_minutes(moved.during.lower, moved.during.upper),
+    )
     return ToolResult(ok=True, facts=facts)
 
 
@@ -264,6 +295,7 @@ REGISTRY: Final[dict[str, Callable[..., object]]] = {
     "cancel_appointment": cancel_appointment,
     "find_slots": find_slots,
     "hold_slot": hold_slot,
+    "move_to_offered_slot": move_to_offered_slot,
 }
 
 #: Statuses a confirm may act on. Checked by the graph before the tool runs, so

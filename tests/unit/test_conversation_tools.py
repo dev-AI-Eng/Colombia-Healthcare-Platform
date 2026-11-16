@@ -102,13 +102,16 @@ def test_every_tool_returns_a_tool_result(name: str, func: object) -> None:
 
 
 def test_the_registry_is_the_whole_reach() -> None:
-    """Exactly the four tools ADR-02 names, so adding a fifth is a visible
-    change rather than an import somewhere."""
+    """Exactly these tools, so adding one is a visible change rather than an
+    import somewhere. `move_to_offered_slot` is the fifth: it completes the
+    reschedule a patient starts by picking one of the times `hold_slot` held,
+    which Rev3's M3 exit criterion requires end to end."""
     assert set(tools.REGISTRY) == {
         "confirm_appointment",
         "cancel_appointment",
         "find_slots",
         "hold_slot",
+        "move_to_offered_slot",
     }
 
 
