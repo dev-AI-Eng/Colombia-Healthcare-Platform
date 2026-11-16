@@ -106,14 +106,16 @@ class Settings(BaseSettings):
     # M3's conversation pipeline. The generator drafts and the evaluator judges,
     # and they must come from **different model families**: self-preference bias
     # is measured and real, so a model grading its own prose is not a second
-    # opinion. Defaults put the generator on OpenAI and the judge on Meta's
-    # Llama, served by Groq through the same SDK. Groq also serves
+    # opinion. Defaults put the generator on OpenAI and the judge on Alibaba's
+    # Qwen, served by Groq through the same SDK. Groq also serves
     # `openai/gpt-oss-120b`, but OpenAI built it, so it is the generator's
-    # family and must not judge it. With neither key set both fall back to
-    # deterministic behaviour and the graph still runs end to end (§6: tests
-    # never call a provider).
+    # family and must not judge it. Qwen is a Groq *preview* model, which Groq
+    # may withdraw at short notice; the judge then fails closed, and the catch
+    # rate must be measured again on its replacement. With neither key set
+    # both fall back to deterministic behaviour and the graph still runs end
+    # to end (§6: tests never call a provider).
     generator_model: str = "gpt-5-mini"
-    evaluator_model: str = "llama-3.3-70b-versatile"
+    evaluator_model: str = "qwen/qwen3.8-27b"
     #: A patient is waiting on this, so it is far tighter than the import's.
     conversation_timeout_seconds: float = Field(default=12.0, gt=0)
 

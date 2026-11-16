@@ -183,7 +183,7 @@ def run(settings: Settings, *, repeat: int, pause: float = 0.0) -> int:
     except JudgeDidNotAnswer as error:
         print(
             f"\nSTOPPED: the judge did not answer ({error}). A non-answer is not a\n"
-            "verdict, so nothing was measured. On Groq's free tier, retry with --pause 5.",
+            "verdict, so nothing was measured. On Groq's free tier, retry with --pause 10.",
             file=sys.stderr,
         )
         return 3

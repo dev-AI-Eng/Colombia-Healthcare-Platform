@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 #: the detail naming the real cause for the escalation a human will read.
 JUDGE_UNAVAILABLE: Final = "judge_unavailable"
 
+#: A verdict is a few dozen tokens of JSON. Without a bound a provider
+#: reserves room for a long answer, which a per-minute output quota refuses
+#: before the call starts; an answer cut short is unreadable and rejects.
+MAX_VERDICT_TOKENS: Final = 150
+
 SYSTEM_PROMPT: Final = """\
 Eres un revisor de cumplimiento para los mensajes que una clínica colombiana \
 envía a sus pacientes por WhatsApp. No escribes mensajes: solo los apruebas o \
@@ -85,7 +90,7 @@ class JudgeClient(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class OpenAIJudge:
-    """The real judge: Meta's Llama on Groq, via the OpenAI SDK.
+    """The real judge: Alibaba's Qwen on Groq, via the OpenAI SDK.
 
     A different family from the generator by default, which is the whole
     requirement. One SDK serves both because Groq speaks the OpenAI protocol.
@@ -110,6 +115,7 @@ class OpenAIJudge:
             ],
             response_format={"type": "json_object"},
             temperature=0,
+            max_tokens=MAX_VERDICT_TOKENS,
         )
         return response.choices[0].message.content or ""
 
