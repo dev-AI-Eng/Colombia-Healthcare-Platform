@@ -85,7 +85,7 @@ class JudgeClient(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class OpenAIJudge:
-    """The real judge: Groq's open-weights model via the OpenAI SDK.
+    """The real judge: Meta's Llama on Groq, via the OpenAI SDK.
 
     A different family from the generator by default, which is the whole
     requirement. One SDK serves both because Groq speaks the OpenAI protocol.

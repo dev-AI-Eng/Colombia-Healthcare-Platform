@@ -151,3 +151,13 @@ def test_an_unknown_reason_becomes_tone_rather_than_being_dropped() -> None:
     verdict = judge("x", client=Fixed('{"approve": false, "reason": "qué?", "quote": "x"}'))
     assert not verdict.approved
     assert Reason.TONE.value in verdict.reason_codes
+
+
+def test_the_default_judge_is_not_the_generators_model_family() -> None:
+    """ADR-21. Groq serving a model does not make it independent: the earlier
+    default, `openai/gpt-oss-120b`, ran on Groq but was built by OpenAI, the
+    generator's own vendor."""
+    fields = Settings.model_fields
+    assert fields["generator_model"].default.startswith("gpt-")
+    judge_model = fields["evaluator_model"].default
+    assert not judge_model.startswith(("gpt-", "openai/", "o1", "o3", "o4"))
