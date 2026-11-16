@@ -28,11 +28,12 @@ import argparse
 import datetime as dt
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from typing import Final
 
 from src.conversation.facts import VerifiedFacts, spell_date, spell_time
-from src.conversation.judge import judge
+from src.conversation.judge import JUDGE_UNAVAILABLE, judge
 from src.core.config import Settings, get_settings
 from src.core.timezones import BOGOTA
 
@@ -156,8 +157,39 @@ GOOD: Final[tuple[Case, ...]] = (
 )
 
 
-def run(settings: Settings, *, repeat: int) -> int:
+class JudgeDidNotAnswer(Exception):
+    """The provider timed out, rate-limited or answered garbage."""
+
+
+def _approves(draft: str, settings: Settings, pause: float) -> bool:
+    """Whether the judge approved, asking once.
+
+    In production a judge that does not answer rejects, which is right there.
+    Counted here, a burst of rate-limit errors would score as catches on the
+    bad set and report a perfect rate, so a non-answer stops the measurement.
+    """
+    time.sleep(pause)
+    verdict = judge(draft, settings=settings)
+    for finding in verdict.findings:
+        if finding.detail.startswith(JUDGE_UNAVAILABLE):
+            raise JudgeDidNotAnswer(finding.detail)
+    return verdict.approved
+
+
+def run(settings: Settings, *, repeat: int, pause: float = 0.0) -> int:
     """Measure both rates. Returns a process exit code."""
+    try:
+        return _measure(settings, repeat=repeat, pause=pause)
+    except JudgeDidNotAnswer as error:
+        print(
+            f"\nSTOPPED: the judge did not answer ({error}). A non-answer is not a\n"
+            "verdict, so nothing was measured. On Groq's free tier, retry with --pause 5.",
+            file=sys.stderr,
+        )
+        return 3
+
+
+def _measure(settings: Settings, *, repeat: int, pause: float) -> int:
     if not settings.conversation_llm_available:
         print(
             "Both OPENAI_API_KEY and GROQ_API_KEY must be set: the judge has to be a\n"
@@ -175,8 +207,8 @@ def run(settings: Settings, *, repeat: int) -> int:
     passed: list[float] = []
 
     for run_index in range(repeat):
-        rejected = sum(1 for case in BAD if not judge(case.draft, settings=settings).approved)
-        approved = sum(1 for case in GOOD if judge(case.draft, settings=settings).approved)
+        rejected = sum(1 for case in BAD if not _approves(case.draft, settings, pause))
+        approved = sum(1 for case in GOOD if _approves(case.draft, settings, pause))
         caught.append(rejected / len(BAD))
         passed.append(approved / len(GOOD))
         print(f"  run {run_index + 1}: caught {rejected}/{len(BAD)}, passed {approved}/{len(GOOD)}")
@@ -190,8 +222,7 @@ def run(settings: Settings, *, repeat: int) -> int:
     # fails rather than only that the rate is short.
     print("per case, final pass:")
     for case in (*BAD, *GOOD):
-        verdict = judge(case.draft, settings=settings)
-        correct = verdict.approved is not case.should_reject
+        correct = _approves(case.draft, settings, pause) is not case.should_reject
         print(f"  {'ok ' if correct else 'MISS'} {case.label}")
         if not correct:
             print(f"       draft: {case.draft[:90]}")
@@ -227,8 +258,14 @@ def main() -> int:
         default=3,
         help="runs per case; more than one because LLM judgments vary between runs",
     )
+    parser.add_argument(
+        "--pause",
+        type=float,
+        default=0.0,
+        help="seconds between calls, to stay inside a provider's rate limit",
+    )
     args = parser.parse_args()
-    return run(get_settings(), repeat=max(1, args.repeat))
+    return run(get_settings(), repeat=max(1, args.repeat), pause=max(0.0, args.pause))
 
 
 if __name__ == "__main__":
