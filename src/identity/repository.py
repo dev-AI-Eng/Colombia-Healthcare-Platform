@@ -8,6 +8,7 @@ records belonging to a soft-deleted patient.
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from dataclasses import dataclass
 
@@ -94,6 +95,51 @@ async def list_patient_consents(
     )
     consents = list(result.all())
     await _record_consents(session, consents)
+    return consents
+
+
+async def withdraw_consents(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    patient_id: uuid.UUID,
+    purpose: ConsentPurpose,
+    now: dt.datetime,
+) -> list[Consent]:
+    """Revoke every live consent of one purpose, and return those revoked.
+
+    The row is kept and dated rather than deleted: it is the record that the
+    patient once agreed and then withdrew, and the consent gate reads
+    `revoked_at` to tell a patient who opted out from one who never opted in.
+    Already-revoked rows are left alone, so a second request changes nothing.
+    """
+    consents = list(
+        (
+            await session.scalars(
+                select(Consent)
+                .where(
+                    Consent.clinic_id == clinic_id,
+                    Consent.patient_id == patient_id,
+                    Consent.purpose == purpose,
+                    Consent.revoked_at.is_(None),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    for consent in consents:
+        # The CHECK constraint requires revoked_at >= granted_at, and a consent
+        # recorded with a future grant date must still be revocable today.
+        consent.revoked_at = max(now, consent.granted_at)
+    await session.flush()
+    await record_accesses(
+        session,
+        AccessAction.UPDATE,
+        [
+            Access(resource="consents", resource_id=str(c.id), patient_id=c.patient_id)
+            for c in consents
+        ],
+    )
     return consents
 
 

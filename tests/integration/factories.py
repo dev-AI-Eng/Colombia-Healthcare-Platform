@@ -45,7 +45,11 @@ class Graph:
 
 
 async def create_graph(
-    session: AsyncSession, *, name: str = "Clínica Prueba", hours: bool = False
+    session: AsyncSession,
+    *,
+    name: str = "Clínica Prueba",
+    hours: bool = False,
+    consent: bool = False,
 ) -> Graph:
     """A clinic with one location, doctor, appointment type and patient.
 
@@ -62,6 +66,11 @@ async def create_graph(
 
     Not 00:00-24:00: a `Window` must be ordered, and a 24-hour day would hide
     an off-by-one at midnight.
+
+    `consent=True` also records the patient's live consent to appointment
+    messages. Opt-in for the same reason as `hours`: a reminder is due only to
+    a patient who consented, while the suites that test the absence of consent
+    must start without one.
     """
     clinic = Clinic(name=name)
     session.add(clinic)
@@ -99,6 +108,19 @@ async def create_graph(
                 )
                 for weekday in range(7)
             ]
+        )
+        await session.flush()
+    if consent:
+        session.add(
+            Consent(
+                clinic_id=clinic.id,
+                patient_id=patient.id,
+                purpose=ConsentPurpose.APPOINTMENT_MESSAGING,
+                channel=ConsentChannel.WHATSAPP,
+                granted_at=datetime(2020, 1, 1, tzinfo=BOGOTA),
+                evidence_kind=EvidenceKind.IMPORTED_DECLARATION,
+                policy_version="test-v1",
+            )
         )
         await session.flush()
     return Graph(

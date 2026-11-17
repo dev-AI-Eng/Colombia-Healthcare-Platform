@@ -5,11 +5,13 @@
      │        ambiguous ─► templated SHARED_HANDSET ──► END
      ▼
 [consent] ─── none ──────► templated NO_CONSENT + escalate ──► END
-     ▼
+     ▼        withdrawn ─► continues, marked on the patient context
 [classify] ── clinical ──► templated CLINICAL_TO_HUMAN + escalate ──► END
      │        human ─────► templated STAFF_WILL_CALL + escalate ──► END
-     │        opt_out ───► templated OPTED_OUT ──► END
+     │        withdrawn, any other intent but opt_out
+     │          ─────────► templated OPTED_OUT ──► END
      │
+     ├ opt_out ────► [act: withdraw_messaging_consent] ──► templated OPTED_OUT ──► END
      ├ confirm ────► [act: confirm_appointment] ─┐
      ├ cancel ─────► [act: cancel_appointment] ──┤
      ├ reschedule ─► [act: find_slots]           │
@@ -186,39 +188,49 @@ async def consent(state: ConversationState, *, deps: Dependencies) -> Conversati
     """Require a live consent for appointment messaging (ADR-19).
 
     Checked before anything is said, not before sending: a patient with no
-    consent gets one templated reply telling them how to give it, and that
-    reply is the only thing this channel may carry for them.
+    consent gets one templated reply, and that reply is the only thing this
+    channel may carry for them.
+
+    A patient who never gave consent is told how to give it. A patient who
+    withdrew it -- usually by asking this channel to stop -- goes on to
+    `classify` marked as withdrawn, rather than stopping here: rule 5 outranks
+    the opt-out, so a clinical message from them must still reach a person, as
+    must a request to speak to one. Everything else they send is answered
+    with the opted-out notice and acted on not at all. Asking them to
+    authorise the channel again would contact somebody who asked not to be.
     """
     patient_id = state["patient"].patient_id
     if patient_id is None:  # pragma: no cover - identify stopped already
         return {"stop": Stop.UNKNOWN_SENDER}
 
-    found = (
-        await deps.session.execute(
-            select(Consent.id).where(
+    revoked_at = (
+        await deps.session.scalars(
+            select(Consent.revoked_at).where(
                 Consent.clinic_id == state["clinic_id"],
                 Consent.patient_id == patient_id,
                 Consent.purpose == ConsentPurpose.APPOINTMENT_MESSAGING,
-                Consent.revoked_at.is_(None),
             )
         )
-    ).first()
+    ).all()
 
-    if found is None:
-        return {"stop": Stop.NO_CONSENT}
-    return {}
+    if any(at is None for at in revoked_at):
+        return {}
+    if revoked_at:
+        return {"patient": replace(state["patient"], consent_withdrawn=True)}
+    return {"stop": Stop.NO_CONSENT}
 
 
 # ------------------------------------------------------------------- classify
 
 
-#: The three intents that end the turn with a templated reply, and the stop
+#: The intents that end the turn here with a templated reply, and the stop
 #: reason each becomes. Set here rather than in the routing function: a
 #: conditional edge decides *where* to go, and a node decides *what to say*.
+#: Opting out is not one of them: it has a write to make first, so it goes
+#: to `act`, which sets `Stop.OPTED_OUT` once the consent is revoked.
 _TERMINAL_INTENTS: Final[dict[Intent, Stop]] = {
     Intent.CLINICAL: Stop.CLINICAL_CONCERN,
     Intent.HUMAN: Stop.ASKED_FOR_HUMAN,
-    Intent.OPT_OUT: Stop.ASKED_FOR_HUMAN,
 }
 
 
@@ -236,6 +248,10 @@ async def classify(state: ConversationState, *, deps: Dependencies) -> Conversat
     update: ConversationState = {"intent": intent}
     if intent in _TERMINAL_INTENTS:
         update["stop"] = _TERMINAL_INTENTS[intent]
+    elif state["patient"].consent_withdrawn and intent is not Intent.OPT_OUT:
+        # Opted out earlier: nothing is confirmed, cancelled or offered for
+        # them, and the reply is the notice that tells them how to come back.
+        update["stop"] = Stop.OPTED_OUT
     return update
 
 
@@ -256,8 +272,16 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         # the stranger's template, which names no patient.
         return {"stop": Stop.UNKNOWN_SENDER}
 
-    facts = await _clinic_facts(state, deps)
     intent = state["intent"]
+    if intent is Intent.OPT_OUT:
+        # Before anything is read: an opt-out needs no appointment and no
+        # facts, and reading them would be a patient-data access with no use.
+        await tools.withdraw_messaging_consent(
+            deps.session, clinic_id=state["clinic_id"], patient_id=patient_id, now=state["now"]
+        )
+        return {"stop": Stop.OPTED_OUT}
+
+    facts = await _clinic_facts(state, deps)
     appointment = await _active_appointment(state, deps, patient_id)
     if appointment is not None:
         facts.set(
@@ -719,6 +743,9 @@ _STOP_REPLIES: Final[dict[Stop, tuple[str, EscalationReason | None]]] = {
     Stop.CLINICAL_CONCERN: (T.CLINICAL_TO_HUMAN, EscalationReason.CLINICAL_CONCERN),
     Stop.ASKED_FOR_HUMAN: (T.STAFF_WILL_CALL, EscalationReason.PATIENT_ASKED_FOR_A_HUMAN),
     Stop.GATE_EXHAUSTED: (T.STAFF_WILL_CALL, EscalationReason.EVALUATOR_EXHAUSTED),
+    # No escalation: a staff case is a promise that someone will call, and the
+    # patient has just asked not to be contacted.
+    Stop.OPTED_OUT: (T.OPTED_OUT, None),
 }
 
 _ESCALATION_DETAIL: Final[dict[Stop, str]] = {
@@ -730,6 +757,7 @@ _ESCALATION_DETAIL: Final[dict[Stop, str]] = {
     Stop.UNKNOWN_SENDER: "Número no reconocido.",
     Stop.SHARED_HANDSET: "Número compartido por varios pacientes.",
     Stop.NO_APPOINTMENT: "No hay cita activa.",
+    Stop.OPTED_OUT: "El paciente pidió no recibir más mensajes.",
 }
 
 
@@ -745,16 +773,10 @@ def _after_consent(state: ConversationState) -> str:
 
 
 def _after_classify(state: ConversationState) -> str:
-    """Intent to node. A closed mapping: an intent with no entry cannot route,
-    which is a loud failure rather than a silent send."""
-    intent = state["intent"]
-    if intent is Intent.CLINICAL:
-        return "clinical"
-    if intent is Intent.HUMAN:
-        return "human"
-    if intent is Intent.OPT_OUT:
-        return "opt_out"
-    return "act"
+    """`classify` sets a stop reason for every turn it ends -- a clinical
+    message, a request for a person, anything from a patient who opted out
+    other than opting out again -- and everything else goes on to `act`."""
+    return "stop" if state.get("stop") else "act"
 
 
 def _after_act(state: ConversationState) -> str:
@@ -837,7 +859,7 @@ def build_graph(
     builder.add_conditional_edges(
         "classify",
         _after_classify,
-        {"act": "act", "clinical": "stop", "human": "stop", "opt_out": "stop"},
+        {"act": "act", "stop": "stop"},
     )
     builder.add_conditional_edges("act", _after_act, {"stop": "stop", "compose": "compose"})
     builder.add_edge("compose", "gate")

@@ -349,6 +349,100 @@ async def test_asking_for_a_person_escalates(session: AsyncSession) -> None:
     assert result["escalation_id"] is not None
 
 
+async def _escalations(session: AsyncSession, graph: Graph) -> int:
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(Escalation)
+            .where(Escalation.clinic_id == graph.clinic_id)
+        )
+    ).scalar_one()
+
+
+async def test_opting_out_withdraws_consent_and_says_so(session: AsyncSession) -> None:
+    """The client's QA finding: this reply used to be "a staff member will
+    contact you", with a case opened as though the patient had asked for a
+    person, and the consent stayed live. Opting out must revoke the consent,
+    record the revocation, and promise no call."""
+    graph = await _clinic_with_patient(session)
+    await session.flush()
+
+    result = await _run(session, graph, "No quiero más mensajes")
+
+    assert result["intent"] is Intent.OPT_OUT
+    assert result["stop"] is Stop.OPTED_OUT
+    assert result["outbound_text"] == T.OPTED_OUT
+    assert result["escalation_id"] is None
+    assert await _escalations(session, graph) == 0
+
+    consent = (
+        await session.execute(select(Consent).where(Consent.patient_id == graph.patient_id))
+    ).scalar_one()
+    assert consent.revoked_at is not None, "the consent is still live after an opt-out"
+
+    revocation = (
+        await session.execute(
+            select(AccessLogEntry).where(
+                AccessLogEntry.action == AccessAction.UPDATE.value,
+                AccessLogEntry.resource == "consents",
+                AccessLogEntry.resource_id == str(consent.id),
+            )
+        )
+    ).scalar_one_or_none()
+    assert revocation is not None, "the revocation has no audit entry (rule 8)"
+    assert revocation.patient_id == graph.patient_id
+
+
+async def test_after_opting_out_nothing_is_done_for_the_patient_again(
+    session: AsyncSession,
+) -> None:
+    """A later confirm, reschedule or repeated opt-out gets the opted-out
+    notice and nothing else: no action on their appointment, no time held, no
+    staff case, and never the no-consent reply, which would ask them to
+    authorise the channel they just left."""
+    graph = await _clinic_with_patient(session)
+    booked = appointment(graph, at(3, 9, 0))
+    session.add(booked)
+    await session.flush()
+
+    await _run(session, graph, "No quiero más mensajes")
+    for later in ("Si, confirmo", "Quiero otra fecha", "No quiero más mensajes"):
+        result = await _run(session, graph, later)
+        assert result["stop"] is Stop.OPTED_OUT, later
+        assert result["outbound_text"] == T.OPTED_OUT, later
+
+    rows = (
+        (await session.execute(select(Appointment).where(Appointment.clinic_id == graph.clinic_id)))
+        .scalars()
+        .all()
+    )
+    assert [(row.id, row.status) for row in rows] == [(booked.id, AppointmentStatus.SCHEDULED)]
+    assert await _escalations(session, graph) == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
+    [
+        ("Me duele mucho el pecho", T.CLINICAL_TO_HUMAN),
+        ("Quiero hablar con alguien", T.STAFF_WILL_CALL),
+    ],
+)
+async def test_after_opting_out_a_patient_can_still_reach_a_person(
+    session: AsyncSession, text: str, reply: str
+) -> None:
+    """Rule 5 outranks the opt-out. A patient who left the channel and then
+    writes about a symptom, or asks for a person, is the one case where a
+    staff case is owed: they wrote to the clinic, and silence would drop it."""
+    graph = await _clinic_with_patient(session)
+    await session.flush()
+
+    await _run(session, graph, "No quiero más mensajes")
+    result = await _run(session, graph, text)
+
+    assert result["outbound_text"] == reply
+    assert result["escalation_id"] is not None
+
+
 async def test_confirming_with_no_appointment_says_so_kindly(
     session: AsyncSession,
 ) -> None:

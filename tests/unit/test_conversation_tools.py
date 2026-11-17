@@ -105,13 +105,15 @@ def test_the_registry_is_the_whole_reach() -> None:
     """Exactly these tools, so adding one is a visible change rather than an
     import somewhere. `move_to_offered_slot` is the fifth: it completes the
     reschedule a patient starts by picking one of the times `hold_slot` held,
-    which Rev3's M3 exit criterion requires end to end."""
+    which Rev3's M3 exit criterion requires end to end. The sixth,
+    `withdraw_messaging_consent`, is the write behind a patient's opt-out."""
     assert set(tools.REGISTRY) == {
         "confirm_appointment",
         "cancel_appointment",
         "find_slots",
         "hold_slot",
         "move_to_offered_slot",
+        "withdraw_messaging_consent",
     }
 
 

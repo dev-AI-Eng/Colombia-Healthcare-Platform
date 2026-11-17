@@ -40,9 +40,9 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 from dataclasses import dataclass
-from typing import Literal
+from typing import Final, Literal
 
-from sqlalchemy import func, select, text
+from sqlalchemy import exists, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
@@ -50,6 +50,7 @@ from sqlalchemy.orm import InstrumentedAttribute
 from src.audit.context import AccessAction
 from src.audit.service import Access, record_accesses
 from src.core.timezones import BOGOTA
+from src.identity.models import Consent, ConsentPurpose
 from src.scheduling.models import (
     ACTIVE_STATUSES,
     Appointment,
@@ -103,6 +104,15 @@ class DueReminder:
     doctor_id: uuid.UUID
     starts_at: dt.datetime
     kind: ReminderKind
+
+
+#: The appointment's patient holds a live consent to appointment messages.
+_has_live_consent: Final = exists().where(
+    Consent.clinic_id == Appointment.clinic_id,
+    Consent.patient_id == Appointment.patient_id,
+    Consent.purpose == ConsentPurpose.APPOINTMENT_MESSAGING,
+    Consent.revoked_at.is_(None),
+)
 
 
 def _flag(kind: ReminderKind) -> InstrumentedAttribute[bool]:
@@ -162,6 +172,11 @@ async def reminders_due(
                     # Half-open: inside the window, and not already past.
                     func.lower(Appointment.during) > now,
                     func.lower(Appointment.during) <= horizon,
+                    # A reminder is a message, so it is due only to a patient
+                    # whose consent to appointment messages is live (ADR-19).
+                    # One who opted out is never listed, so no dispatcher can
+                    # reach them from here.
+                    _has_live_consent,
                 )
                 .order_by(func.lower(Appointment.during))
                 # One worker per reminder. Without this both workers in a

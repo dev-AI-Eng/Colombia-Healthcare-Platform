@@ -1348,7 +1348,7 @@ async def test_two_workers_do_not_report_the_same_reminder(
     The two sweeps are deliberately overlapping in time: the first holds its
     lock until its transaction ends, so the second must see nothing.
     """
-    graph = await create_graph(session, hours=True)
+    graph = await create_graph(session, hours=True, consent=True)
     start = dt.datetime.now(tz=dt.UTC) + dt.timedelta(hours=23)
     session.add(
         appointment(
@@ -1412,7 +1412,7 @@ async def test_a_reminder_released_without_being_sent_is_found_again(
     """The other half of the claim: a worker that crashes must not lose the
     reminder. The lock ends with the transaction, so the next sweep sees it --
     at-least-once, which is the behaviour M4's outbox builds on."""
-    graph = await create_graph(session, hours=True)
+    graph = await create_graph(session, hours=True, consent=True)
     start = dt.datetime.now(tz=dt.UTC) + dt.timedelta(hours=23)
     session.add(
         appointment(

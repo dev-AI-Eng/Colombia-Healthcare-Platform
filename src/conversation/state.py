@@ -68,6 +68,8 @@ class Stop(StrEnum):
     CLINICAL_CONCERN = "clinical_concern"
     ASKED_FOR_HUMAN = "asked_for_human"
     GATE_EXHAUSTED = "gate_exhausted"
+    #: The patient asked for no more messages, now or in an earlier turn.
+    OPTED_OUT = "opted_out"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,10 @@ class PatientContext:
     patient_id: uuid.UUID | None = None
     given_name: str | None = None
     candidates: tuple[uuid.UUID, ...] = ()
+    #: Set by `consent` when the patient withdrew their consent to messages.
+    #: Kept here rather than as its own channel because it is patient data,
+    #: and a bare boolean channel is stored unencrypted (§9).
+    consent_withdrawn: bool = False
 
     @property
     def is_resolved(self) -> bool:

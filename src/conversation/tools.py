@@ -35,6 +35,8 @@ from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
 from src.conversation.facts import FactsBuilder
 from src.core.timezones import BOGOTA
+from src.identity import repository as identity
+from src.identity.models import ConsentPurpose
 from src.scheduling import booking, offers
 from src.scheduling.models import AppointmentStatus
 
@@ -281,6 +283,30 @@ async def move_to_offered_slot(
     return ToolResult(ok=True, facts=facts)
 
 
+async def withdraw_messaging_consent(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    patient_id: uuid.UUID,
+    now: dt.datetime,
+) -> ToolResult:
+    """Revoke the patient's consent to appointment messages (ADR-19).
+
+    The purpose is fixed here rather than passed in: the only consent a
+    patient can withdraw from inside this conversation is the one that lets
+    the conversation reach them. Nothing to revoke is still `ok` -- the
+    patient's request is satisfied either way.
+    """
+    revoked = await identity.withdraw_consents(
+        session,
+        clinic_id=clinic_id,
+        patient_id=patient_id,
+        purpose=ConsentPurpose.APPOINTMENT_MESSAGING,
+        now=now,
+    )
+    return ToolResult(ok=True, facts=FactsBuilder(), detail="" if revoked else "none_live")
+
+
 def _minutes(start: dt.datetime | None, end: dt.datetime | None) -> int:
     if start is None or end is None:
         return 0
@@ -296,6 +322,7 @@ REGISTRY: Final[dict[str, Callable[..., object]]] = {
     "find_slots": find_slots,
     "hold_slot": hold_slot,
     "move_to_offered_slot": move_to_offered_slot,
+    "withdraw_messaging_consent": withdraw_messaging_consent,
 }
 
 #: Statuses a confirm may act on. Checked by the graph before the tool runs, so

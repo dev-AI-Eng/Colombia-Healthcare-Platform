@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.audit.context import AuditContext
 from src.core.tenancy import ClinicScope, apply_clinic_scope
+from src.identity import repository as identity
+from src.identity.models import ConsentPurpose
 from src.scheduling import reminders
 from src.scheduling.models import (
     Appointment,
@@ -62,7 +64,7 @@ async def _add(
 async def test_an_appointment_two_days_out_is_due_its_48h_reminder(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     # 08:00 on the 10th; due 07:00 on the 12th, so 47 hours away: inside 48,
     # outside 24.
     await _add(session, graph, at(12, 7))
@@ -75,7 +77,7 @@ async def test_an_appointment_two_days_out_is_due_its_48h_reminder(
 async def test_an_appointment_tomorrow_is_due_its_24h_reminder(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     # 23 hours away: inside the 24h window.
     await _add(session, graph, at(11, 7), sent_48h=True)
 
@@ -90,7 +92,7 @@ async def test_a_reminder_already_sent_is_not_due_again(session: AsyncSession) -
     A sweep that ran every few minutes and ignored the flag would message the
     same patient on every run.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(12, 7), sent_48h=True)
 
     due = await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW)
@@ -101,7 +103,7 @@ async def test_a_reminder_already_sent_is_not_due_again(session: AsyncSession) -
 async def test_an_appointment_further_out_than_the_window_is_not_due(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(20, 9))
 
     assert await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW) == []
@@ -109,7 +111,7 @@ async def test_an_appointment_further_out_than_the_window_is_not_due(
 
 async def test_an_appointment_in_the_past_is_never_due(session: AsyncSession) -> None:
     """A reminder for an appointment that has already happened is noise."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(9, 9))
 
     assert await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW) == []
@@ -131,15 +133,44 @@ async def test_a_cancelled_appointment_is_never_reminded(
 
     It reads as the clinic having ignored the cancellation.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(12, 7), status=inactive)
+
+    assert await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW) == []
+
+
+async def test_a_patient_who_opted_out_is_never_due_a_reminder(
+    session: AsyncSession,
+) -> None:
+    """ADR-19. A reminder is a message; once the patient withdraws consent,
+    their appointment stays booked but no dispatcher is ever handed it."""
+    graph = await create_graph(session, consent=True)
+    await _add(session, graph, at(12, 7))
+    assert len(await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW)) == 1
+
+    await identity.withdraw_consents(
+        session,
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        purpose=ConsentPurpose.APPOINTMENT_MESSAGING,
+        now=NOW,
+    )
+
+    assert await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW) == []
+
+
+async def test_a_patient_who_never_consented_is_not_due_a_reminder(
+    session: AsyncSession,
+) -> None:
+    graph = await create_graph(session)
+    await _add(session, graph, at(12, 7))
 
     assert await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW) == []
 
 
 async def test_a_hold_is_never_reminded(session: AsyncSession) -> None:
     """A hold is an offer nobody has accepted, so there is nothing to confirm."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     row = appointment(graph, at(12, 7), status=AppointmentStatus.HOLD)
     row.expires_at = at(10, 9)
     session.add(row)
@@ -152,7 +183,7 @@ async def test_marking_a_reminder_sent_stops_it_coming_back(
     session: AsyncSession,
 ) -> None:
     """What a dispatcher calls once the message is actually away."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     row = await _add(session, graph, at(12, 7))
 
     due = await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW)
@@ -171,7 +202,7 @@ async def test_the_due_record_carries_what_a_message_needs(
     session: AsyncSession,
 ) -> None:
     """The sweep's output has to be enough to send from, without a second query."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     row = await _add(session, graph, at(12, 7))
 
     (due,) = await reminders.reminders_due(session, clinic_id=graph.clinic_id, now=NOW)
@@ -194,7 +225,7 @@ async def test_yesterdays_unmarked_appointment_is_flagged_for_a_human(
     Rev2 is explicit: software cannot observe attendance, only record it. So
     the row keeps its status and an escalation carries the question.
     """
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     row = await _add(session, graph, at(9, 9))
 
     flagged = await reminders.flag_unrecorded_attendance(
@@ -223,7 +254,7 @@ async def test_yesterdays_unmarked_appointment_is_flagged_for_a_human(
 async def test_an_appointment_marked_checked_in_is_not_flagged(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(9, 9), status=AppointmentStatus.CHECKED_IN)
 
     assert (
@@ -244,7 +275,7 @@ async def test_an_appointment_already_settled_is_not_flagged(
     session: AsyncSession, settled: AppointmentStatus
 ) -> None:
     """Somebody has already said what happened; there is nothing to ask."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(9, 9), status=settled)
 
     assert (
@@ -255,7 +286,7 @@ async def test_an_appointment_already_settled_is_not_flagged(
 async def test_an_appointment_still_in_the_future_is_not_flagged(
     session: AsyncSession,
 ) -> None:
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(12, 7))
 
     assert (
@@ -267,7 +298,7 @@ async def test_an_appointment_earlier_today_is_not_flagged_yet(
     session: AsyncSession,
 ) -> None:
     """The sweep is end-of-day. A patient due at 07:00 may still be in reception."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(10, 7))
 
     assert (
@@ -279,7 +310,7 @@ async def test_running_the_attendance_sweep_twice_flags_once(
     session: AsyncSession,
 ) -> None:
     """The sweep runs on a timer, so a second run must not duplicate the queue."""
-    graph = await create_graph(session)
+    graph = await create_graph(session, consent=True)
     await _add(session, graph, at(9, 9))
 
     first = await reminders.flag_unrecorded_attendance(session, clinic_id=graph.clinic_id, now=NOW)
@@ -302,12 +333,12 @@ async def test_running_the_attendance_sweep_twice_flags_once(
 
 async def test_neither_sweep_reaches_another_clinic(session: AsyncSession) -> None:
     """Row-level security scopes both sweeps, and this is what proves it."""
-    mine = await create_graph(session)
+    mine = await create_graph(session, consent=True)
     await _add(session, mine, at(12, 7))
     await _add(session, mine, at(9, 9))
     await session.commit()
 
-    theirs = await create_graph(session, name="Clínica Ajena")
+    theirs = await create_graph(session, name="Clínica Ajena", consent=True)
     await _add(session, theirs, at(12, 7))
     await _add(session, theirs, at(9, 9))
     await session.commit()
