@@ -227,3 +227,47 @@ async def test_one_clinic_cannot_see_another_doctors_slots(
     # this proves the scope stopped it rather than the engine finding nothing.
     assert response.status_code == 404, response.text
     assert response.json() != []
+
+
+# ------------------------------------------------- the search range's limits
+
+
+async def test_a_range_longer_than_the_horizon_is_a_422_about_the_range(
+    scoped,  # type: ignore[no-untyped-def]
+) -> None:
+    """Found in the delivery campaign: the route answered 404 "No existe ese
+    tipo de cita", because it blamed every error from the engine on the
+    appointment type, and the engine's horizon limit is one of them."""
+    client, graph = scoped
+
+    response = client.get(
+        "/review/availability/slots",
+        params=_search(graph, MONDAY, MONDAY + dt.timedelta(days=120)),
+    )
+
+    assert response.status_code == 422, response.text
+    assert "tipo de cita" not in response.json()["detail"]
+
+
+async def test_exactly_the_longest_range_is_allowed(scoped) -> None:  # type: ignore[no-untyped-def]
+    client, graph = scoped
+
+    response = client.get(
+        "/review/availability/slots",
+        params=_search(graph, MONDAY, MONDAY + dt.timedelta(days=119)),
+    )
+
+    assert response.status_code == 200, response.text
+
+
+async def test_an_unknown_appointment_type_is_still_a_404(
+    scoped,  # type: ignore[no-untyped-def]
+) -> None:
+    client, graph = scoped
+    search = _search(graph, MONDAY, MONDAY)
+    search["appointment_type_id"] = "00000000-0000-4000-8000-000000000000"
+
+    response = client.get("/review/availability/slots", params=search)
+
+    assert response.status_code == 404, response.text
+    assert "tipo de cita" in response.json()["detail"]

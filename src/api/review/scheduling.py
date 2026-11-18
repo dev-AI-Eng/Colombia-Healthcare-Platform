@@ -55,6 +55,7 @@ from src.api.review.scheduling_schemas import (
 from src.api.review.schemas import AppointmentOut, EscalationOut, Page, SlotOut, to_page
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers, repository
+from src.scheduling.availability import MAX_HORIZON_DAYS
 from src.scheduling.booking import BookingResult, Outcome
 from src.scheduling.models import (
     Appointment,
@@ -491,6 +492,15 @@ async def find_available_slots(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             "La fecha final no puede ser anterior a la inicial.",
+        )
+
+    # Checked here so the answer names the range. The engine raises a
+    # `ValueError` for this too, and the handler below would blame it on the
+    # appointment type.
+    if (end_date - start_date).days + 1 > MAX_HORIZON_DAYS:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"El rango de fechas no puede superar {MAX_HORIZON_DAYS} días.",
         )
 
     try:
