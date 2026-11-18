@@ -174,11 +174,34 @@ def chosen_slot(inbound: str, offered: int) -> int | None:
     resolvable choice rather than a sentence to interpret: "2" resolves against
     the offer we sent, while "el martes" would not when two Tuesdays were
     offered.
+
+    **A pick is one clear number, or nothing.** Booking is the one action here
+    that moves a patient's appointment, so a reply that could mean two things
+    is not read as either. Reading the first number in "el 2 no" or "ni el 2
+    ni el 3" booked the very date the patient had just refused, and "1 hora
+    antes" booked option 1. Anything with a negation, with more than one
+    number, or with a number that is a quantity or a date is not a pick; the
+    patient is asked again and answers with the number alone.
     """
     if offered <= 0:
         return None
-    match = re.search(r"\b(\d{1,2})\b", normalise(inbound))
-    if match is None:
+    text = normalise(inbound)
+    if _NOT_A_PICK.search(text):
         return None
-    index = int(match.group(1))
+    numbers = {int(n) for n in re.findall(r"(?<![\w-])(\d{1,2})(?!\w)", text)}
+    if len(numbers) != 1:
+        return None
+    index = numbers.pop()
     return index if 1 <= index <= offered else None
+
+
+#: What makes a reply containing a number something other than a choice: a
+#: negation (the patient may be refusing that very date), a minus sign, a
+#: clock time, a quantity of time, or a date.
+_NOT_A_PICK: Final = re.compile(
+    r"\b(no|ni|tampoco|nunca|jamas|nada)\b"
+    r"|-\s*\d"
+    r"|\d:\d"
+    r"|\d+\s*(horas?|hrs?|minutos?|mins?|dias?|semanas?|meses|mes|am|pm|a\.m\.?|p\.m\.?)\b"
+    r"|\d+\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\b"
+)

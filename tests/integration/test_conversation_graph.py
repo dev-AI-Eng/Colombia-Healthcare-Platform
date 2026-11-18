@@ -1649,3 +1649,24 @@ async def test_a_generator_that_fails_never_reaches_the_patient(
     assert result["escalation_id"] is not None, "nobody was told"
     assert all(not draft.approved for draft in result["drafts"])
     assert judged == [], "the judge was asked to bless a marker"
+
+
+@pytest.mark.parametrize(
+    "reply", ["el 2 no", "no puedo el 2", "ni el 2 ni el 3", "2 y 3", "1 hora antes"]
+)
+async def test_a_reply_that_refuses_or_is_unclear_never_books_a_date(
+    session: AsyncSession, reply: str
+) -> None:
+    """Found in the delivery campaign: the first number in the reply was taken
+    as the pick, so "el 2 no" booked date 2 and moved the appointment."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    answer = await _run(session, graph, reply, deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert answer["intent"] is not Intent.CHOOSE, f"{reply!r} was taken as a pick"
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED, f"{reply!r} moved the appointment"
