@@ -33,16 +33,25 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from src.api.dependencies import ClinicScopeDep, SessionDep, SettingsDep
+from src.api.review.live import TOPIC_APPOINTMENTS, TOPIC_ESCALATIONS, notify
 from src.api.review.patient_auth import canonical_phone
 from src.conversation import templates as T
 from src.conversation.generator import generate as generate_draft
 from src.conversation.graph import Dependencies, build_graph
 from src.conversation.judge import judge as model_judge
-from src.conversation.state import ConversationState, Draft, initial
+from src.conversation.state import ConversationState, Draft, Intent, initial
 from src.conversation.validator import MessageKind, Verdict
 from src.core.crypto import blind_index
 
 router = APIRouter()
+
+#: The intents that confirm, cancel or move an appointment. A turn with one of
+#: these may have changed the diary, so dashboards watching it are told. A
+#: notice that turns out to be unneeded costs a re-fetch, which is cheaper than
+#: a screen showing a diary that no longer exists.
+_CHANGES_THE_DIARY: Final = frozenset(
+    {Intent.CONFIRM, Intent.CANCEL, Intent.CHOOSE, Intent.RESCHEDULE}
+)
 
 #: Which template the prototype's generator renders for each intent. In M4 a
 #: model drafts these; the mapping is what makes M3 runnable without one, and
@@ -234,6 +243,14 @@ async def run_turn(
     # `ainvoke` is typed as returning a plain dict, so the narrowing
     # happens once here rather than at every read below.
     final = cast(ConversationState, await graph.ainvoke(state))
+
+    # Every other write route tells the open dashboards; this one confirms,
+    # cancels and moves appointments and opens cases, so it does too. The
+    # notices carry no patient data: they say a topic changed in this clinic.
+    if final["intent"] in _CHANGES_THE_DIARY:
+        notify(scope.clinic_id, TOPIC_APPOINTMENTS)
+    if final.get("escalation_id") is not None:
+        notify(scope.clinic_id, TOPIC_ESCALATIONS)
 
     return TurnOut(
         intent=final["intent"].value,

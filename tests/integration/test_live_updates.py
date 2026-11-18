@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.review import live
 from src.audit.context import AuditContext
+from src.scheduling.models import Escalation, EscalationReason
 from tests.integration.factories import appointment, at, create_graph, scope_client
 
 
@@ -240,3 +241,27 @@ async def test_a_stream_for_a_clinic_that_does_not_exist_is_refused(
     response = client.get("/review/live", params={"clinic_id": str(nobody)})
     assert response.status_code == 404, response.text
     assert live.listener_count(nobody) == 0, "a listener was registered for an unknown clinic"
+
+
+async def test_resolving_a_case_tells_the_open_dashboards(
+    session: AsyncSession, client: TestClient
+) -> None:
+    """The queue is the one place a person sees what the system could not do, so
+    a dashboard watching it learns when a case is closed."""
+    graph = await create_graph(session)
+    case = Escalation(
+        clinic_id=graph.clinic_id,
+        reason=EscalationReason.CLINICAL_CONCERN,
+        detail_es="El paciente hizo una consulta clínica por este canal.",
+    )
+    session.add(case)
+    await session.commit()
+    scoped = scope_client(client, graph)
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=live.QUEUE_LIMIT)
+    live._listeners[graph.clinic_id] = {queue}
+    try:
+        assert scoped.post(f"/review/escalations/{case.id}/resolve").status_code == 200
+
+        assert json.loads(queue.get_nowait())["topic"] == live.TOPIC_ESCALATIONS
+    finally:
+        live._listeners.pop(graph.clinic_id, None)

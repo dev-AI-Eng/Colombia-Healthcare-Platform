@@ -44,7 +44,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
-from src.api.review.live import TOPIC_APPOINTMENTS, notify
+from src.api.review.live import TOPIC_APPOINTMENTS, TOPIC_ESCALATIONS, notify
 from src.api.review.patient_auth import CallerPatientDep, require_owns
 from src.api.review.scheduling_schemas import (
     BookIn,
@@ -580,5 +580,5 @@ async def resolve_escalation(
         ),
         "open escalation",
     )
-    out = EscalationOut.build(view)
-    return out
+    notify(scope.clinic_id, TOPIC_ESCALATIONS)
+    return EscalationOut.build(view)

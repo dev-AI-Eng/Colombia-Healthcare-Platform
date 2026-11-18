@@ -7,14 +7,18 @@ about canonicalising before a blind-index lookup has to hold.
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.review import live
 from src.core.crypto import blind_index
 from src.core.tenancy import ClinicScope, apply_clinic_scope
 from src.identity.models import BindingRelationship, PhoneBinding
-from tests.integration.factories import PHONE, create_graph, scope_client
+from tests.integration.factories import PHONE, appointment, at, create_graph, scope_client
 
 TURN = "/review/conversation/turn"
 
@@ -60,3 +64,67 @@ async def test_a_number_that_is_not_a_phone_is_refused_not_treated_as_a_stranger
     out = client.post(TURN, json={"sender_phone": "12345", "text": "hola"})
 
     assert out.status_code == 422
+
+
+def _listen(clinic_id) -> asyncio.Queue[str]:  # type: ignore[no-untyped-def]
+    """Register a dashboard's queue directly: `TestClient` cannot hold a stream
+    open while making a second request, and the queue is where a notice is
+    observable."""
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=live.QUEUE_LIMIT)
+    live._listeners[clinic_id] = {queue}
+    return queue
+
+
+@pytest.mark.parametrize("text", ["Si, confirmo", "cancelar", "Quiero otra fecha"])
+async def test_a_turn_that_changes_the_diary_tells_the_open_dashboards(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+    text: str,
+) -> None:
+    """Found in the delivery campaign: every other write route notifies, and the
+    conversation, which confirms, cancels and moves appointments, did not, so a
+    dashboard left open showed the old diary until its fallback refresh."""
+    client, graph = scoped
+    session.add(appointment(graph, at(3, 9)))
+    await session.commit()
+    queue = _listen(graph.clinic_id)
+    try:
+        out = client.post(TURN, json={"sender_phone": PHONE, "text": text})
+
+        assert out.status_code == 200, out.text
+        assert queue.qsize() >= 1, f"{text!r} changed the diary and told nobody"
+        assert json.loads(queue.get_nowait())["topic"] == live.TOPIC_APPOINTMENTS
+    finally:
+        live._listeners.pop(graph.clinic_id, None)
+
+
+async def test_a_turn_that_opens_a_case_tells_the_open_dashboards(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+) -> None:
+    client, graph = scoped
+    session.add(appointment(graph, at(3, 9)))
+    await session.commit()
+    queue = _listen(graph.clinic_id)
+    try:
+        out = client.post(TURN, json={"sender_phone": PHONE, "text": "Me duele mucho el pecho"})
+
+        assert out.status_code == 200 and out.json()["escalation_id"], out.text
+        topics = [json.loads(queue.get_nowait())["topic"] for _ in range(queue.qsize())]
+        assert live.TOPIC_ESCALATIONS in topics, topics
+        assert live.TOPIC_APPOINTMENTS not in topics, "a clinical message does not change the diary"
+    finally:
+        live._listeners.pop(graph.clinic_id, None)
+
+
+async def test_a_message_that_changes_nothing_tells_nobody(
+    scoped,  # type: ignore[no-untyped-def]
+) -> None:
+    client, graph = scoped
+    queue = _listen(graph.clinic_id)
+    try:
+        client.post(TURN, json={"sender_phone": PHONE, "text": "hola"})
+
+        assert queue.qsize() == 0
+    finally:
+        live._listeners.pop(graph.clinic_id, None)
