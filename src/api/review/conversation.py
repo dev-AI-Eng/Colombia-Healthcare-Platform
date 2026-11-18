@@ -33,6 +33,7 @@ from fastapi import APIRouter, status
 from pydantic import BaseModel, Field
 
 from src.api.dependencies import ClinicScopeDep, SessionDep, SettingsDep
+from src.api.review.patient_auth import canonical_phone
 from src.conversation import templates as T
 from src.conversation.generator import generate as generate_draft
 from src.conversation.graph import Dependencies, build_graph
@@ -203,6 +204,10 @@ async def run_turn(
     where it is working.
     """
     now = body.now or dt.datetime.now(tz=dt.UTC)
+    # Canonicalised before the blind index (§7): "300 111 2233" and
+    # "+573001112233" are one patient, and an uncanonicalised lookup would
+    # answer the first as an unknown number. A malformed number is a 422.
+    sender = blind_index(canonical_phone(body.sender_phone))
 
     def judge(text: str) -> Verdict:
         # The real judge when both provider keys are set; otherwise it reports
@@ -219,10 +224,10 @@ async def run_turn(
         )
     )
     state = initial(
-        thread_id=f"{scope.clinic_id}:{blind_index(body.sender_phone).hex()[:16]}",
+        thread_id=f"{scope.clinic_id}:{sender.hex()[:16]}",
         clinic_id=scope.clinic_id,
         channel="prototype",
-        sender_bidx=blind_index(body.sender_phone),
+        sender_bidx=sender,
         inbound_text=body.text,
         now=now,
     )
