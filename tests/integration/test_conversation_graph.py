@@ -1383,3 +1383,70 @@ async def test_a_new_reschedule_a_day_later_starts_from_the_first_round(
     assert tomorrow["intent"] is Intent.RESCHEDULE
     assert tomorrow["stop"] is None
     assert len(_dates(tomorrow)) == 5
+
+
+# A late answer is a choice, not a refusal. The holds last fifteen minutes and
+# a patient often answers later, so these were the commonest way into a round.
+
+
+async def test_a_late_pick_offers_the_same_dates_again_and_uses_no_round(
+    session: AsyncSession,
+) -> None:
+    """Found in review: "2" twenty minutes after the offer was read as "none of
+    these", so the patient got five other dates and the one they picked was
+    never offered again."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    late = await _run(session, graph, "2", deps=deps, now=now + dt.timedelta(minutes=20))
+    second = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=21))
+
+    assert late["intent"] is Intent.RESCHEDULE
+    assert late["stop"] is None
+    assert _dates(late) == _dates(first), "a late pick changed the dates on offer"
+    assert second["stop"] is None, "the repeated offer was counted as a round"
+    assert len(_dates(second)) == 5
+    assert not set(_dates(first)) & set(_dates(second))
+
+
+async def test_a_late_pick_in_the_second_round_is_offered_again_not_closed(
+    session: AsyncSession,
+) -> None:
+    """Found in review: a slow "2" to the second round got "No hay más citas
+    disponibles" although the patient had just chosen a date."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    second = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=1))
+    late = await _run(session, graph, "2", deps=deps, now=now + dt.timedelta(minutes=20))
+
+    assert late["stop"] is None
+    assert late["outbound_text"] != T.NO_MORE_OFFERS
+    assert _dates(late) == _dates(second)
+
+
+async def test_a_number_after_the_holds_are_swept_is_not_a_confirmation(
+    session: AsyncSession,
+) -> None:
+    """Found in review: once the sweep had deleted the holds, "1" read as
+    "confirm" and confirmed the appointment the patient was moving away from."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+    later = now + dt.timedelta(minutes=40)
+
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    await booking.sweep_expired_holds(session, clinic_id=graph.clinic_id, now=later)
+    late = await _run(session, graph, "1", deps=deps, now=later)
+
+    assert late["intent"] is Intent.RESCHEDULE
+    assert _dates(late) == _dates(first)
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED, "a late '1' confirmed the old date"

@@ -312,32 +312,39 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         # rather than a pick of the third date.
         intent = Intent.RESCHEDULE
     live = [o for o in offers if o.expires_at is not None and o.expires_at > state["now"]]
-    if appointment is not None and offers and intent in {Intent.CONFIRM, Intent.UNCLEAR}:
-        # The previous turn offered numbered times and holds them. A reply
-        # naming one of them is a choice; "1" is a choice here, not "confirm",
-        # because the patient is answering the offer.
-        if not live and chosen_slot(state["inbound_text"], len(offers)) is not None:
-            # The patient answered the offer after its holds expired (the
-            # sweep has not removed them yet). ADR-17: offer again, rather
-            # than book a time that may have gone to somebody else.
-            intent = Intent.RESCHEDULE
+    #: The dates of an offer the patient picked from too late, to offer again.
+    again: tuple[dt.date, ...] = ()
+    if (
+        appointment is not None
+        and (offers or rounds)
+        and intent in {Intent.CONFIRM, Intent.UNCLEAR}
+    ):
+        # An earlier turn offered numbered times. A reply naming one of them
+        # is a choice; "1" is a choice here, not "confirm", because the
+        # patient is answering the offer.
         index = chosen_slot(state["inbound_text"], len(live)) if live else None
         if index is not None:
-            offers = live
             moved = await tools.move_to_offered_slot(
                 deps.session,
                 clinic_id=state["clinic_id"],
-                hold_id=offers[index - 1].id,
+                hold_id=live[index - 1].id,
                 now=state["now"],
             )
             if moved.ok:
                 return {
                     "intent": Intent.CHOOSE,
-                    "appointment_id": offers[index - 1].id,
+                    "appointment_id": live[index - 1].id,
                     "verified_facts": _merge(facts, moved.facts),
                 }
-            # Expired between the read and the lock: offer again (ADR-17).
+        shown = len(offers) or (len(rounds[-1].offered_dates) if rounds else 0)
+        if chosen_slot(state["inbound_text"], shown) is not None:
+            # A pick of a time no longer held: expired, swept, or taken
+            # between the read and the lock. ADR-17: offer again rather than
+            # book a time that may have gone to somebody else. The same
+            # dates, because a late answer is a choice, not a refusal: it
+            # neither uses up a round nor rules out the date it named.
             intent = Intent.RESCHEDULE
+            again = tuple(rounds[-1].offered_dates) if rounds else ()
 
     if appointment is not None and offers and intent in {Intent.CONFIRM, Intent.CANCEL}:
         # The patient answered about the appointment itself, so the times
@@ -379,11 +386,9 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         acted: ConversationState = {"intent": Intent.RESCHEDULE}
         if appointment is None:
             return {**acted, "stop": Stop.NO_APPOINTMENT, "verified_facts": facts.build()}
-        if len(rounds) >= MAX_OFFER_ROUNDS:
+        if not again and len(rounds) >= MAX_OFFER_ROUNDS:
             # Both rounds turned down: the closing message, and a case for
-            # staff so a patient the channel could not serve is not lost. A
-            # pick that arrives after the second round's holds expired lands
-            # here too, which is why the case matters.
+            # staff so a patient the channel could not serve is not lost.
             await booking.release_offers(
                 deps.session, clinic_id=state["clinic_id"], appointment_id=appointment.id
             )
@@ -393,13 +398,15 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
                 "appointment_id": appointment.id,
                 "verified_facts": facts.build(),
             }
+        refused = set() if again else {day for r in rounds for day in r.offered_dates}
         result = await tools.find_slots(
             deps.session,
             clinic_id=state["clinic_id"],
             doctor_id=appointment.doctor_id,
             appointment_type_id=appointment.appointment_type_id,
             now=state["now"],
-            exclude_dates=tuple(sorted({day for r in rounds for day in r.offered_dates})),
+            exclude_dates=tuple(sorted(refused)),
+            only_dates=again,
         )
         if not result.ok:
             return {**acted, "stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
@@ -433,14 +440,15 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         offered = held.build().offered_slots
         if not offered:
             return {**acted, "stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
-        await tools.record_offer_round(
-            deps.session,
-            clinic_id=state["clinic_id"],
-            appointment_id=appointment.id,
-            patient_id=patient_id,
-            offered_dates=tuple(slot.starts_at.astimezone(BOGOTA).date() for slot in offered),
-            now=state["now"],
-        )
+        if not again:
+            await tools.record_offer_round(
+                deps.session,
+                clinic_id=state["clinic_id"],
+                appointment_id=appointment.id,
+                patient_id=patient_id,
+                offered_dates=tuple(slot.starts_at.astimezone(BOGOTA).date() for slot in offered),
+                now=state["now"],
+            )
         return {
             **acted,
             "appointment_id": appointment.id,

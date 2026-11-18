@@ -83,6 +83,9 @@ class SlotSearch:
     weekdays: frozenset[int] = frozenset()
     #: Clinic-local dates already offered and turned down; never offered again.
     excluded_dates: frozenset[dt.date] = frozenset()
+    #: Clinic-local dates to search on; empty means any. An offer repeated
+    #: after its holds expired keeps to the dates the patient was shown.
+    only_dates: frozenset[dt.date] = frozenset()
     #: At most one slot per clinic-local day, so an offer is a choice between
     #: dates rather than five times on the same morning.
     one_per_day: bool = False
@@ -181,6 +184,8 @@ def _acceptable(slot: Slot, search: SlotSearch) -> bool:
     """
     local = slot.local_start
     if local.date() in search.excluded_dates:
+        return False
+    if search.only_dates and local.date() not in search.only_dates:
         return False
     if search.weekdays and local.weekday() not in search.weekdays:
         return False
