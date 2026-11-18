@@ -230,12 +230,11 @@ async def test_a_clinic_may_not_open_unlimited_streams(
 async def test_a_stream_for_a_clinic_that_does_not_exist_is_refused(
     client: TestClient,
 ) -> None:
-    """`clinic_scope` deliberately does not reject an unknown clinic -- the
-    row-level policies simply match nothing -- which is right for a route that
-    reads rows and wrong for this one. The stream reads none, so there is
-    nothing for a policy to filter: an arbitrary UUID became a dictionary key
-    that would never be notified and never collected while the connection was
-    held. A typo'd dashboard URL is now a 404 rather than a dead stream.
+    """`clinic_scope` answers 404 for a clinic that does not exist. That matters
+    most for this route: the stream reads no rows, so an arbitrary UUID would
+    otherwise become a dictionary key that is never notified and never
+    collected while the connection is held. A typo'd dashboard URL is a 404
+    rather than a dead stream, and no listener is filed under it.
     """
     nobody = uuid.uuid4()
     response = client.get("/review/live", params={"clinic_id": str(nobody)})

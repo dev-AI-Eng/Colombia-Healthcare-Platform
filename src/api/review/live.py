@@ -44,11 +44,8 @@ from typing import Final
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.dependencies import ClinicScopeDep, SessionDep
-from src.registry.models import Clinic
+from src.api.dependencies import ClinicScopeDep
 
 router = APIRouter()
 
@@ -114,16 +111,6 @@ def _total_listeners() -> int:
     return sum(len(queues) for queues in _listeners.values())
 
 
-async def _clinic_exists(session: AsyncSession, clinic_id: uuid.UUID) -> bool:
-    """Whether this clinic is real.
-
-    Row-level security scopes the query, so this answers "a clinic I am allowed
-    to see" rather than "any clinic", which is the question that matters here.
-    """
-    found = await session.scalar(select(Clinic.id).where(Clinic.id == clinic_id))
-    return found is not None
-
-
 async def _stream(request: Request, clinic_id: uuid.UUID) -> AsyncIterator[str]:
     """One dashboard's connection, until it goes away."""
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_LIMIT)
@@ -158,7 +145,7 @@ async def _stream(request: Request, clinic_id: uuid.UUID) -> AsyncIterator[str]:
     summary="Stream a notice when this clinic's data changes",
     response_class=StreamingResponse,
 )
-async def live(request: Request, scope: ClinicScopeDep, session: SessionDep) -> StreamingResponse:
+async def live(request: Request, scope: ClinicScopeDep) -> StreamingResponse:
     """Open a server-sent event stream for one clinic.
 
     Scoped by the same dependency every other route uses, so a dashboard
@@ -170,18 +157,12 @@ async def live(request: Request, scope: ClinicScopeDep, session: SessionDep) -> 
     says a topic changed. The re-fetch it triggers is audited, which is where
     the patient data actually travels.
 
-    The clinic is checked to exist before a listener is filed under it.
-    `clinic_scope` deliberately does not reject an unknown id -- the row-level
-    policies simply match nothing -- which is right for a route that reads
-    rows, and wrong for this one: the stream reads none, so there is nothing
-    for a policy to filter and an arbitrary UUID became a dictionary key that
-    would never be notified and never collected while the connection was held.
-    A typo'd dashboard URL is now a 404 rather than a stream that is silently
-    dead.
+    `clinic_scope` answers 404 for a clinic that does not exist, which matters
+    more here than on a route that reads rows: this stream reads none, so an
+    arbitrary UUID would otherwise become a dictionary key that is never
+    notified and never collected while the connection is held. A typo'd
+    dashboard URL is a 404 rather than a stream that is silently dead.
     """
-    if not await _clinic_exists(session, scope.clinic_id):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No existe esa clínica.")
-
     if listener_count(scope.clinic_id) >= LISTENERS_PER_CLINIC or _total_listeners() >= (
         LISTENERS_TOTAL
     ):
