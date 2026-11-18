@@ -290,6 +290,48 @@ async def test_a_column_the_sheet_does_not_have_is_rejected(scoped: TestClient) 
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    "target", ["no_such_field", "patient.no_such_field", "nonsense.eps", "EPS"]
+)
+async def test_a_column_cannot_be_mapped_to_a_field_that_does_not_exist(
+    scoped: TestClient, target: str
+) -> None:
+    """Found in the delivery campaign: the mapping was accepted and shown as
+    "confirmed", and the column then converted into nothing."""
+    body = _upload(scoped, "1_clean_ips.xlsx")
+    session_id = body["session_id"]
+
+    response = scoped.put(
+        f"/onboarding/uploads/{session_id}/mapping",
+        json={"sheet": "Pacientes", "mapping": {"Celular": target}},
+    )
+
+    assert response.status_code == 422, response.text
+    assert target in response.json()["detail"]
+    after = scoped.get(f"/onboarding/uploads/{session_id}").json()
+    celular = next(
+        c
+        for s in after["sheets"]
+        if s["sheet"] == "Pacientes"
+        for c in s["columns"]
+        if c["column"] == "Celular"
+    )
+    assert celular["target_field"] != target, "a refused mapping was stored"
+
+
+async def test_a_field_of_another_kind_of_sheet_can_still_be_named(scoped: TestClient) -> None:
+    """A sheet may carry columns of the entity it describes ("appointment.…" on
+    a patient sheet), so a qualified name that exists must keep working."""
+    body = _upload(scoped, "1_clean_ips.xlsx")
+
+    response = scoped.put(
+        f"/onboarding/uploads/{body['session_id']}/mapping",
+        json={"sheet": "Pacientes", "mapping": {"Celular": "appointment.appointment_date"}},
+    )
+
+    assert response.status_code == 200, response.text
+
+
 # ----------------------------------------------------------------- isolation
 async def test_another_clinic_cannot_see_the_session(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
     """A session is clinic data: its existence is not disclosed either."""

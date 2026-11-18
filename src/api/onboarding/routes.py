@@ -44,7 +44,7 @@ from src.api.onboarding.schemas import (
     ValidationOut,
 )
 from src.onboarding import guidance, repository, service
-from src.onboarding.canonical import Entity
+from src.onboarding.canonical import FIELDS_BY_ENTITY, Entity, field_for
 from src.onboarding.matcher import SHARED_FIELDS
 from src.onboarding.models import ImportProfile
 from src.onboarding.reader import ReadResult, UnreadableFile, read_isolated
@@ -513,6 +513,25 @@ async def set_mapping(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
             f"These columns are not in the sheet: {sorted(unknown)}.",
+        )
+
+    # A target must be a field we define, on the sheet's own entity or named
+    # with another's prefix ("appointment.appointment_date"). Otherwise the
+    # mapping was stored and shown as confirmed, and the column then converted
+    # into nothing.
+    sheet_entity = (
+        Entity(body.entity) if body.entity in {e.value for e in Entity} else report.entity
+    )
+    invented = sorted(
+        target
+        for target in body.mapping.values()
+        if target and field_for(*service.split_target(target, sheet_entity)) is None
+    )
+    if invented:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"These are not fields of a {sheet_entity.value} sheet: {invented}. "
+            f"Choose one of {sorted(f.name for f in FIELDS_BY_ENTITY[sheet_entity])}.",
         )
 
     # The name fields are exempt: RIPS exports a name in four columns, and
