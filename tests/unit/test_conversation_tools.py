@@ -113,6 +113,7 @@ def test_the_registry_is_the_whole_reach() -> None:
         "find_slots",
         "hold_slot",
         "move_to_offered_slot",
+        "record_offer_round",
         "withdraw_messaging_consent",
     }
 
@@ -129,6 +130,22 @@ def test_an_offer_is_bounded() -> None:
     """A message listing ten times is one nobody reads, and a template allows
     ten buttons at most anyway (§9a)."""
     assert 1 <= tools.MAX_OFFERED_SLOTS <= 10
+
+
+@pytest.mark.parametrize(
+    ("today", "last"),
+    [
+        (dt.date(2026, 11, 18), dt.date(2026, 12, 31)),
+        (dt.date(2026, 12, 20), dt.date(2027, 1, 31)),
+        (dt.date(2027, 1, 31), dt.date(2027, 2, 28)),
+        (dt.date(2028, 1, 1), dt.date(2028, 2, 29)),
+    ],
+)
+def test_the_search_covers_the_rest_of_this_month_and_all_of_the_next(
+    today: dt.date, last: dt.date
+) -> None:
+    """The client's window, across a year end, a short month and a leap year."""
+    assert tools.offer_window(today) == (today, last)
 
 
 def test_tool_results_carry_facts_not_sentences() -> None:

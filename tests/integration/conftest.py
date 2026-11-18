@@ -32,8 +32,9 @@ _TABLES = (
     "onboarding.staging_rows",
     "onboarding.import_sessions",
     "onboarding.import_profiles",
-    # Before appointments and patients: it references both.
+    # Before appointments and patients: they reference both.
     "app.escalations",
+    "app.offer_rounds",
     "app.appointments",
     "app.availability_exceptions",
     "app.availability_rules",

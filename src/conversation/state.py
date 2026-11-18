@@ -70,6 +70,8 @@ class Stop(StrEnum):
     GATE_EXHAUSTED = "gate_exhausted"
     #: The patient asked for no more messages, now or in an earlier turn.
     OPTED_OUT = "opted_out"
+    #: Both rounds of offered dates turned down (the client's reschedule rule).
+    OFFER_ROUNDS_EXHAUSTED = "offer_rounds_exhausted"
 
 
 @dataclass(frozen=True, slots=True)

@@ -149,6 +149,22 @@ def classify_intent(inbound: str) -> Intent:
     return Intent.UNCLEAR
 
 
+#: Turning down every offered date. Only consulted while an offer is open,
+#: which is what makes a bare "no" safe to read this way: in answer to "which
+#: of these dates?", "no" means none of them, not "cancel my appointment".
+_DECLINES_OFFER: Final[tuple[str, ...]] = (
+    r"^no$",
+    r"\bningun[oa]s?\b",
+    r"\botras? (fechas?|opciones|horas|dias)\b",
+    r"\bno me (sirve|sirven|queda|quedan)\b",
+)
+
+
+def declines_offer(inbound: str) -> bool:
+    """Whether a reply to an offer turns down every date in it."""
+    return _matches(normalise(inbound), _DECLINES_OFFER)
+
+
 def chosen_slot(inbound: str, offered: int) -> int | None:
     """Which numbered slot the patient picked, or None.
 

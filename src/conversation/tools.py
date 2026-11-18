@@ -62,15 +62,19 @@ class ToolResult:
     detail: str = ""
 
 
-#: How far ahead a reschedule looks when the patient states no preference. Two
-#: weeks: far enough to find something in a busy clinic, near enough that the
-#: offer is still relevant when they reply.
-DEFAULT_HORIZON_DAYS: Final = 14
-
-#: How many slots one offer carries. A template allows 10 quick-reply buttons
-#: (CLAUDE.md §9a), but a message listing ten times is one nobody reads: five
-#: is a choice, ten is a catalogue.
+#: How many slots one offer carries, each on a different date. A template
+#: allows 10 quick-reply buttons (CLAUDE.md §9a), but a message listing ten
+#: dates is one nobody reads: five is a choice, ten is a catalogue.
 MAX_OFFERED_SLOTS: Final = 5
+
+
+def offer_window(today: dt.date) -> tuple[dt.date, dt.date]:
+    """The dates a reschedule searches: the rest of this month and all of the
+    next, as the client asked. Clinic-local dates, so "this month" is the
+    month in Bogotá."""
+    first_of_next = (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+    last_of_next = (first_of_next + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
+    return today, last_of_next
 
 
 async def confirm_appointment(
@@ -180,26 +184,28 @@ async def find_slots(
     doctor_id: uuid.UUID,
     appointment_type_id: uuid.UUID,
     now: dt.datetime,
-    start_date: dt.date | None = None,
-    end_date: dt.date | None = None,
+    exclude_dates: tuple[dt.date, ...] = (),
     earliest: dt.time | None = None,
     latest: dt.time | None = None,
 ) -> ToolResult:
-    """Compute offerable times. Nothing is reserved.
+    """Compute offerable times, one per date, never on `exclude_dates`.
+    Nothing is reserved.
 
     Computed from the doctor's rules on this request rather than read from a
     slot table: a stored list drifts the moment a doctor changes their hours or
     a holiday is declared (CLAUDE.md §11).
     """
-    begins = start_date or now.astimezone(BOGOTA).date()
+    begins, ends = offer_window(now.astimezone(BOGOTA).date())
     search = offers.SlotSearch(
         clinic_id=clinic_id,
         doctor_id=doctor_id,
         appointment_type_id=appointment_type_id,
         start_date=begins,
-        end_date=end_date or begins + dt.timedelta(days=DEFAULT_HORIZON_DAYS),
+        end_date=ends,
         earliest=earliest,
         latest=latest,
+        excluded_dates=frozenset(exclude_dates),
+        one_per_day=True,
     )
     found = await offers.find_slots(session, search, now=now, limit=MAX_OFFERED_SLOTS)
 
@@ -283,6 +289,28 @@ async def move_to_offered_slot(
     return ToolResult(ok=True, facts=facts)
 
 
+async def record_offer_round(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    patient_id: uuid.UUID,
+    offered_dates: tuple[dt.date, ...],
+    now: dt.datetime,
+) -> ToolResult:
+    """Remember the dates this round offered, so the next round offers others
+    and the conversation can count its rounds."""
+    await offers.record_round(
+        session,
+        clinic_id=clinic_id,
+        appointment_id=appointment_id,
+        patient_id=patient_id,
+        offered_dates=offered_dates,
+        now=now,
+    )
+    return ToolResult(ok=True, facts=FactsBuilder())
+
+
 async def withdraw_messaging_consent(
     session: AsyncSession,
     *,
@@ -322,6 +350,7 @@ REGISTRY: Final[dict[str, Callable[..., object]]] = {
     "find_slots": find_slots,
     "hold_slot": hold_slot,
     "move_to_offered_slot": move_to_offered_slot,
+    "record_offer_round": record_offer_round,
     "withdraw_messaging_consent": withdraw_messaging_consent,
 }
 

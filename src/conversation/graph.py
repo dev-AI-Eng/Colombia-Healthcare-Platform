@@ -14,7 +14,9 @@
      ├ opt_out ────► [act: withdraw_messaging_consent] ──► templated OPTED_OUT ──► END
      ├ confirm ────► [act: confirm_appointment] ─┐
      ├ cancel ─────► [act: cancel_appointment] ──┤
-     ├ reschedule ─► [act: find_slots]           │
+     ├ reschedule ─► [act: find_slots ──► hold_slot per date ──► record_offer_round]
+     │   (5 dates, one per day; a second round never repeats the first;
+     │    after two rounds turned down: templated NO_MORE_OFFERS + escalate ──► END)
      └ unclear ────────────────────────────────► │
                                                  ▼
                                             [compose]
@@ -62,7 +64,7 @@ from src.audit.context import AccessAction
 from src.audit.service import Access, record_access
 from src.conversation import templates as T
 from src.conversation import tools
-from src.conversation.classify import chosen_slot, classify_intent
+from src.conversation.classify import chosen_slot, classify_intent, declines_offer
 from src.conversation.facts import FactsBuilder, VerifiedFacts
 from src.conversation.state import (
     ConversationState,
@@ -73,6 +75,7 @@ from src.conversation.state import (
 )
 from src.conversation.validator import Verdict, check_authored, validate
 from src.core.config import Settings
+from src.core.timezones import BOGOTA
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
 from src.registry import repository as registry
 from src.registry.models import Clinic, Doctor
@@ -82,6 +85,7 @@ from src.scheduling.models import (
     Appointment,
     AppointmentStatus,
     EscalationReason,
+    OfferRound,
 )
 
 
@@ -107,6 +111,15 @@ MAX_RETRIES: Final = 2
 
 #: Total compositions allowed per turn, derived rather than written twice.
 MAX_ATTEMPTS: Final = MAX_RETRIES + 1
+
+#: The client's reschedule rule: five dates, then five different ones, then a
+#: closing message. A third request in the same reschedule gets the message.
+MAX_OFFER_ROUNDS: Final = 2
+
+#: How long one reschedule lasts for counting rounds. A day, so a patient who
+#: comes back next week to move the appointment starts from the first round
+#: rather than being told nothing is available.
+OFFER_EPISODE: Final = dt.timedelta(hours=24)
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +304,13 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         )
 
     offers = await _offers(state, deps, appointment) if appointment else []
+    rounds = await _rounds(state, deps, appointment) if appointment else []
+    if appointment is not None and (offers or rounds) and declines_offer(state["inbound_text"]):
+        # An answer to an open offer that turns every date down: the next
+        # round, never a cancellation of the appointment it would replace.
+        # Checked before a number is read, so "el 3 no me sirve" is a refusal
+        # rather than a pick of the third date.
+        intent = Intent.RESCHEDULE
     live = [o for o in offers if o.expires_at is not None and o.expires_at > state["now"]]
     if appointment is not None and offers and intent in {Intent.CONFIRM, Intent.UNCLEAR}:
         # The previous turn offered numbered times and holds them. A reply
@@ -355,12 +375,26 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
     if intent is Intent.RESCHEDULE:
         if appointment is None:
             return {"stop": Stop.NO_APPOINTMENT, "verified_facts": facts.build()}
+        if len(rounds) >= MAX_OFFER_ROUNDS:
+            # Both rounds turned down: the closing message, and a case for
+            # staff so a patient the channel could not serve is not lost. A
+            # pick that arrives after the second round's holds expired lands
+            # here too, which is why the case matters.
+            await booking.release_offers(
+                deps.session, clinic_id=state["clinic_id"], appointment_id=appointment.id
+            )
+            return {
+                "stop": Stop.OFFER_ROUNDS_EXHAUSTED,
+                "appointment_id": appointment.id,
+                "verified_facts": facts.build(),
+            }
         result = await tools.find_slots(
             deps.session,
             clinic_id=state["clinic_id"],
             doctor_id=appointment.doctor_id,
             appointment_type_id=appointment.appointment_type_id,
             now=state["now"],
+            exclude_dates=tuple(sorted({day for r in rounds for day in r.offered_dates})),
         )
         if not result.ok:
             return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
@@ -391,8 +425,17 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
             )
             if taken.ok:
                 held.offer(slot.starts_at, slot.duration_minutes)
-        if not held.build().offered_slots:
+        offered = held.build().offered_slots
+        if not offered:
             return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
+        await tools.record_offer_round(
+            deps.session,
+            clinic_id=state["clinic_id"],
+            appointment_id=appointment.id,
+            patient_id=patient_id,
+            offered_dates=tuple(slot.starts_at.astimezone(BOGOTA).date() for slot in offered),
+            now=state["now"],
+        )
         return {
             "intent": Intent.RESCHEDULE,
             "appointment_id": appointment.id,
@@ -472,6 +515,20 @@ async def _offers(
             Access(resource="appointments", resource_id=str(row.id), patient_id=row.patient_id),
         )
     return rows
+
+
+async def _rounds(
+    state: ConversationState, deps: Dependencies, appointment: Appointment
+) -> list[OfferRound]:
+    """The rounds of dates offered for this appointment in the current
+    reschedule, oldest first. A reschedule lasts `OFFER_EPISODE`; a patient who
+    asks again after that starts from the first round."""
+    return await offers.recent_rounds(
+        deps.session,
+        clinic_id=state["clinic_id"],
+        appointment_id=appointment.id,
+        since=state["now"] - OFFER_EPISODE,
+    )
 
 
 async def _active_appointment(
@@ -746,6 +803,8 @@ _STOP_REPLIES: Final[dict[Stop, tuple[str, EscalationReason | None]]] = {
     # No escalation: a staff case is a promise that someone will call, and the
     # patient has just asked not to be contacted.
     Stop.OPTED_OUT: (T.OPTED_OUT, None),
+    # M2's no-acceptable-slot case, which M14's waitlist later builds on.
+    Stop.OFFER_ROUNDS_EXHAUSTED: (T.NO_MORE_OFFERS, EscalationReason.NO_ACCEPTABLE_SLOT),
 }
 
 _ESCALATION_DETAIL: Final[dict[Stop, str]] = {
@@ -758,6 +817,9 @@ _ESCALATION_DETAIL: Final[dict[Stop, str]] = {
     Stop.SHARED_HANDSET: "Número compartido por varios pacientes.",
     Stop.NO_APPOINTMENT: "No hay cita activa.",
     Stop.OPTED_OUT: "El paciente pidió no recibir más mensajes.",
+    Stop.OFFER_ROUNDS_EXHAUSTED: (
+        "El paciente rechazó las dos rondas de fechas ofrecidas para reprogramar su cita."
+    ),
 }
 
 

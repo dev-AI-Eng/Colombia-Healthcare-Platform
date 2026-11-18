@@ -41,7 +41,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSTZRANGE, ExcludeConstraint, Range
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSTZRANGE, ExcludeConstraint, Range
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db import Base, string_enum
@@ -314,3 +314,30 @@ class Escalation(Base):
     context: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OfferRound(Base):
+    """One round of dates offered to move one appointment (M3 reschedule).
+
+    The conversation's memory between turns. The offered times themselves are
+    holds, which are deleted when released and swept when they expire, so they
+    cannot answer "which dates did this patient already turn down" or "is this
+    the second round" by the time the patient replies. A row here can.
+    """
+
+    __tablename__ = "offer_rounds"
+    __table_args__ = (
+        Index("ix_offer_rounds_clinic_id_appointment_id", "clinic_id", "appointment_id"),
+        {"schema": "app"},
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    clinic_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.clinics.id"))
+    #: The appointment the offered dates would replace.
+    appointment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.appointments.id"))
+    patient_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("app.patients.id"))
+    #: Clinic-local dates, one per offered slot.
+    offered_dates: Mapped[list[date]] = mapped_column(ARRAY(Date))
+    #: The conversation's clock, not the database's, so a test can construct
+    #: "a round offered yesterday".
+    offered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

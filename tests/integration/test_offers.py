@@ -212,6 +212,35 @@ async def test_a_weekday_filter_narrows_the_offer(session: AsyncSession) -> None
     assert {s.local_start.weekday() for s in slots} == {2}
 
 
+async def test_one_per_day_offers_dates_rather_than_one_mornings_times(
+    session: AsyncSession,
+) -> None:
+    """The client's reschedule rule: five dates to choose between. Without it
+    the first five times of Monday morning fill the whole offer."""
+    graph = await create_graph(session)
+    await _weekday_mornings(session, graph)
+
+    slots = await offers.find_slots(session, _search(graph, one_per_day=True), now=NOW, limit=5)
+
+    days = [s.local_start.date() for s in slots]
+    assert days == [MONDAY + dt.timedelta(days=offset) for offset in range(5)]
+    assert all(s.local_start.time() == dt.time(8) for s in slots), "the earliest time each day"
+
+
+async def test_an_excluded_date_is_never_offered(session: AsyncSession) -> None:
+    """A second round must not repeat the dates the patient turned down."""
+    graph = await create_graph(session)
+    await _weekday_mornings(session, graph)
+    turned_down = frozenset({MONDAY, MONDAY + dt.timedelta(days=2)})
+
+    slots = await offers.find_slots(
+        session, _search(graph, excluded_dates=turned_down), now=NOW, limit=100
+    )
+
+    assert slots
+    assert not {s.local_start.date() for s in slots} & turned_down
+
+
 # ------------------------------------------------- the criterion that matters
 async def test_offering_holds_every_slot_it_shows(session: AsyncSession) -> None:
     """An offer the patient cannot accept is worse than no offer (ADR-17)."""

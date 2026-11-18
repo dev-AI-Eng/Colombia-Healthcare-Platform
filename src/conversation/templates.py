@@ -55,7 +55,14 @@ CANCELLED: Final = (
 OFFER_INTRO: Final = "Estos son los horarios disponibles con {doctor}:"
 
 OFFER_FOOTER: Final = (
-    "Responda con el número del horario que prefiera, o escriba CANCELAR si desea cancelar la cita."
+    "Responda con el número del horario que prefiera, NINGUNA si ninguno le sirve, "
+    "o CANCELAR si desea cancelar la cita."
+)
+
+#: The client's closing message once both rounds of dates are turned down.
+NO_MORE_OFFERS: Final = (
+    "No hay más citas disponibles por este medio. "
+    "Si desea una cita, por favor comuníquese con la clínica."
 )
 
 REMINDER: Final = (

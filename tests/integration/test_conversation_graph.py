@@ -27,10 +27,12 @@ from src.conversation.generator import facts_block
 from src.conversation.generator import generate as model_generate
 from src.conversation.graph import CLINIC_PHONE_SETTING, Dependencies, build_graph
 from src.conversation.state import Draft, Intent, Stop, initial
+from src.conversation.tools import offer_window
 from src.conversation.validator import MessageKind, Verdict, validate
 from src.core.config import Settings
 from src.core.crypto import blind_index
 from src.core.tenancy import ClinicScope, apply_clinic_scope
+from src.core.timezones import BOGOTA
 from src.identity.models import (
     BindingRelationship,
     Consent,
@@ -40,6 +42,7 @@ from src.identity.models import (
     PhoneBinding,
 )
 from src.registry.models import Clinic
+from src.scheduling import booking
 from src.scheduling.models import (
     Appointment,
     AppointmentStatus,
@@ -1229,3 +1232,153 @@ async def test_a_number_that_names_no_offer_moves_nothing(session: AsyncSession)
     assert result["intent"] is not Intent.CHOOSE
     await session.refresh(original)
     assert original.status is AppointmentStatus.SCHEDULED
+
+
+# ------------------------------------- the client's reschedule rounds (M3 QA)
+#
+# Five dates, one per day, within the rest of this month and the next. If none
+# works, five different dates. If none works again, a closing message and a
+# case for staff. Holds, the exclusion constraint and the gate are unchanged.
+
+
+def _dates(result: dict) -> list[dt.date]:
+    return [s.starts_at.astimezone(BOGOTA).date() for s in result["verified_facts"].offered_slots]
+
+
+async def test_the_first_round_offers_five_different_dates_inside_the_window(
+    session: AsyncSession,
+) -> None:
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    offered = await _run(
+        session, graph, "Quiero otra fecha", deps=_by_intent_deps(session), now=now
+    )
+
+    dates = _dates(offered)
+    assert len(dates) == 5
+    assert len(set(dates)) == 5, "two offered times share a date"
+    first, last = offer_window(now.astimezone(BOGOTA).date())
+    assert all(first <= day <= last for day in dates)
+    assert len(await _offer_holds(session, original)) == 5, "every offered date must be held"
+
+
+async def test_when_none_works_five_different_dates_are_offered(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    second = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert second["intent"] is Intent.RESCHEDULE
+    assert len(_dates(second)) == 5
+    assert not set(_dates(first)) & set(_dates(second)), "the second round repeated a date"
+    held = {h.during.lower.astimezone(BOGOTA).date() for h in await _offer_holds(session, original)}
+    assert held == set(_dates(second)), "the first round's holds outlived it"
+
+
+async def test_a_date_picked_in_the_second_round_is_booked(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    second = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=1))
+    chosen = await _run(session, graph, "3", deps=deps, now=now + dt.timedelta(minutes=2))
+
+    assert chosen["intent"] is Intent.CHOOSE
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.RESCHEDULED
+    moved = (
+        await session.execute(
+            select(Appointment).where(
+                Appointment.rescheduled_from_appointment_id == original.id,
+                Appointment.status == AppointmentStatus.CONFIRMED,
+            )
+        )
+    ).scalar_one()
+    assert moved.during.lower == second["verified_facts"].offered_slots[2].starts_at
+
+
+async def test_after_two_rounds_turned_down_the_closing_message_is_sent(
+    session: AsyncSession,
+) -> None:
+    """Nothing is booked or cancelled, no time stays held, and staff get a
+    case so a patient the channel could not serve is not lost."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=1))
+    last = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=2))
+
+    assert last["stop"] is Stop.OFFER_ROUNDS_EXHAUSTED
+    assert last["outbound_text"] == T.NO_MORE_OFFERS
+    assert last["escalation_id"] is not None
+    case = await session.get(Escalation, last["escalation_id"])
+    assert case is not None and case.reason.value == "no_acceptable_slot"
+    assert await _offer_holds(session, original) == []
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED
+
+
+async def test_a_bare_no_to_an_offer_asks_again_rather_than_cancelling(
+    session: AsyncSession,
+) -> None:
+    """Without an offer, "no" reads as a cancellation. In answer to "which of
+    these dates?" it means none of them, and the appointment must survive."""
+    graph = await _clinic_with_patient(session)
+    original = await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    answer = await _run(session, graph, "no", deps=deps, now=now + dt.timedelta(minutes=1))
+
+    assert answer["intent"] is Intent.RESCHEDULE
+    await session.refresh(original)
+    assert original.status is AppointmentStatus.SCHEDULED
+
+
+async def test_turned_down_dates_are_remembered_after_their_holds_are_swept(
+    session: AsyncSession,
+) -> None:
+    """The holds are deleted when they expire; the patient who answers
+    "ninguna" forty minutes later still gets dates they have not seen."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+    later = now + dt.timedelta(minutes=40)
+
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    await booking.sweep_expired_holds(session, clinic_id=graph.clinic_id, now=later)
+    second = await _run(session, graph, "ninguna", deps=deps, now=later)
+
+    assert len(_dates(second)) == 5
+    assert not set(_dates(first)) & set(_dates(second))
+
+
+async def test_a_new_reschedule_a_day_later_starts_from_the_first_round(
+    session: AsyncSession,
+) -> None:
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+
+    await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=1))
+    tomorrow = await _run(
+        session, graph, "Quiero otra fecha", deps=deps, now=now + dt.timedelta(hours=25)
+    )
+
+    assert tomorrow["intent"] is Intent.RESCHEDULE
+    assert tomorrow["stop"] is None
+    assert len(_dates(tomorrow)) == 5

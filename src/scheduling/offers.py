@@ -52,6 +52,7 @@ from src.scheduling.models import (
     AvailabilityRule,
     Escalation,
     EscalationReason,
+    OfferRound,
 )
 
 #: How many slots to offer at once. Three is enough to feel like a choice and
@@ -80,6 +81,11 @@ class SlotSearch:
     latest: dt.time | None = None
     #: Clinic-local weekdays the patient can manage; empty means any.
     weekdays: frozenset[int] = frozenset()
+    #: Clinic-local dates already offered and turned down; never offered again.
+    excluded_dates: frozenset[dt.date] = frozenset()
+    #: At most one slot per clinic-local day, so an offer is a choice between
+    #: dates rather than five times on the same morning.
+    one_per_day: bool = False
 
 
 async def _load_rules(
@@ -174,6 +180,8 @@ def _acceptable(slot: Slot, search: SlotSearch) -> bool:
     where the patient lives, not in UTC.
     """
     local = slot.local_start
+    if local.date() in search.excluded_dates:
+        return False
     if search.weekdays and local.weekday() not in search.weekdays:
         return False
     if search.earliest is not None and local.time() < search.earliest:
@@ -238,7 +246,84 @@ async def find_slots(
         buffer_minutes=appointment_type.buffer_minutes,
         now=now,
     )
-    return [slot for slot in slots if _acceptable(slot, search)][:limit]
+    chosen: list[Slot] = []
+    days: set[dt.date] = set()
+    for slot in slots:
+        if not _acceptable(slot, search):
+            continue
+        if search.one_per_day:
+            day = slot.local_start.date()
+            if day in days:
+                continue
+            days.add(day)
+        chosen.append(slot)
+        if len(chosen) == limit:
+            break
+    return chosen
+
+
+async def recent_rounds(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    since: dt.datetime,
+) -> list[OfferRound]:
+    """The rounds of dates offered to move this appointment since `since`,
+    oldest first. Each is patient data read, so each is recorded (rule 8)."""
+    rows = list(
+        (
+            await session.scalars(
+                select(OfferRound)
+                .where(
+                    OfferRound.clinic_id == clinic_id,
+                    OfferRound.appointment_id == appointment_id,
+                    OfferRound.offered_at > since,
+                )
+                .order_by(OfferRound.offered_at)
+            )
+        ).all()
+    )
+    for row in rows:
+        await record_access(
+            session,
+            AccessAction.READ,
+            Access(resource="offer_rounds", resource_id=str(row.id), patient_id=row.patient_id),
+        )
+    return rows
+
+
+async def record_round(
+    session: AsyncSession,
+    *,
+    clinic_id: uuid.UUID,
+    appointment_id: uuid.UUID,
+    patient_id: uuid.UUID,
+    offered_dates: tuple[dt.date, ...],
+    now: dt.datetime,
+) -> OfferRound:
+    """Remember which dates one round offered, so the next round offers
+    others and the conversation knows how many rounds it has made.
+
+    Kept apart from the holds on purpose: a hold is deleted when released and
+    swept when it expires, and a patient who answers "ninguna" twenty minutes
+    later must still get dates they have not already turned down.
+    """
+    row = OfferRound(
+        clinic_id=clinic_id,
+        appointment_id=appointment_id,
+        patient_id=patient_id,
+        offered_dates=list(offered_dates),
+        offered_at=now,
+    )
+    session.add(row)
+    await session.flush()
+    await record_access(
+        session,
+        AccessAction.CREATE,
+        Access(resource="offer_rounds", resource_id=str(row.id), patient_id=patient_id),
+    )
+    return row
 
 
 async def escalate(
