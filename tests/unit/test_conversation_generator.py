@@ -221,13 +221,16 @@ def test_an_empty_fact_set_is_not_sent_to_a_model() -> None:
     assert not validate(draft.text, VerifiedFacts(), draft.kind).approved
 
 
-def test_the_fallback_needs_no_facts() -> None:
-    """ "A person will contact you" states nothing, so it is still generated."""
-    client = Fixed("Un miembro del personal se pondrá en contacto con usted.")
-    draft = generate(_state(Intent.UNCLEAR, facts=VerifiedFacts()), client=client)
+def test_the_unclear_reply_gives_the_clinics_number_rather_than_promising_a_call() -> None:
+    """Found in review: it said a person would contact the patient, and an
+    unclear message opens no staff case, so nobody would have."""
+    client = Fixed("Gracias por escribirnos.")
+    draft = generate(_state(Intent.UNCLEAR), client=client)
 
-    assert client.calls, "the fallback should still be drafted"
+    assert client.calls, "the unclear reply should still be drafted"
     assert draft.kind is MessageKind.FALLBACK
+    assert FACTS.clinic_phone and FACTS.clinic_phone in draft.text
+    assert "se pondrá en contacto" not in draft.text
 
 
 # --------------------------------------------------------- the gate applies

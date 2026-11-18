@@ -1035,7 +1035,7 @@ _BY_INTENT = {
     Intent.CHOOSE: (MessageKind.CONFIRMATION, T.CONFIRMED),
     Intent.CANCEL: (MessageKind.CANCELLATION, T.CANCELLED),
     Intent.RESCHEDULE: (MessageKind.SLOT_OFFER, T.OFFER_INTRO),
-    Intent.UNCLEAR: (MessageKind.FALLBACK, T.STAFF_WILL_CALL),
+    Intent.UNCLEAR: (MessageKind.FALLBACK, T.NOT_UNDERSTOOD),
 }
 
 
@@ -1542,3 +1542,57 @@ async def test_a_stop_reply_the_gate_refuses_is_never_sent(
 
     assert result["stop"] is Stop.UNKNOWN_SENDER
     assert result["outbound_text"] == T.STAFF_WILL_CALL
+
+
+# ------------------------------------------- a promised call has a staff case
+
+
+@pytest.mark.parametrize("phone_configured", [True, False])
+@pytest.mark.parametrize(
+    "inbound",
+    [
+        "hola",
+        "la segunda",
+        "a que hora es mi cita?",
+        "gracias",
+        "",
+        "Si, confirmo",
+        "cancelar",
+        "Quiero otra fecha",
+        "Quiero hablar con alguien",
+        "Me duele mucho el estomago",
+        "No quiero más mensajes",
+    ],
+)
+async def test_every_reply_that_promises_a_call_comes_with_a_staff_case(
+    session: AsyncSession, inbound: str, phone_configured: bool
+) -> None:
+    """Found in review: a message the classifier could not place was answered
+    "Un miembro del personal ... se pondrá en contacto con usted" and opened no
+    case, so nobody would have called. Whatever the message, a reply that says
+    someone will be in touch has a case behind it."""
+    graph = await _clinic_with_patient(session)
+    if not phone_configured:
+        clinic = await session.get(Clinic, graph.clinic_id)
+        assert clinic is not None
+        clinic.settings = {}
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    result = await _run(session, graph, inbound, deps=_by_intent_deps(session))
+
+    out = result["outbound_text"] or ""
+    if "se pondrá en contacto" in out:
+        assert result["escalation_id"] is not None, f"{inbound!r} promised a call with no case"
+
+
+async def test_an_unclear_message_gets_the_clinics_number(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+
+    result = await _run(session, graph, "hola", deps=_by_intent_deps(session))
+
+    assert result["intent"] is Intent.UNCLEAR
+    assert result["outbound_text"] == T.NOT_UNDERSTOOD.format(clinic_phone="+57 601 555 0101")
+    assert result["escalation_id"] is None

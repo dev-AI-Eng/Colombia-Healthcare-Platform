@@ -77,6 +77,15 @@ STAFF_WILL_CALL: Final = (
     "Gracias por su mensaje. Un miembro del personal de la clínica se pondrá en contacto con usted."
 )
 
+#: The reply to a message the classifier cannot place (`Intent.UNCLEAR`). It
+#: gives the clinic's number rather than promising a call: an unclear message
+#: opens no staff case, so "someone will contact you" would be a promise
+#: nobody keeps. Every reply that does promise one comes with a case.
+NOT_UNDERSTOOD: Final = (
+    "No logramos entender su mensaje. "
+    "Si necesita ayuda con su cita, por favor llame a la clínica al {clinic_phone}."
+)
+
 #: Rule 5. A clinical question is never answered, in any form.
 CLINICAL_TO_HUMAN: Final = (
     "Por su seguridad no podemos dar información médica por este medio. "

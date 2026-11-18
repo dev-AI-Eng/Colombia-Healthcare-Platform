@@ -53,7 +53,7 @@ _TEMPLATE_FOR: Final[dict[str, tuple[MessageKind, str]]] = {
     "cancel": (MessageKind.CANCELLATION, T.CANCELLED),
     "reschedule": (MessageKind.SLOT_OFFER, T.OFFER_INTRO),
     "choose": (MessageKind.CONFIRMATION, T.CONFIRMED),
-    "unclear": (MessageKind.FALLBACK, T.STAFF_WILL_CALL),
+    "unclear": (MessageKind.FALLBACK, T.NOT_UNDERSTOOD),
 }
 
 

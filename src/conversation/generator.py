@@ -45,8 +45,8 @@ from src.conversation.state import ConversationState, Draft, Intent
 from src.conversation.templates import (
     CANCELLED,
     CONFIRMED,
+    NOT_UNDERSTOOD,
     REMINDER,
-    STAFF_WILL_CALL,
     MissingFact,
     render,
     render_offer,
@@ -73,7 +73,7 @@ FACTS_TEMPLATE: Final[dict[MessageKind, str]] = {
     MessageKind.CONFIRMATION: CONFIRMED,
     MessageKind.CANCELLATION: CANCELLED,
     MessageKind.REMINDER: REMINDER,
-    MessageKind.FALLBACK: STAFF_WILL_CALL,
+    MessageKind.FALLBACK: NOT_UNDERSTOOD,
 }
 
 #: What each message is about, told to the model in words that carry no fact.
@@ -82,7 +82,7 @@ PURPOSE: Final[dict[MessageKind, str]] = {
     MessageKind.CANCELLATION: "La cita del paciente fue cancelada.",
     MessageKind.SLOT_OFFER: "Se le ofrecen al paciente horarios para reprogramar su cita.",
     MessageKind.REMINDER: "Se le recuerda al paciente su próxima cita.",
-    MessageKind.FALLBACK: "Una persona de la clínica se pondrá en contacto con el paciente.",
+    MessageKind.FALLBACK: "No se entendió el mensaje del paciente; se le indica cómo llamar a la clínica.",
 }
 
 SYSTEM_PROMPT: Final = """\
