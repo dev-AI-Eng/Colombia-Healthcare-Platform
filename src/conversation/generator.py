@@ -170,10 +170,13 @@ def _refusal(kind: MessageKind, detail: str) -> Draft:
 
     Returned rather than raised so the retry bound applies and the escalation
     carries the reason. The text is a marker, not Spanish: it must never be
-    mistaken for something sendable, and the gate refuses it either way because
-    it states no required fact.
+    mistaken for something sendable. `refused` is what makes the gate refuse
+    it: relying on a missing required fact does not work for the message kinds
+    that require none.
     """
-    return Draft(text=f"[generator unavailable: {detail}]", kind=kind, templated=False)
+    return Draft(
+        text=f"[generator unavailable: {detail}]", kind=kind, templated=False, refused=True
+    )
 
 
 def generate(

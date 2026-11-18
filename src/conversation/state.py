@@ -125,6 +125,11 @@ class Draft:
     #: code appended (ADR-02). The gate checks this part on its own: it must
     #: state no fact at all, and it is the only part the judge reads.
     authored: str | None = None
+    #: True when the generator failed and `text` is only a marker saying why.
+    #: Such a draft is never approvable: whether a stage happens to refuse a
+    #: marker depends on which facts the message kind requires, and a
+    #: cancellation requires none.
+    refused: bool = False
 
 
 class ConversationState(TypedDict, total=False):

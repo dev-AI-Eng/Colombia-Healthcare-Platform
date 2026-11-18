@@ -42,6 +42,9 @@ class Reason(StrEnum):
     MISSING_REQUIRED_FACT = "missing_required_fact"
     #: Stage 4's code, raised by the model judge rather than here.
     TONE = "tone"
+    #: The generator produced no message (provider down, key rejected, empty
+    #: reply). Raised by the gate, never by a stage: there is no text to read.
+    GENERATOR_UNAVAILABLE = "generator_unavailable"
 
 
 class MessageKind(StrEnum):

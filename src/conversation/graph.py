@@ -73,7 +73,14 @@ from src.conversation.state import (
     PatientContext,
     Stop,
 )
-from src.conversation.validator import MessageKind, Verdict, check_authored, validate
+from src.conversation.validator import (
+    Finding,
+    MessageKind,
+    Reason,
+    Verdict,
+    check_authored,
+    validate,
+)
 from src.core.config import Settings
 from src.core.timezones import BOGOTA
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
@@ -710,6 +717,23 @@ async def gate(state: ConversationState, *, deps: Dependencies) -> ConversationS
     would introduce a model into a path that has none (ADR-01a).
     """
     draft = state["drafts"][-1]
+    if draft.refused:
+        # The generator produced nothing, so there is nothing to check and
+        # nothing a judge could be asked: refuse it without reading it.
+        verdict = Verdict(
+            approved=False,
+            findings=(
+                Finding(Reason.GENERATOR_UNAVAILABLE, "", "the generator produced no message"),
+            ),
+        )
+        return {
+            "drafts": (
+                *state["drafts"][:-1],
+                replace(draft, findings=verdict.findings, approved=False),
+            ),
+            "attempt": state["attempt"] + 1,
+            "reason_codes": verdict.reason_codes,
+        }
     # Stage 0 (ADR-02): the words a model wrote may state no fact. Facts are
     # appended by code, so anything fact-shaped in this part is invented --
     # even a correct-looking one -- and the draft is refused before the

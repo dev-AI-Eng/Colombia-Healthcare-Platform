@@ -1596,3 +1596,56 @@ async def test_an_unclear_message_gets_the_clinics_number(session: AsyncSession)
     assert result["intent"] is Intent.UNCLEAR
     assert result["outbound_text"] == T.NOT_UNDERSTOOD.format(clinic_phone="+57 601 555 0101")
     assert result["escalation_id"] is None
+
+
+# ------------------------------------------- a failed generation is never sent
+
+
+class _Raises:
+    """A provider that is down, or rejects the key."""
+
+    def complete(self, system: str, user: str) -> str:
+        raise RuntimeError("provider unavailable")
+
+
+@pytest.mark.parametrize("failure", ["raises", "empty", "no_key"])
+@pytest.mark.parametrize("inbound", ["Si, confirmo", "cancelar", "hola", "Quiero otra fecha"])
+async def test_a_generator_that_fails_never_reaches_the_patient(
+    session: AsyncSession, inbound: str, failure: str
+) -> None:
+    """Found in the delivery campaign: with the keys configured and the
+    generator failing (an invalid key), the patient was sent the marker
+    "[generator unavailable: AuthenticationError]" for a cancellation or an
+    unclear message. A marker states no fact, and those two kinds require none,
+    so every deterministic stage passed it and a judge that checks tone, not
+    sense, approved it. A refused generation is not a draft at all.
+
+    The judge approves everything here, which is the worst case, and is asked
+    for nothing: there is no wording to judge."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    judged: list[str] = []
+
+    def generate(state):  # type: ignore[no-untyped-def]
+        if failure == "no_key":
+            return model_generate(
+                state, client=None, settings=Settings(_env_file=None, openai_api_key="")
+            )
+        return model_generate(state, client=_Raises() if failure == "raises" else _Scripted("   "))
+
+    def judge(text: str) -> Verdict:
+        judged.append(text)
+        return Verdict(approved=True)
+
+    deps = Dependencies(
+        session=session, settings=Settings(_env_file=None), generate=generate, judge=judge
+    )
+    result = await _run(session, graph, inbound, deps=deps)
+
+    out = result["outbound_text"] or ""
+    assert "generator unavailable" not in out and "[" not in out, f"{inbound!r}: {out!r}"
+    assert result["stop"] is Stop.GATE_EXHAUSTED
+    assert out == T.STAFF_WILL_CALL
+    assert result["escalation_id"] is not None, "nobody was told"
+    assert all(not draft.approved for draft in result["drafts"])
+    assert judged == [], "the judge was asked to bless a marker"
