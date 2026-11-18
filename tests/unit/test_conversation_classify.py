@@ -7,9 +7,12 @@ appointment: a bare "no" to "which of these dates?" must never cancel.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pytest
 
 from src.conversation.classify import declines_offer
+from src.conversation.facts import spell_date
 
 
 @pytest.mark.parametrize(
@@ -26,3 +29,16 @@ def test_these_replies_turn_every_date_down(reply: str) -> None:
 )
 def test_a_pick_a_confirmation_or_a_cancellation_is_not_a_refusal(reply: str) -> None:
     assert not declines_offer(reply)
+
+
+@pytest.mark.parametrize(
+    ("day", "spelled"),
+    [
+        (dt.date(2026, 11, 25), "miércoles 25 de noviembre"),
+        (dt.date(2026, 11, 28), "sábado 28 de noviembre"),
+    ],
+)
+def test_offered_dates_are_spelled_with_their_accents(day: dt.date, spelled: str) -> None:
+    """Patient-facing Spanish (rule 10). Found in the live run of the offer
+    rounds, which listed "miercoles"."""
+    assert spell_date(day) == spelled

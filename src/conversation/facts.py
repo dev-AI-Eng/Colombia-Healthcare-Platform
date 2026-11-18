@@ -52,10 +52,10 @@ MONTHS_ES: Final[tuple[str, ...]] = (
 WEEKDAYS_ES: Final[tuple[str, ...]] = (
     "lunes",
     "martes",
-    "miercoles",
+    "miércoles",
     "jueves",
     "viernes",
-    "sabado",
+    "sábado",
     "domingo",
 )
 
