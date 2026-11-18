@@ -222,6 +222,46 @@ def test_unknown_ids_return_404(client: TestClient, path: str) -> None:
 @pytest.mark.parametrize(
     "path", ["/review/patients", "/review/appointments", "/review/doctors", "/review/summary"]
 )
+def test_a_clinic_that_does_not_exist_is_a_404_not_an_empty_list(
+    client: TestClient, path: str
+) -> None:
+    """An empty list reads as "this clinic has no data"; a clinic that is not
+    there is a different answer."""
+    response = client.get(path, params={"clinic_id": str(uuid.uuid4())})
+
+    assert response.status_code == 404, response.text
+
+
+def test_a_write_for_a_clinic_that_does_not_exist_is_a_404_not_a_500(client: TestClient) -> None:
+    """Found in the delivery campaign: an upload for an unknown clinic reached
+    the foreign key and answered 500, because only reads were covered by "the
+    row-level policies simply match nothing"."""
+    unknown = {"clinic_id": str(uuid.uuid4())}
+
+    upload = client.post(
+        "/onboarding/uploads",
+        params=unknown,
+        files={"file": ("a.csv", b"documento,nombre\n1,Ana\n", "text/csv")},
+    )
+    book = client.post(
+        "/review/appointments",
+        params=unknown,
+        json={
+            "start": "2030-01-07T09:00:00-05:00",
+            "patient_id": str(uuid.uuid4()),
+            "doctor_id": str(uuid.uuid4()),
+            "location_id": str(uuid.uuid4()),
+            "appointment_type_id": str(uuid.uuid4()),
+        },
+    )
+
+    assert upload.status_code == 404, upload.text
+    assert book.status_code == 404, book.text
+
+
+@pytest.mark.parametrize(
+    "path", ["/review/patients", "/review/appointments", "/review/doctors", "/review/summary"]
+)
 def test_clinic_id_is_required(client: TestClient, path: str) -> None:
     """No route serving clinic data may be queried without naming the clinic."""
     assert client.get(path).status_code == 422

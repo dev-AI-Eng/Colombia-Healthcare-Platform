@@ -6,12 +6,14 @@ import uuid
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Settings, get_settings
 from src.core.db import get_session
 from src.core.pagination import PageRequest
 from src.core.tenancy import ClinicScope, apply_clinic_scope
+from src.registry.models import Clinic
 
 MAX_PAGE_SIZE = 200
 
@@ -41,11 +43,14 @@ async def clinic_scope(
     security has a clinic to compare against. Without it the policies match no
     row, which is the safe default but would look like an empty database.
 
-    A clinic id that does not exist is not rejected here: the row-level policies
-    simply match nothing, and the route returns an empty result or 404.
+    A clinic that does not exist is a 404 here. Left to the row-level policies
+    it would match nothing, which reads as an empty list on a read, and on a
+    write reaches the foreign key and becomes a 500.
     """
     scope = ClinicScope(clinic_id=clinic_id)
     await apply_clinic_scope(session, scope)
+    if await session.scalar(select(Clinic.id).where(Clinic.id == clinic_id)) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="clinic not found")
     return scope
 
 
