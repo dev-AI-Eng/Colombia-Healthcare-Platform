@@ -56,7 +56,12 @@ from src.api.review.schemas import AppointmentOut, EscalationOut, Page, SlotOut,
 from src.core.timezones import BOGOTA
 from src.scheduling import booking, offers, repository
 from src.scheduling.booking import BookingResult, Outcome
-from src.scheduling.models import Appointment, AppointmentType, EscalationStatus
+from src.scheduling.models import (
+    Appointment,
+    AppointmentStatus,
+    AppointmentType,
+    EscalationStatus,
+)
 
 router = APIRouter()
 
@@ -68,6 +73,7 @@ TAKEN_DETAIL = "Ese horario ya está ocupado. Elija otro."
 #: A hold that has already lapsed cannot be confirmed: its slot is free again
 #: and may belong to another patient by now.
 EXPIRED_DETAIL = "La reserva ya venció. Vuelva a buscar un horario."
+NOT_A_HOLD_DETAIL = "Esa cita no es una reserva pendiente de confirmar."
 
 
 def _now() -> dt.datetime:
@@ -305,6 +311,21 @@ async def confirm(
         appointment_id=appointment_id,
         caller_patient_id=caller_patient_id,
     )
+
+    # Looked up first, because the engine answers `TAKEN` for a missing row, a
+    # row that is not a hold and an expired hold alike, and each deserves its
+    # own answer: an unknown id is a 404, a booking that is already scheduled
+    # or cancelled is not "expired", and only a real expiry says so.
+    current = require_found(
+        await session.scalar(
+            select(Appointment.status).where(
+                Appointment.clinic_id == scope.clinic_id, Appointment.id == appointment_id
+            )
+        ),
+        "appointment",
+    )
+    if current is not AppointmentStatus.HOLD:
+        raise HTTPException(status.HTTP_409_CONFLICT, NOT_A_HOLD_DETAIL)
 
     result = await booking.confirm_hold(
         session,

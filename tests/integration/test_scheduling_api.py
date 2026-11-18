@@ -226,6 +226,43 @@ async def test_confirming_an_expired_hold_answers_409(
     assert "venció" in response.json()["detail"]
 
 
+async def test_confirming_an_appointment_that_does_not_exist_answers_404(
+    scoped,  # type: ignore[no-untyped-def]
+) -> None:
+    """Found in the delivery campaign: an unknown id answered 409 "La reserva
+    ya venció", because a missing row, a row that is not a hold and an expired
+    hold all came back from the engine as the same outcome."""
+    client, _ = scoped
+
+    response = client.post(f"/review/appointments/{uuid.uuid4()}/confirm")
+
+    assert response.status_code == 404, response.text
+
+
+@pytest.mark.parametrize("status", [AppointmentStatus.SCHEDULED, AppointmentStatus.CANCELLED])
+async def test_confirming_something_that_is_not_a_hold_does_not_say_it_expired(
+    scoped,  # type: ignore[no-untyped-def]
+    session: AsyncSession,
+    status: AppointmentStatus,
+) -> None:
+    """A booking that is already scheduled, or cancelled, is not an expired
+    reservation, and telling a patient it expired sends them to book again."""
+    client, graph = scoped
+    row = appointment(graph, START, status=status)
+    session.add(row)
+    await session.commit()
+
+    response = client.post(f"/review/appointments/{row.id}/confirm")
+
+    assert response.status_code == 409, response.text
+    assert "venció" not in response.json()["detail"]
+    # The commit above cleared the clinic scope, so it is applied again before
+    # the row is read back; without it row security hides the row.
+    await apply_clinic_scope(session, ClinicScope(clinic_id=graph.clinic_id))
+    await session.refresh(row)
+    assert row.status is status, "a refused confirm changed the appointment"
+
+
 # -------------------------------------------------------------------- cancel
 
 
