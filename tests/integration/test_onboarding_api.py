@@ -184,6 +184,23 @@ async def test_rows_needing_review_explain_themselves(scoped: TestClient) -> Non
     assert any("cannot be reached" in reason for row in rows for reason in row["reviews"])
 
 
+@pytest.mark.parametrize("path", ["rows", "transform-log"])
+async def test_a_filter_that_matches_nothing_by_name_is_refused_not_answered_empty(
+    scoped: TestClient, path: str
+) -> None:
+    """Found in the delivery campaign: an unknown status or sheet answered an
+    empty list, which reads as "no rows" -- the answer a typo must not get."""
+    body = _upload(scoped, "1_clean_ips.xlsx")
+    scoped.post(f"/onboarding/uploads/{body['session_id']}/validate")
+    base = f"/onboarding/uploads/{body['session_id']}/{path}"
+
+    assert scoped.get(base, params={"status": "reviw"}).status_code == 422
+    assert scoped.get(base, params={"sheet": "Pacientes", "status": "review"}).status_code == 200
+    if path == "rows":
+        assert scoped.get(base, params={"sheet": "Pacienes"}).status_code == 404
+        assert scoped.get(base, params={"sheet": "Pacientes"}).status_code == 200
+
+
 # ------------------------------------------------- the guarantee that matters
 async def test_commit_refuses_while_a_question_is_unanswered(scoped: TestClient, session) -> None:  # type: ignore[no-untyped-def]
     """The corrupted fixture's birth dates are genuinely ambiguous.

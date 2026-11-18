@@ -25,7 +25,7 @@ import shutil
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 
@@ -815,11 +815,15 @@ async def get_rows(
     scope: ClinicScopeDep,
     sheet: Annotated[str | None, Query(description="Which sheet's rows to show.")] = None,
     row_status: Annotated[
-        str | None, Query(alias="status", description="valid, review or invalid.")
+        Literal["valid", "review", "invalid"] | None,
+        Query(alias="status", description="valid, review or invalid."),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
 ) -> list[RowOut]:
-    await _load(db, session_id, scope.clinic_id)
+    record, _ = await _load(db, session_id, scope.clinic_id)
+    if sheet is not None and sheet not in {r.sheet for r in _reports(record)}:
+        # A sheet that does not exist is not a sheet with no rows.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No sheet named {sheet!r}.")
     if not await repository.staged_rows(
         db, clinic_id=scope.clinic_id, session_id=session_id, limit=1
     ):
@@ -856,7 +860,8 @@ async def transform_log(
     session_id: uuid.UUID,
     scope: ClinicScopeDep,
     cell_status: Annotated[
-        str | None, Query(alias="status", description="valid, review or invalid.")
+        Literal["valid", "review", "invalid"] | None,
+        Query(alias="status", description="valid, review or invalid."),
     ] = None,
     limit: Annotated[int, Query(ge=1, le=2000)] = 200,
 ) -> list[CellOut]:
