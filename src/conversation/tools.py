@@ -358,7 +358,10 @@ REGISTRY: Final[dict[str, Callable[..., object]]] = {
 
 #: Statuses a confirm may act on. Checked by the graph before the tool runs, so
 #: a patient tapping "confirm" on something already cancelled gets an answer
-#: rather than a tool error.
+#: rather than a tool error. `confirmed` is one of them: a patient who confirms
+#: twice, or confirms the date they just picked, is told the confirmation
+#: again -- the tool writes nothing the second time -- rather than that they
+#: have no active appointment, which would be false.
 CONFIRMABLE: Final[frozenset[AppointmentStatus]] = frozenset(
-    {AppointmentStatus.HOLD, AppointmentStatus.SCHEDULED}
+    {AppointmentStatus.HOLD, AppointmentStatus.SCHEDULED, AppointmentStatus.CONFIRMED}
 )

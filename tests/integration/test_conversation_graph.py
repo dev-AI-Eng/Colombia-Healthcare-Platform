@@ -789,11 +789,11 @@ async def test_the_fabrication_rejection_rate_through_the_graph_is_total(
     sent = []
     for index, draft in enumerate(fabrications):
         # A fresh clinic and patient per iteration, not just a fresh
-        # appointment. A turn that confirms leaves the appointment `confirmed`,
-        # which `CONFIRMABLE` excludes, so the next turn takes the
-        # `no_appointment` exit and produces no draft at all -- the first
-        # version of this reported "2 of 3 reached the patient" when in truth
-        # two turns never drafted anything.
+        # appointment, so every draft is the first turn on a scheduled
+        # appointment and nothing one turn leaves behind decides the next. The
+        # first version of this shared one patient, the later turns took a
+        # different exit, and it reported "2 of 3 reached the patient" when in
+        # truth two turns never drafted anything.
         graph = await _clinic_with_patient(session, phone=f"+5730055500{index:02d}")
         session.add(appointment(graph, at(3, 9, 0)))
         await session.flush()
@@ -1162,6 +1162,44 @@ async def test_one_after_an_offer_picks_the_first_time_not_a_confirmation(
     await session.refresh(original)
     assert original.status is AppointmentStatus.RESCHEDULED
     assert first.time_text in (chosen["outbound_text"] or "")
+
+
+async def test_confirming_twice_restates_the_confirmation(session: AsyncSession) -> None:
+    """Found in review: a second "Si, confirmo" -- or one after picking an
+    offered date, which books it confirmed -- was answered "No encontramos una
+    cita activa", which is false. It is told the confirmation again, and
+    nothing is written the second time."""
+    graph = await _clinic_with_patient(session)
+    booked = appointment(graph, at(3, 9, 0))
+    session.add(booked)
+    await session.flush()
+    deps = _by_intent_deps(session)
+
+    first = await _run(session, graph, "Si, confirmo", deps=deps)
+    updates_before = await session.scalar(
+        select(func.count())
+        .select_from(AccessLogEntry)
+        .where(
+            AccessLogEntry.action == AccessAction.UPDATE.value,
+            AccessLogEntry.resource_id == str(booked.id),
+        )
+    )
+    again = await _run(session, graph, "Si, confirmo", deps=deps)
+    updates_after = await session.scalar(
+        select(func.count())
+        .select_from(AccessLogEntry)
+        .where(
+            AccessLogEntry.action == AccessAction.UPDATE.value,
+            AccessLogEntry.resource_id == str(booked.id),
+        )
+    )
+
+    assert again["stop"] is None
+    assert again["outbound_text"] == first["outbound_text"]
+    assert again["outbound_text"] != T.NO_APPOINTMENT
+    assert updates_after == updates_before, "the second confirmation wrote again"
+    await session.refresh(booked)
+    assert booked.status is AppointmentStatus.CONFIRMED
 
 
 @pytest.mark.parametrize(
