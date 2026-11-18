@@ -265,9 +265,74 @@ def inspect_archive(path: Path) -> None:
                         )
 
 
+#: Formats that are certainly not a delimited text export: a PDF or an image
+#: picked by mistake, a compressed archive that is not a workbook.
+_BINARY_MAGIC: Final = (
+    b"%PDF",
+    b"\x89PNG",
+    b"\xff\xd8\xff",
+    b"GIF8",
+    b"\x1f\x8b",
+    b"Rar!",
+    b"7z\xbc\xaf",
+    b"BZh",
+    b"OggS",
+    b"RIFF",
+)
+
+#: Text encoded with a byte-order mark contains NUL bytes legitimately, so a
+#: file that opens with one is text whatever its bytes look like.
+_TEXT_BOMS: Final = (
+    codecs.BOM_UTF32_LE,
+    codecs.BOM_UTF32_BE,
+    codecs.BOM_UTF16_LE,
+    codecs.BOM_UTF16_BE,
+)
+
+
+def bomless_utf16_encoding(probe: bytes) -> str | None:
+    """'utf-16-le' or 'utf-16-be' when the bytes look like UTF-16 text with no
+    byte-order mark, else None.
+
+    Such text is mostly NUL bytes, in a regular pattern: in ASCII-ish text LE
+    puts its NULs at odd offsets and BE at even ones. Random or binary data has
+    far fewer NULs and no such order.
+    """
+    if len(probe) < 4 or probe.count(0) <= len(probe) // 4:
+        return None
+    even = sum(1 for i in range(0, len(probe) - 1, 2) if probe[i] == 0)
+    odd = sum(1 for i in range(1, len(probe), 2) if probe[i] == 0)
+    if even == odd:
+        return None
+    return "utf-16-be" if even > odd else "utf-16-le"
+
+
+def _looks_binary(head: bytes) -> bool:
+    """Whether the start of a file is data rather than text.
+
+    A NUL byte, or more than one byte in twenty that is a control character
+    other than tab and line breaks, does not occur in any export a clinic's
+    software writes. Without this, a PDF, an image or random bytes were read
+    as a one-column CSV and staged as rows.
+    """
+    if head.startswith(_TEXT_BOMS):
+        return False
+    if head.startswith(_BINARY_MAGIC):
+        return True
+    if not head:
+        return False
+    if bomless_utf16_encoding(head) is not None:
+        return False
+    if b"\x00" in head:
+        return True
+    controls = sum(1 for byte in head if byte < 32 and byte not in (9, 10, 13))
+    return controls / len(head) > 0.05
+
+
 def detect_kind(path: Path) -> str:
     """Return 'xlsx', 'xls' or 'csv' from the file's bytes, not its name."""
-    head = path.read_bytes()[:8]
+    with path.open("rb") as handle:
+        head = handle.read(4096)
     if head.startswith(_ZIP_MAGIC):
         return "xlsx"
     if head.startswith(_OLE2_MAGIC):
@@ -275,6 +340,11 @@ def detect_kind(path: Path) -> str:
     # Anything else must be text to be a CSV. An executable renamed .csv fails here.
     if head[:2] == b"MZ" or head[:4] == b"\x7fELF":
         raise UnreadableFile("File is an executable, not a spreadsheet.")
+    if _looks_binary(head):
+        raise UnreadableFile(
+            "File is not a spreadsheet: it looks like binary data, such as a PDF or an "
+            "image. Export the data from your system as .xlsx or .csv and upload that."
+        )
     return "csv"
 
 
@@ -302,14 +372,9 @@ def decode(raw: bytes) -> tuple[str, str]:
     # than failing, so "it decoded" is not evidence of the right order. In
     # ASCII-ish text LE puts its NULs at odd offsets and BE at even ones.
     def _bomless_utf16(raw: bytes) -> tuple[str, str] | None:
-        probe = raw[:4096]
-        if len(probe) < 4 or probe.count(0) <= len(probe) // 4:
-            return None
-        even = sum(1 for i in range(0, len(probe) - 1, 2) if probe[i] == 0)
-        odd = sum(1 for i in range(1, len(probe), 2) if probe[i] == 0)
-        if even == odd:
+        encoding = bomless_utf16_encoding(raw[:4096])
+        if encoding is None:
             return None  # no clear order; fall through to the ladder
-        encoding = "utf-16-be" if even > odd else "utf-16-le"
         try:
             text = raw.decode(encoding)
         except UnicodeDecodeError:

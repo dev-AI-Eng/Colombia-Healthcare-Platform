@@ -53,6 +53,49 @@ def test_an_executable_renamed_csv_is_refused() -> None:
         read(FIXTURES / "5_not_really_csv.csv")
 
 
+_BINARY_FILES = {
+    "pdf": b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n" + bytes(range(256)) * 2,
+    "png": b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 2,
+    "jpeg": b"\xff\xd8\xff\xe0\x00\x10JFIF" + bytes(range(256)) * 2,
+    "gif": b"GIF89a" + bytes(range(256)) * 2,
+    "gzip": b"\x1f\x8b\x08\x00" + bytes(range(256)) * 2,
+    "no signature at all": bytes(range(256)) * 4,
+}
+
+
+@pytest.mark.parametrize("kind", list(_BINARY_FILES))
+def test_binary_data_posing_as_a_spreadsheet_is_refused(tmp_path: Path, kind: str) -> None:
+    """Found in the delivery campaign: a PDF, an image or random bytes were
+    read as a one-column CSV and staged as rows, so a receptionist who picked
+    the wrong file got a mapping screen full of garbage instead of being told."""
+    path = tmp_path / f"{kind.replace(' ', '_')}.csv"
+    path.write_bytes(_BINARY_FILES[kind])
+
+    with pytest.raises(UnreadableFile, match="not a spreadsheet"):
+        read(path)
+
+
+@pytest.mark.parametrize(
+    ("encoding", "text"),
+    [
+        ("utf-16", "documento;nombre\n123;José Ñandú\n"),
+        ("utf-32", "documento;nombre\n123;José Ñandú\n"),
+        ("latin-1", "documento;nombre\n123;José Ñandú\n"),
+        ("cp1252", "documento;nombre\n123;José Ñandú €\n"),
+        ("utf-8-sig", "documento\tnombre\n123\tJosé Ñandú\n"),
+    ],
+)
+def test_real_spanish_text_is_not_mistaken_for_binary(
+    tmp_path: Path, encoding: str, text: str
+) -> None:
+    path = tmp_path / "export.csv"
+    path.write_bytes(text.encode(encoding))
+
+    result = read(path)
+
+    assert result.sheets and result.sheets[0].rows, f"{encoding} was refused or read as empty"
+
+
 def test_kind_comes_from_the_bytes(tmp_path: Path) -> None:
     xlsx = tmp_path / "claims_to_be.csv"
     xlsx.write_bytes(b"PK\x03\x04rest-of-an-archive")
