@@ -23,9 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.audit.context import AccessAction, AuditContext
 from src.audit.models import AccessLogEntry
 from src.conversation import templates as T
+from src.conversation.facts import VerifiedFacts
 from src.conversation.generator import facts_block
 from src.conversation.generator import generate as model_generate
-from src.conversation.graph import CLINIC_PHONE_SETTING, Dependencies, build_graph
+from src.conversation.graph import (
+    _STOP_REPLIES,
+    CLINIC_PHONE_SETTING,
+    Dependencies,
+    build_graph,
+)
 from src.conversation.state import Draft, Intent, Stop, initial
 from src.conversation.tools import offer_window
 from src.conversation.validator import MessageKind, Verdict, validate
@@ -1468,3 +1474,33 @@ async def test_the_appointment_s_own_date_is_never_offered(session: AsyncSession
 
     assert len(_dates(offered)) == 5
     assert day not in _dates(offered)
+
+
+# --------------------------------------------- rule 1 for the stop replies
+
+
+@pytest.mark.parametrize("stop", list(Stop))
+def test_every_stop_reply_passes_the_deterministic_stages(stop: Stop) -> None:
+    """A stop reply is templated text, so it passes stages 1-3 like any other
+    (rule 1). Proven per stop, so rewording one cannot put a refused reply in
+    front of a patient, and a stop added without a reply fails here."""
+    text, _ = _STOP_REPLIES[stop]
+    verdict = validate(text, VerifiedFacts(), MessageKind.FALLBACK)
+    assert verdict.approved, verdict.findings
+
+
+async def test_a_stop_reply_the_gate_refuses_is_never_sent(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found in review: the stop replies went to the patient without the
+    deterministic stages, a third path rule 1 forbids. A reply reworded into
+    an invented date is refused, and the patient gets the reply proven to pass."""
+    graph = await create_graph(session)
+    monkeypatch.setitem(
+        _STOP_REPLIES, Stop.UNKNOWN_SENDER, ("Su cita es el 24 de diciembre a las 9:00 a.m.", None)
+    )
+
+    result = await _run(session, graph, "Si, confirmo", sender="+573009998877")
+
+    assert result["stop"] is Stop.UNKNOWN_SENDER
+    assert result["outbound_text"] == T.STAFF_WILL_CALL

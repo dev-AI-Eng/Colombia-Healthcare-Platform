@@ -73,7 +73,7 @@ from src.conversation.state import (
     PatientContext,
     Stop,
 )
-from src.conversation.validator import Verdict, check_authored, validate
+from src.conversation.validator import MessageKind, Verdict, check_authored, validate
 from src.core.config import Settings
 from src.core.timezones import BOGOTA
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
@@ -799,6 +799,13 @@ async def stop_with_template(state: ConversationState, *, deps: Dependencies) ->
     try:
         rendered = T.render(text, state["verified_facts"]) if "{" in text else text
     except T.MissingFact:
+        rendered = T.STAFF_WILL_CALL
+    # Rule 1: a stop reply is templated text, so it passes the deterministic
+    # stages before it is sent, like every other message; there is no third
+    # path. Every reply passes today, and a test proves it for each stop, so
+    # this refuses only a template reworded into something the gate would
+    # refuse -- and then the patient gets the one reply proven to pass.
+    if not validate(rendered, state["verified_facts"], MessageKind.FALLBACK).approved:
         rendered = T.STAFF_WILL_CALL
 
     return {"outbound_text": rendered, "escalation_id": escalation_id}
