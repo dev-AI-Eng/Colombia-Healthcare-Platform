@@ -1058,9 +1058,11 @@ def _by_intent_deps(session: AsyncSession) -> Dependencies:
     )
 
 
-async def _bookable_week(session: AsyncSession, graph: Graph) -> Appointment:
+async def _bookable_week(
+    session: AsyncSession, graph: Graph, start: dt.datetime | None = None
+) -> Appointment:
     """The patient's appointment, and a doctor who works weekday mornings."""
-    booked = appointment(graph, at(3, 9, 0))
+    booked = appointment(graph, start or at(3, 9, 0))
     session.add(booked)
     for weekday in range(5):
         session.add(
@@ -1450,3 +1452,19 @@ async def test_a_number_after_the_holds_are_swept_is_not_a_confirmation(
     assert _dates(late) == _dates(first)
     await session.refresh(original)
     assert original.status is AppointmentStatus.SCHEDULED, "a late '1' confirmed the old date"
+
+
+async def test_the_appointment_s_own_date_is_never_offered(session: AsyncSession) -> None:
+    """Found in review: "No me sirve esa fecha" was answered with the same
+    date at another time."""
+    graph = await _clinic_with_patient(session)
+    day = dt.datetime.now(tz=BOGOTA).date() + dt.timedelta(days=2)
+    while day.weekday() >= 5:
+        day += dt.timedelta(days=1)
+    start = dt.datetime.combine(day, dt.time(10, 0), tzinfo=BOGOTA)
+    await _bookable_week(session, graph, start)
+
+    offered = await _run(session, graph, "No me sirve esa fecha", deps=_by_intent_deps(session))
+
+    assert len(_dates(offered)) == 5
+    assert day not in _dates(offered)

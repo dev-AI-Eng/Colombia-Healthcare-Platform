@@ -398,7 +398,11 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
                 "appointment_id": appointment.id,
                 "verified_facts": facts.build(),
             }
-        refused = set() if again else {day for r in rounds for day in r.offered_dates}
+        # Never the appointment's own date: the patient is asking for another.
+        starts = appointment.during.lower
+        refused = set() if starts is None else {starts.astimezone(BOGOTA).date()}
+        if not again:
+            refused |= {day for r in rounds for day in r.offered_dates}
         result = await tools.find_slots(
             deps.session,
             clinic_id=state["clinic_id"],
