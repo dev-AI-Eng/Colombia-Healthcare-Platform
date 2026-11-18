@@ -17,7 +17,21 @@ from src.conversation.facts import spell_date
 
 @pytest.mark.parametrize(
     "reply",
-    ["ninguna", "Ninguno de esos", "NINGUNA", "no", "No", "no me sirve ninguna", "otras fechas"],
+    [
+        "ninguna",
+        "Ninguno de esos",
+        "NINGUNA",
+        "no",
+        "No",
+        "no me sirve ninguna",
+        "otras fechas",
+        # Found in review: punctuation, and the shortened "ningún" that comes
+        # before a masculine noun, both read as nothing.
+        "No.",
+        "No!",
+        "Ningún horario me sirve",
+        "ningún día",
+    ],
 )
 def test_these_replies_turn_every_date_down(reply: str) -> None:
     assert declines_offer(reply)

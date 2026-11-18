@@ -153,8 +153,10 @@ def classify_intent(inbound: str) -> Intent:
 #: which is what makes a bare "no" safe to read this way: in answer to "which
 #: of these dates?", "no" means none of them, not "cancel my appointment".
 _DECLINES_OFFER: Final[tuple[str, ...]] = (
-    r"^no$",
-    r"\bningun[oa]s?\b",
+    r"^no[.!]*$",
+    # "ningún" before a masculine noun ("ningún horario"), as well as
+    # "ninguno" and "ninguna".
+    r"\bningun[oa]?s?\b",
     r"\botras? (fechas?|opciones|horas|dias)\b",
     r"\bno me (sirve|sirven|queda|quedan)\b",
 )
