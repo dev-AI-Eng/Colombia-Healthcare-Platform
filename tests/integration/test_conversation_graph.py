@@ -1319,6 +1319,7 @@ async def test_after_two_rounds_turned_down_the_closing_message_is_sent(
     last = await _run(session, graph, "ninguna", deps=deps, now=now + dt.timedelta(minutes=2))
 
     assert last["stop"] is Stop.OFFER_ROUNDS_EXHAUSTED
+    assert last["intent"] is Intent.RESCHEDULE, "the screen must show what the turn did"
     assert last["outbound_text"] == T.NO_MORE_OFFERS
     assert last["escalation_id"] is not None
     case = await session.get(Escalation, last["escalation_id"])

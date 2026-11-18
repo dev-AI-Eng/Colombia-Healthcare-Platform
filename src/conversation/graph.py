@@ -373,8 +373,12 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         }
 
     if intent is Intent.RESCHEDULE:
+        # Every exit from here reports the intent it acted on: a decline such
+        # as "ninguna" or "no" was read by the classifier as something else,
+        # and the review screen should show what the turn did.
+        acted: ConversationState = {"intent": Intent.RESCHEDULE}
         if appointment is None:
-            return {"stop": Stop.NO_APPOINTMENT, "verified_facts": facts.build()}
+            return {**acted, "stop": Stop.NO_APPOINTMENT, "verified_facts": facts.build()}
         if len(rounds) >= MAX_OFFER_ROUNDS:
             # Both rounds turned down: the closing message, and a case for
             # staff so a patient the channel could not serve is not lost. A
@@ -384,6 +388,7 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
                 deps.session, clinic_id=state["clinic_id"], appointment_id=appointment.id
             )
             return {
+                **acted,
                 "stop": Stop.OFFER_ROUNDS_EXHAUSTED,
                 "appointment_id": appointment.id,
                 "verified_facts": facts.build(),
@@ -397,7 +402,7 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
             exclude_dates=tuple(sorted({day for r in rounds for day in r.offered_dates})),
         )
         if not result.ok:
-            return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
+            return {**acted, "stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
         # Each offered time is held (ADR-17), linked to the appointment it
         # would replace, so the patient's later "2" names a time nobody else
         # can take meanwhile. A fresh offer replaces any earlier one.
@@ -427,7 +432,7 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
                 held.offer(slot.starts_at, slot.duration_minutes)
         offered = held.build().offered_slots
         if not offered:
-            return {"stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
+            return {**acted, "stop": Stop.NO_SLOTS, "verified_facts": facts.build()}
         await tools.record_offer_round(
             deps.session,
             clinic_id=state["clinic_id"],
@@ -437,7 +442,7 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
             now=state["now"],
         )
         return {
-            "intent": Intent.RESCHEDULE,
+            **acted,
             "appointment_id": appointment.id,
             "verified_facts": _merge(facts, held),
         }
