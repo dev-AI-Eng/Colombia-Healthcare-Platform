@@ -164,6 +164,33 @@ def test_a_failing_provider_falls_over_to_the_next() -> None:
     assert suggestion.target_field == "document_number"
 
 
+def test_a_providers_error_message_is_never_written_to_the_log() -> None:
+    """Found in the delivery campaign: a rejected key logged the provider's
+    own message, and OpenAI's "Incorrect API key provided: ..." echoes the first
+    characters of the key it was sent. Rule 6 allows no part of a secret in a
+    log, so only the error's type and HTTP status are recorded."""
+    from structlog.testing import capture_logs
+
+    fragment = "sk-proj-LEAKED12"
+
+    class Rejected(Exception):
+        status_code = 401
+
+    error = Rejected(f"Incorrect API key provided: {fragment}***. You can find your key at ...")
+    with capture_logs() as logs, pytest.raises(llm.LLMUnavailable):
+        llm.suggest(
+            llm.ColumnQuestion("NRO IDENT", "10 digits", 100, 9),
+            Entity.PATIENT,
+            settings=_settings(openai_api_key="a"),
+            client_factory=lambda provider, settings: _FakeClient(fail=error),
+        )
+
+    calls = [entry for entry in logs if entry["event"] == "llm.call"]
+    assert calls, "the failed call was not logged at all"
+    assert fragment not in json.dumps(logs, default=str)
+    assert calls[0]["detail"] == "Rejected (HTTP 401)"
+
+
 def test_when_every_provider_fails_the_column_goes_to_a_human() -> None:
     with pytest.raises(llm.LLMUnavailable):
         llm.suggest(

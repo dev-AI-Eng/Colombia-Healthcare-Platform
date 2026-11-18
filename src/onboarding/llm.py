@@ -274,11 +274,11 @@ def suggest(
             # model has stopped honouring it. Failing over is right; retrying
             # the same provider would only repeat the same violation.
             failures.append(f"{provider.name}: response did not match the schema")
-            _log_call(provider, question, digest, started, "schema_violation", str(error))
+            _log_call(provider, question, digest, started, "schema_violation", _error_detail(error))
             continue
         except Exception as error:  # provider errors are not ours to classify
             failures.append(f"{provider.name}: {type(error).__name__}")
-            _log_call(provider, question, digest, started, "error", str(error)[:200])
+            _log_call(provider, question, digest, started, "error", _error_detail(error))
             continue
 
         _log_call(
@@ -394,7 +394,7 @@ def explain_rule(rule: str, field_means: str, *, settings: Settings | None = Non
                 digest,
                 started,
                 "error",
-                str(error)[:200],
+                _error_detail(error),
                 purpose="rule_wording",
             )
             continue
@@ -425,6 +425,18 @@ def _openai_client(provider: _Provider, settings: Settings) -> Any:
         timeout=settings.mapping_timeout_seconds,
         max_retries=2,
     )
+
+
+def _error_detail(error: BaseException) -> str:
+    """What may be logged about a provider's failure: its type and HTTP status.
+
+    Never its message. A rejected key makes the provider answer with text that
+    quotes the start of the key it was sent, and rule 6 allows no part of a
+    secret in a log. The type and status say what an operator needs: rejected,
+    rate limited, unreachable.
+    """
+    status = getattr(error, "status_code", None)
+    return f"{type(error).__name__} (HTTP {status})" if status else type(error).__name__
 
 
 def _log_call(
