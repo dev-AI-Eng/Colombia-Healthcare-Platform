@@ -40,10 +40,12 @@ MISSING: Final = "�"
 # cancellation confirmed by the patient and one forced by the clinic read
 # differently and are different templates.
 
+#: The last two parts are the clinic's own and may be empty: its address, from
+#: the site's record, and a note it configured. Each is a verified fact, so the
+#: gate resolves every number and name in them like any other.
 CONFIRMED: Final = (
     "Su cita quedó confirmada para el {date} a las {time} con {doctor}. "
-    "Por favor llegue {arrive} minutos antes. "
-    "Si tiene exámenes o imágenes previas, tráigalos."
+    "Por favor llegue {arrive} minutos antes.{address_line}{note_line}"
 )
 
 CANCELLED: Final = (
@@ -176,6 +178,12 @@ def render(template: str, facts: VerifiedFacts) -> str:
         "arrive": (
             str(facts.arrive_minutes_early) if facts.arrive_minutes_early is not None else MISSING
         ),
+        # Optional: empty when the clinic has not configured them, and never
+        # reported as missing.
+        "address_line": (
+            f" Dirección: {facts.location_address.rstrip('. ')}." if facts.location_address else ""
+        ),
+        "note_line": f" {facts.clinic_note}" if facts.clinic_note else "",
     }
     text = template.format(**values)
     if MISSING in text:

@@ -1670,3 +1670,120 @@ async def test_a_reply_that_refuses_or_is_unclear_never_books_a_date(
     assert answer["intent"] is not Intent.CHOOSE, f"{reply!r} was taken as a pick"
     await session.refresh(original)
     assert original.status is AppointmentStatus.SCHEDULED, f"{reply!r} moved the appointment"
+
+
+# ---------------------------------------- what a clinic configures, end to end
+
+
+async def _configure(session: AsyncSession, graph: Graph, **settings: object) -> None:
+    clinic = await session.get(Clinic, graph.clinic_id)
+    assert clinic is not None
+    clinic.settings = {**(clinic.settings or {}), **settings}
+    await session.flush()
+
+
+async def _confirm_text(session: AsyncSession, graph: Graph) -> str:
+    session.add(appointment(graph, at(3, 9, 0)))
+    await session.flush()
+    result = await _run(session, graph, "Si, confirmo", deps=_by_intent_deps(session))
+    assert result["stop"] is None, result.get("stop")
+    return result["outbound_text"] or ""
+
+
+async def test_a_confirmation_carries_the_sites_address_and_the_default_note(
+    session: AsyncSession,
+) -> None:
+    graph = await _clinic_with_patient(session)
+
+    text = await _confirm_text(session, graph)
+
+    assert "Dirección: Calle 1 # 2-3." in text
+    assert text.endswith("Si tiene exámenes o imágenes previas, tráigalos.")
+
+
+async def test_a_clinics_own_note_replaces_the_default(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note="Traiga su carné de la EPS.")
+
+    text = await _confirm_text(session, graph)
+
+    assert text.endswith("Traiga su carné de la EPS.")
+    assert "exámenes" not in text
+
+
+async def test_a_clinic_can_have_no_note_at_all(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note="")
+
+    text = await _confirm_text(session, graph)
+
+    assert "exámenes" not in text and "Dirección: Calle 1 # 2-3." in text
+    assert text.endswith("Calle 1 # 2-3.")
+
+
+async def test_a_note_that_gives_medical_advice_is_never_sent(session: AsyncSession) -> None:
+    """Rule 5 applies to what a clinic configures as much as to what a model
+    writes. The note is refused when it is read, so the confirmation still goes
+    out, without it, instead of every confirmation for that clinic being refused
+    by the gate and sent to staff."""
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note="Tome 500 mg de ibuprofeno antes de venir.")
+
+    text = await _confirm_text(session, graph)
+
+    assert "ibuprofeno" not in text and "500" not in text
+    assert "confirmada" in text
+
+
+#: A day in March 2027, so the expected dates do not move with the real clock.
+_MARCH_FIRST = dt.datetime(2027, 3, 1, 13, 0, tzinfo=dt.UTC)
+
+
+async def _agenda_opening_in_april(session: AsyncSession, graph: Graph) -> None:
+    """A doctor whose agenda opens on 5 April 2027: nothing before it."""
+    session.add(appointment(graph, at(3, 9, 0)))
+    for weekday in range(5):
+        session.add(
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=graph.location_id,
+                weekday=weekday,
+                start_time=dt.time(8, 0),
+                end_time=dt.time(12, 0),
+                valid_from=dt.date(2027, 4, 5),
+            )
+        )
+    await session.flush()
+
+
+@pytest.mark.parametrize(
+    ("setting", "finds_dates"),
+    [
+        (0, False),  # this month only: the agenda is not open yet
+        (1, True),
+        (2, True),
+        ("pronto", True),  # not a number: the default, not a guess
+        (99, True),  # beyond the engine's longest range: the default
+        (-1, True),
+        (True, True),  # a boolean is not a number of months
+        (None, True),  # no setting at all
+    ],
+)
+async def test_a_clinic_chooses_how_far_ahead_the_search_reaches(
+    session: AsyncSession, setting: object, finds_dates: bool
+) -> None:
+    graph = await _clinic_with_patient(session)
+    await _agenda_opening_in_april(session, graph)
+    if setting is not None:
+        await _configure(session, graph, offer_months_ahead=setting)
+
+    result = await _run(
+        session, graph, "Quiero otra fecha", deps=_by_intent_deps(session), now=_MARCH_FIRST
+    )
+
+    if finds_dates:
+        assert result["stop"] is None, result.get("stop")
+        assert _dates(result) and all(day.month == 4 for day in _dates(result))
+    else:
+        assert result["stop"] is Stop.NO_SLOTS

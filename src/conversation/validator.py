@@ -318,6 +318,13 @@ def _fact_tokens(draft: str) -> list[str]:
     return spans
 
 
+def fact_spans(text: str) -> list[str]:
+    """The fact-shaped spans in some text: what the provenance stage would ask
+    a fact to resolve. Used to register what a clinic's own configured wording
+    contains (its address, its note) as verified, since the clinic wrote it."""
+    return _fact_tokens(text)
+
+
 def check_provenance(draft: str, facts: VerifiedFacts) -> list[Finding]:
     """Stage 1. Every fact-shaped token resolves to `verified_facts`."""
     allowed = facts.tokens()

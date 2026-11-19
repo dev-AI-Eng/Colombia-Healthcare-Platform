@@ -38,6 +38,7 @@ from src.core.timezones import BOGOTA
 from src.identity import repository as identity
 from src.identity.models import ConsentPurpose
 from src.scheduling import booking, offers
+from src.scheduling.availability import MAX_HORIZON_DAYS
 from src.scheduling.models import AppointmentStatus
 
 
@@ -68,13 +69,25 @@ class ToolResult:
 MAX_OFFERED_SLOTS: Final = 5
 
 
-def offer_window(today: dt.date) -> tuple[dt.date, dt.date]:
-    """The dates a reschedule searches: the rest of this month and all of the
-    next, as the client asked. Clinic-local dates, so "this month" is the
-    month in Bogotá."""
-    first_of_next = (today.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
-    last_of_next = (first_of_next + dt.timedelta(days=32)).replace(day=1) - dt.timedelta(days=1)
-    return today, last_of_next
+#: How many whole months after the current one a reschedule searches, unless the
+#: clinic says otherwise: the client's rule is the rest of this month and all of
+#: the next. The most a clinic may ask for keeps the range near the engine's
+#: 120-day limit; `offer_window` holds the end at that limit regardless.
+OFFER_MONTHS_AHEAD_DEFAULT: Final = 1
+OFFER_MONTHS_AHEAD_MAX: Final = 3
+
+
+def offer_window(
+    today: dt.date, months_ahead: int = OFFER_MONTHS_AHEAD_DEFAULT
+) -> tuple[dt.date, dt.date]:
+    """The dates a reschedule searches: the rest of this month and `months_ahead`
+    whole months after it (one by default, as the client asked). Clinic-local
+    dates, so "this month" is the month in Bogotá. Never longer than the
+    availability engine accepts."""
+    month_index = today.year * 12 + (today.month - 1) + months_ahead + 1
+    first_after = dt.date(month_index // 12, month_index % 12 + 1, 1)
+    last = first_after - dt.timedelta(days=1)
+    return today, min(last, today + dt.timedelta(days=MAX_HORIZON_DAYS - 1))
 
 
 async def confirm_appointment(
@@ -184,6 +197,7 @@ async def find_slots(
     doctor_id: uuid.UUID,
     appointment_type_id: uuid.UUID,
     now: dt.datetime,
+    months_ahead: int = OFFER_MONTHS_AHEAD_DEFAULT,
     exclude_dates: tuple[dt.date, ...] = (),
     only_dates: tuple[dt.date, ...] = (),
     earliest: dt.time | None = None,
@@ -196,7 +210,7 @@ async def find_slots(
     slot table: a stored list drifts the moment a doctor changes their hours or
     a holiday is declared (CLAUDE.md §11).
     """
-    begins, ends = offer_window(now.astimezone(BOGOTA).date())
+    begins, ends = offer_window(now.astimezone(BOGOTA).date(), months_ahead)
     search = offers.SlotSearch(
         clinic_id=clinic_id,
         doctor_id=doctor_id,

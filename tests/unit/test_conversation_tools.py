@@ -183,3 +183,25 @@ def test_the_retry_budget_matches_adr_23() -> None:
 
     assert MAX_RETRIES == 2
     assert MAX_ATTEMPTS == MAX_RETRIES + 1 == 3
+
+
+@pytest.mark.parametrize(
+    ("today", "months", "last"),
+    [
+        (dt.date(2027, 3, 10), 0, dt.date(2027, 3, 31)),
+        (dt.date(2027, 3, 10), 1, dt.date(2027, 4, 30)),
+        (dt.date(2027, 3, 10), 2, dt.date(2027, 5, 31)),
+        (dt.date(2027, 3, 10), 3, dt.date(2027, 6, 30)),
+        (dt.date(2027, 11, 20), 3, dt.date(2028, 2, 29)),
+        # 1 Jan 2027 + 3 months ends on day 120, the longest range the engine allows.
+        (dt.date(2027, 1, 1), 3, dt.date(2027, 4, 30)),
+        # In a leap year the same wish is day 121, so the end is held at the limit.
+        (dt.date(2028, 1, 1), 3, dt.date(2028, 4, 29)),
+    ],
+)
+def test_a_clinic_can_choose_how_many_months_ahead_the_search_reaches(
+    today: dt.date, months: int, last: dt.date
+) -> None:
+    """The window is a clinic setting: its doctors open their agendas as far
+    ahead as they like. It never exceeds what the availability engine accepts."""
+    assert tools.offer_window(today, months_ahead=months) == (today, last)

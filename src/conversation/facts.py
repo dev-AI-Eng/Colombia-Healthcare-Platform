@@ -132,6 +132,10 @@ class VerifiedFacts:
     #: Arrival advice and similar clinic policy: a number a message may state
     #: only because a tool put it here, not because a model knew it.
     arrive_minutes_early: int | None = None
+    #: A sentence the clinic wrote for its confirmations ("bring your exams").
+    #: Clinic configuration, not patient or model text, and checked against the
+    #: medical-advice rules when it is loaded.
+    clinic_note: str | None = None
 
     def tokens(self) -> frozenset[str]:
         """Every value a draft may contain, normalised.
@@ -154,6 +158,7 @@ class VerifiedFacts:
             self.specialty,
             self.location_name,
             self.location_address,
+            self.clinic_note,
             self.clinic_name,
             self.clinic_phone,
         ):
@@ -208,6 +213,16 @@ class VerifiedFacts:
 
         if self.arrive_minutes_early is not None:
             add(str(self.arrive_minutes_early))
+
+        # What the clinic wrote in its address and note is a set of facts too:
+        # "Calle 100 # 15-20" is read by the provenance stage as the numbers
+        # 100 and 15-20, and they resolve because the clinic's record holds
+        # them. Imported here, not at the top: the validator imports this module.
+        from src.conversation.validator import fact_spans
+
+        for written in (self.location_address, self.clinic_note):
+            for span in fact_spans(written or ""):
+                add(span)
 
         for slot in self.all_times():
             local = slot.starts_at.astimezone(BOGOTA)

@@ -53,7 +53,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
@@ -79,13 +79,14 @@ from src.conversation.validator import (
     Reason,
     Verdict,
     check_authored,
+    check_forbidden,
     validate,
 )
 from src.core.config import Settings
 from src.core.timezones import BOGOTA
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
 from src.registry import repository as registry
-from src.registry.models import Clinic, Doctor
+from src.registry.models import Clinic, Doctor, Location
 from src.scheduling import booking, offers
 from src.scheduling.models import (
     ACTIVE_STATUSES,
@@ -301,13 +302,16 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
         )
         return {"stop": Stop.OPTED_OUT}
 
-    facts = await _clinic_facts(state, deps)
+    facts, clinic_config = await _clinic_facts(state, deps)
     appointment = await _active_appointment(state, deps, patient_id)
     if appointment is not None:
         facts.set(
             **await _doctor_facts(
                 deps, clinic_id=state["clinic_id"], doctor_id=appointment.doctor_id
-            )
+            ),
+            **await _location_facts(
+                deps, clinic_id=state["clinic_id"], location_id=appointment.location_id
+            ),
         )
 
     offers = await _offers(state, deps, appointment) if appointment else []
@@ -416,6 +420,7 @@ async def act(state: ConversationState, *, deps: Dependencies) -> ConversationSt
             doctor_id=appointment.doctor_id,
             appointment_type_id=appointment.appointment_type_id,
             now=state["now"],
+            months_ahead=_offer_months_ahead(clinic_config),
             exclude_dates=tuple(sorted(refused)),
             only_dates=again,
         )
@@ -485,8 +490,69 @@ CLINIC_PHONE_SETTING: Final = "public_phone_e164"
 DEFAULT_ARRIVE_MINUTES: Final = 30
 
 
-async def _clinic_facts(state: ConversationState, deps: Dependencies) -> FactsBuilder:
-    """The clinic's own details, which several templates need.
+#: The clinic settings this module reads, all optional, all in `clinics.settings`.
+#: `offer_months_ahead`: how many whole months after this one a reschedule
+#: searches (0 to `OFFER_MONTHS_AHEAD_MAX`; anything else is the default).
+#: `confirmation_note`: the sentence ending a confirmation; empty for none, and
+#: absent for `DEFAULT_CONFIRMATION_NOTE`.
+OFFER_MONTHS_AHEAD_SETTING: Final = "offer_months_ahead"
+CONFIRMATION_NOTE_SETTING: Final = "confirmation_note"
+
+#: What a clinic that has not written its own note tells its patients.
+DEFAULT_CONFIRMATION_NOTE: Final = "Si tiene exámenes o imágenes previas, tráigalos."
+
+#: A note longer than this is cut: it is one sentence in a message, not a page.
+MAX_CONFIRMATION_NOTE_CHARS: Final = 200
+
+
+def _offer_months_ahead(config: dict[str, Any]) -> int:
+    """The clinic's search reach in months, or the default when the setting is
+    missing or is not a whole number in range. A boolean is not a number here."""
+    value = config.get(OFFER_MONTHS_AHEAD_SETTING)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return tools.OFFER_MONTHS_AHEAD_DEFAULT
+    if not 0 <= value <= tools.OFFER_MONTHS_AHEAD_MAX:
+        return tools.OFFER_MONTHS_AHEAD_DEFAULT
+    return value
+
+
+def _confirmation_note(config: dict[str, Any]) -> str | None:
+    """The sentence a clinic ends its confirmations with, or None.
+
+    Rule 5 covers what a clinic configures as much as what a model writes: a
+    note the medical-advice stage would refuse is dropped here, once, so the
+    confirmation goes out without it instead of every confirmation for the
+    clinic being refused at the gate and handed to staff.
+    """
+    note = config.get(CONFIRMATION_NOTE_SETTING, DEFAULT_CONFIRMATION_NOTE)
+    if not isinstance(note, str) or not note.strip():
+        return None
+    note = note.strip()[:MAX_CONFIRMATION_NOTE_CHARS]
+    if note[-1] not in ".!?":
+        note += "."
+    if check_forbidden(note):
+        return None
+    return note
+
+
+async def _location_facts(
+    deps: Dependencies, *, clinic_id: uuid.UUID, location_id: uuid.UUID
+) -> dict[str, str | None]:
+    """The site's name and address, from its own record."""
+    site = (
+        await deps.session.execute(
+            select(Location).where(Location.clinic_id == clinic_id, Location.id == location_id)
+        )
+    ).scalar_one_or_none()
+    if site is None:
+        return {}
+    return {"location_name": site.name, "location_address": site.address or None}
+
+
+async def _clinic_facts(
+    state: ConversationState, deps: Dependencies
+) -> tuple[FactsBuilder, dict[str, Any]]:
+    """The clinic's own details, which several templates need, and its settings.
 
     A clinic with no configured phone number yields no `clinic_phone` fact,
     and the templates that need one then raise `MissingFact` rather than
@@ -498,16 +564,18 @@ async def _clinic_facts(state: ConversationState, deps: Dependencies) -> FactsBu
     clinic = (
         await deps.session.execute(select(Clinic).where(Clinic.id == state["clinic_id"]))
     ).scalar_one_or_none()
+    config: dict[str, Any] = {}
     if clinic is not None:
-        config = clinic.settings or {}
+        config = dict(clinic.settings or {})
         phone = config.get(CLINIC_PHONE_SETTING)
         builder.set(
             clinic_name=clinic.name,
             clinic_phone=str(phone) if phone else None,
             arrive_minutes_early=int(config.get("arrive_minutes_early", DEFAULT_ARRIVE_MINUTES)),
+            clinic_note=_confirmation_note(config),
         )
     builder.set(patient_given_name=state["patient"].given_name)
-    return builder
+    return builder, config
 
 
 async def _offers(
