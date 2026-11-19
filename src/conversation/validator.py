@@ -150,14 +150,17 @@ _UNVERIFIABLE_PATTERNS: Final[tuple[tuple[str, str], ...]] = (
     # A precondition on attending. The clinic's own policy may require one, but
     # it reaches the patient through an approved template, never a generated
     # sentence, because an invented one sends them away or has them fast for
-    # nothing.
-    (r"\ben ayunas\b", "precondition"),
+    # nothing. "preparation" is clinical (fasting, eating, drinking); "paperwork"
+    # is administrative (the order, the authorisation). The wording a clinic
+    # configures itself is a verified fact and is exempt from this group, but
+    # not from "preparation", which stays clinical whoever writes it (rule 5).
+    (r"\ben ayunas\b", "preparation"),
     (
         r"\b(?:traiga|traer|debe traer|lleve|llevar)\b.{0,40}"
         r"\b(?:orden|autorizacion|autorización|remision|remisión|formula|fórmula|carta)\b",
-        "precondition",
+        "paperwork",
     ),
-    (r"\b(?:no )?(?:puede|podra|podrá) (?:comer|beber|tomar agua|desayunar)\b", "precondition"),
+    (r"\b(?:no )?(?:puede|podra|podrá) (?:comer|beber|tomar agua|desayunar)\b", "preparation"),
 )
 
 _COMPILED_UNVERIFIABLE: Final[tuple[tuple[re.Pattern[str], str], ...]] = tuple(
@@ -373,7 +376,49 @@ def check_authored(authored: str) -> list[Finding]:
     ]
 
 
-def check_forbidden(draft: str) -> list[Finding]:
+def check_clinic_text(text: str) -> list[Finding]:
+    """What a clinic may not configure into its own messages: medical advice
+    (rule 5) and clinical preparation. Its address, its requirements and its
+    prices are its own to state, so the claims-no-fact-supports group does not
+    apply to them; that group exists for text a model wrote."""
+    lowered = normalise(text)
+    findings = [
+        Finding(Reason.MEDICAL_ADVICE, match.group(0), label)
+        for pattern, label in _COMPILED
+        if (match := pattern.search(lowered))
+    ]
+    findings.extend(
+        Finding(Reason.MEDICAL_ADVICE, match.group(0), label)
+        for pattern, label in _COMPILED_UNVERIFIABLE
+        if label == "preparation" and (match := pattern.search(lowered))
+    )
+    return findings
+
+
+def _without_clinic_wording(text: str, facts: VerifiedFacts) -> str:
+    """The text with the clinic's own configured wording blanked out.
+
+    The address and the note are verified facts: what they say is the clinic's
+    statement, not a claim somebody invented. Removing them before the
+    claims-no-fact-supports patterns run is what keeps "Traiga su orden médica"
+    from being refused as an invented precondition, while the same sentence
+    anywhere else in a message still is.
+    """
+    owned = {
+        normalise(written)
+        for written in (
+            facts.clinic_note,
+            facts.location_address,
+            (facts.location_address or "").rstrip(". "),
+        )
+        if written
+    }
+    for wording in sorted(owned, key=len, reverse=True):
+        text = text.replace(wording, " ")
+    return text
+
+
+def check_forbidden(draft: str, facts: VerifiedFacts | None = None) -> list[Finding]:
     """Stage 2. Medical advice, dosage, diagnosis (rule 5), and claims no fact
     could support.
 
@@ -391,10 +436,16 @@ def check_forbidden(draft: str) -> list[Finding]:
         for pattern, label in _COMPILED
         if (match := pattern.search(text))
     ]
+    unverifiable_text = _without_clinic_wording(text, facts) if facts is not None else text
     findings.extend(
         Finding(Reason.FABRICATED_FACT, match.group(0), label)
         for pattern, label in _COMPILED_UNVERIFIABLE
-        if (match := pattern.search(text))
+        if label == "preparation" and (match := pattern.search(text))
+    )
+    findings.extend(
+        Finding(Reason.FABRICATED_FACT, match.group(0), label)
+        for pattern, label in _COMPILED_UNVERIFIABLE
+        if label != "preparation" and (match := pattern.search(unverifiable_text))
     )
     return findings
 
@@ -461,7 +512,7 @@ def validate(draft: str, facts: VerifiedFacts, kind: MessageKind) -> Verdict:
     # add a stage with a cost would not notice.
     if findings := check_provenance(draft, facts):
         return Verdict(approved=False, findings=tuple(findings))
-    if findings := check_forbidden(draft):
+    if findings := check_forbidden(draft, facts):
         return Verdict(approved=False, findings=tuple(findings))
     if findings := check_omission(draft, facts, kind):
         return Verdict(approved=False, findings=tuple(findings))

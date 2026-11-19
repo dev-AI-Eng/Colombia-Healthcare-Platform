@@ -15,6 +15,7 @@ seam.
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 from sqlalchemy import func, select
@@ -47,7 +48,7 @@ from src.identity.models import (
     EvidenceKind,
     PhoneBinding,
 )
-from src.registry.models import Clinic
+from src.registry.models import Clinic, Location
 from src.scheduling import booking
 from src.scheduling.models import (
     Appointment,
@@ -1787,3 +1788,83 @@ async def test_a_clinic_chooses_how_far_ahead_the_search_reaches(
         assert _dates(result) and all(day.month == 4 for day in _dates(result))
     else:
         assert result["stop"] is Stop.NO_SLOTS
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Traiga su orden médica y la autorización de su EPS.",
+        "Lleve la remisión y la carta de su EPS.",
+        "La cuota moderadora es de $20.000.",
+        "La ubicación exacta está en www.clinica.co/sede.",
+    ],
+)
+async def test_a_clinics_own_requirement_reaches_the_patient(
+    session: AsyncSession, note: str
+) -> None:
+    """Found in deep testing: "Traiga su orden médica" was dropped as an invented
+    precondition, though it is the clinic's own words."""
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note=note)
+
+    text = await _confirm_text(session, graph)
+
+    assert text.endswith(note), text
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "Venga en ayunas de 8 horas.",
+        "No puede comer ni beber antes.",
+        "No se preocupe, no es grave.",
+    ],
+)
+async def test_clinical_preparation_is_never_configured_into_a_confirmation(
+    session: AsyncSession, note: str
+) -> None:
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note=note)
+
+    text = await _confirm_text(session, graph)
+
+    assert "ayunas" not in text and "comer" not in text and "preocupe" not in text
+    assert "confirmada" in text
+
+
+async def test_a_note_is_tidied_before_it_is_sent(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note="  Traiga su documento\n  de identidad:  ")
+
+    text = await _confirm_text(session, graph)
+
+    assert text.endswith("Traiga su documento de identidad."), text
+    assert "\n" not in text
+
+
+async def test_an_address_of_only_spaces_is_not_stated(session: AsyncSession) -> None:
+    graph = await _clinic_with_patient(session)
+    site = await session.get(Location, graph.location_id)
+    assert site is not None
+    site.address = "   "
+    await session.flush()
+
+    text = await _confirm_text(session, graph)
+
+    assert "Dirección" not in text
+
+
+async def test_a_note_that_is_dropped_is_logged_without_its_text(session: AsyncSession) -> None:
+    """A clinic that configured something the gate refuses should be able to
+    find out why its confirmations lost the note."""
+    from structlog.testing import capture_logs
+
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note="Tome 500 mg de ibuprofeno antes de venir.")
+
+    with capture_logs() as logs:
+        await _confirm_text(session, graph)
+
+    dropped = [entry for entry in logs if entry["event"] == "clinic_note_dropped"]
+    assert dropped and dropped[0]["clinic_id"] == str(graph.clinic_id)
+    assert "ibuprofeno" not in json.dumps(logs, default=str)

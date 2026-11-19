@@ -79,10 +79,11 @@ from src.conversation.validator import (
     Reason,
     Verdict,
     check_authored,
-    check_forbidden,
+    check_clinic_text,
     validate,
 )
 from src.core.config import Settings
+from src.core.logging import get_logger
 from src.core.timezones import BOGOTA
 from src.identity.models import Consent, ConsentPurpose, PhoneBinding
 from src.registry import repository as registry
@@ -95,6 +96,8 @@ from src.scheduling.models import (
     EscalationReason,
     OfferRound,
 )
+
+log = get_logger(__name__)
 
 
 class Node(Protocol):
@@ -516,23 +519,29 @@ def _offer_months_ahead(config: dict[str, Any]) -> int:
     return value
 
 
-def _confirmation_note(config: dict[str, Any]) -> str | None:
-    """The sentence a clinic ends its confirmations with, or None.
+def _confirmation_note(config: dict[str, Any]) -> tuple[str | None, tuple[str, ...]]:
+    """The sentence a clinic ends its confirmations with, and why it was dropped.
 
-    Rule 5 covers what a clinic configures as much as what a model writes: a
-    note the medical-advice stage would refuse is dropped here, once, so the
-    confirmation goes out without it instead of every confirmation for the
-    clinic being refused at the gate and handed to staff.
+    Tidied first: whitespace and line breaks become single spaces, and it ends
+    as a sentence. Rule 5 covers what a clinic configures as much as what a
+    model writes, so a note with medical advice or clinical preparation in it
+    (`check_clinic_text`) is dropped here, once, and the confirmation goes out
+    without it instead of every confirmation for the clinic being refused at
+    the gate and handed to staff. The second value names what was refused, for
+    the log; it is empty when the note is used or was never configured.
     """
     note = config.get(CONFIRMATION_NOTE_SETTING, DEFAULT_CONFIRMATION_NOTE)
-    if not isinstance(note, str) or not note.strip():
-        return None
-    note = note.strip()[:MAX_CONFIRMATION_NOTE_CHARS]
+    if not isinstance(note, str):
+        return None, ()
+    note = " ".join(note.split())[:MAX_CONFIRMATION_NOTE_CHARS].rstrip(" :;,")
+    if not note:
+        return None, ()
     if note[-1] not in ".!?":
         note += "."
-    if check_forbidden(note):
-        return None
-    return note
+    refused = check_clinic_text(note)
+    if refused:
+        return None, tuple(dict.fromkeys(finding.detail for finding in refused))
+    return note, ()
 
 
 async def _location_facts(
@@ -546,7 +555,8 @@ async def _location_facts(
     ).scalar_one_or_none()
     if site is None:
         return {}
-    return {"location_name": site.name, "location_address": site.address or None}
+    address = " ".join((site.address or "").split())
+    return {"location_name": site.name, "location_address": address or None}
 
 
 async def _clinic_facts(
@@ -568,11 +578,16 @@ async def _clinic_facts(
     if clinic is not None:
         config = dict(clinic.settings or {})
         phone = config.get(CLINIC_PHONE_SETTING)
+        note, refused = _confirmation_note(config)
+        if refused:
+            # What was refused, never the note: it is the clinic's to fix, and
+            # the log is where it can find out why its confirmations changed.
+            log.warning("clinic_note_dropped", clinic_id=str(clinic.id), refused=refused)
         builder.set(
             clinic_name=clinic.name,
             clinic_phone=str(phone) if phone else None,
             arrive_minutes_early=int(config.get("arrive_minutes_early", DEFAULT_ARRIVE_MINUTES)),
-            clinic_note=_confirmation_note(config),
+            clinic_note=note,
         )
     builder.set(patient_given_name=state["patient"].given_name)
     return builder, config

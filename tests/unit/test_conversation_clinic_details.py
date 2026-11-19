@@ -14,7 +14,7 @@ from dataclasses import replace
 
 from src.conversation import templates as T
 from src.conversation.facts import VerifiedFacts
-from src.conversation.validator import MessageKind, validate
+from src.conversation.validator import MessageKind, check_clinic_text, validate
 from src.core.timezones import BOGOTA
 
 START = dt.datetime(2026, 12, 1, 10, 30, tzinfo=BOGOTA)
@@ -84,3 +84,41 @@ def test_the_note_is_not_a_licence_for_other_numbers() -> None:
     )
 
     assert not verdict.approved
+
+
+def test_a_clinics_own_requirement_is_not_an_invented_one() -> None:
+    """Found in deep testing: "Traiga su orden médica", the commonest line a
+    Colombian clinic adds, was refused as an invented precondition. That stage
+    exists to stop a model telling a patient what the clinic never said. The
+    clinic's own wording is a verified fact, so it is not judged by it."""
+    facts = _with(clinic_note="Traiga su orden médica y la autorización de su EPS.")
+
+    text = T.render(T.CONFIRMED, facts)
+
+    assert validate(text, facts, MessageKind.CONFIRMATION).approved
+
+
+def test_the_note_gives_a_model_no_cover_for_inventing_the_same_claim() -> None:
+    """Only the clinic's own words are exempt. The same sentence in text the
+    clinic did not configure is still refused."""
+    facts = _with(clinic_note="Llegue temprano.")
+
+    verdict = validate(
+        T.render(T.CONFIRMED, facts) + " Traiga su orden médica.", facts, MessageKind.CONFIRMATION
+    )
+
+    assert not verdict.approved
+
+
+def test_clinical_preparation_and_advice_are_refused_in_a_note() -> None:
+    """Rule 5 outranks the exemption: fasting, eating and drinking, and
+    anything about medication are clinical instructions, whoever writes them."""
+    for clinical in (
+        "Venga en ayunas.",
+        "No puede comer ni beber antes de la cita.",
+        "Tome 500 mg de ibuprofeno antes de venir.",
+        "No se preocupe, no es grave.",
+    ):
+        assert check_clinic_text(clinical), clinical
+    for administrative in ("Traiga su orden médica.", "Lleve la remisión de su EPS."):
+        assert not check_clinic_text(administrative), administrative
