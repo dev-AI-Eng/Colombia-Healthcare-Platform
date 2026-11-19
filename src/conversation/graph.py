@@ -523,7 +523,8 @@ def _confirmation_note(config: dict[str, Any]) -> tuple[str | None, tuple[str, .
     """The sentence a clinic ends its confirmations with, and why it was dropped.
 
     Tidied first: whitespace and line breaks become single spaces, and it ends
-    as a sentence. Rule 5 covers what a clinic configures as much as what a
+    as a sentence. A note with no letter or digit in it ("." or "-") says
+    nothing and is no note. Rule 5 covers what a clinic configures as much as what a
     model writes, so a note with medical advice or clinical preparation in it
     (`check_clinic_text`) is dropped here, once, and the confirmation goes out
     without it instead of every confirmation for the clinic being refused at
@@ -534,7 +535,7 @@ def _confirmation_note(config: dict[str, Any]) -> tuple[str | None, tuple[str, .
     if not isinstance(note, str):
         return None, ()
     note = " ".join(note.split())[:MAX_CONFIRMATION_NOTE_CHARS].rstrip(" :;,")
-    if not note:
+    if not any(character.isalnum() for character in note):
         return None, ()
     if note[-1] not in ".!?":
         note += "."

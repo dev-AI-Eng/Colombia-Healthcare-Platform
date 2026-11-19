@@ -1722,6 +1722,19 @@ async def test_a_clinic_can_have_no_note_at_all(session: AsyncSession) -> None:
     assert text.endswith("Calle 1 # 2-3.")
 
 
+@pytest.mark.parametrize("note", [".", "...", " - ", ";", "!!", "\n.\n"])
+async def test_a_note_of_only_punctuation_is_no_note(session: AsyncSession, note: str) -> None:
+    """Found in deep testing: a note of "." survived tidying and the confirmation
+    ended in a stray " .". With nothing to say, it says nothing, as an empty note does."""
+    graph = await _clinic_with_patient(session)
+    await _configure(session, graph, confirmation_note=note)
+
+    text = await _confirm_text(session, graph)
+
+    assert text.endswith("Calle 1 # 2-3."), text
+    assert "exámenes" not in text and " ." not in text and "  " not in text
+
+
 async def test_a_note_that_gives_medical_advice_is_never_sent(session: AsyncSession) -> None:
     """Rule 5 applies to what a clinic configures as much as to what a model
     writes. The note is refused when it is read, so the confirmation still goes
