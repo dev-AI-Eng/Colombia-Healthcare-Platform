@@ -573,6 +573,17 @@ async def hold(
             now=now,
         )
 
+    # An expired hold still blocks the constraint, and the slot search already
+    # calls its slot free, so a reschedule offer over a lapsed, unswept hold was
+    # refused and silently skipped. Reclaimed here, as `book` does.
+    await _reclaim_expired_holds(
+        session,
+        clinic_id=clinic_id,
+        doctor_id=doctor_id,
+        start=start,
+        end=end,
+        now=now,
+    )
     result = await _insert(
         session,
         Appointment(
@@ -913,6 +924,15 @@ async def reschedule(
             now=now or dt.datetime.now(tz=dt.UTC),
         )
 
+    # The destination may be a slot whose hold lapsed and has not been swept.
+    await _reclaim_expired_holds(
+        session,
+        clinic_id=clinic_id,
+        doctor_id=original.doctor_id,
+        start=start,
+        end=end,
+        now=now or dt.datetime.now(tz=dt.UTC),
+    )
     result = await _insert(
         session,
         Appointment(

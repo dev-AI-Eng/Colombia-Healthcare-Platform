@@ -48,7 +48,7 @@ from src.identity.models import (
     EvidenceKind,
     PhoneBinding,
 )
-from src.registry.models import Clinic, Location
+from src.registry.models import Clinic, DocumentType, Location, Patient
 from src.scheduling import booking
 from src.scheduling.models import (
     Appointment,
@@ -1868,3 +1868,69 @@ async def test_a_note_that_is_dropped_is_logged_without_its_text(session: AsyncS
     dropped = [entry for entry in logs if entry["event"] == "clinic_note_dropped"]
     assert dropped and dropped[0]["clinic_id"] == str(graph.clinic_id)
     assert "ibuprofeno" not in json.dumps(logs, default=str)
+
+
+async def _another_patient(session: AsyncSession, graph: Graph, phone: str) -> Patient:
+    """A second consenting patient of the same clinic and doctor, with an appointment."""
+    other = Patient(
+        clinic_id=graph.clinic_id,
+        document_type=DocumentType.CC,
+        document_number="5544332211",
+        document_number_bidx=blind_index("5544332211"),
+        given_names="Beatriz",
+        family_names="Núñez Peña",
+        phone_e164=phone,
+        phone_e164_bidx=blind_index(phone),
+    )
+    session.add(other)
+    await session.flush()
+    session.add(
+        PhoneBinding(
+            clinic_id=graph.clinic_id,
+            phone_e164_bidx=blind_index(phone),
+            patient_id=other.id,
+            relationship_kind=BindingRelationship.SELF,
+        )
+    )
+    session.add(
+        Consent(
+            clinic_id=graph.clinic_id,
+            patient_id=other.id,
+            purpose=ConsentPurpose.APPOINTMENT_MESSAGING,
+            channel=ConsentChannel.WHATSAPP,
+            evidence_kind=EvidenceKind.WRITTEN,
+            granted_at=dt.datetime.now(tz=dt.UTC),
+            policy_version="2026-10",
+        )
+    )
+    session.add(appointment(graph, at(4, 9, 0), patient_id=other.id))
+    await session.flush()
+    return other
+
+
+async def test_another_patients_lapsed_offer_does_not_shrink_this_ones(
+    session: AsyncSession,
+) -> None:
+    """Found in the delivery campaign: the first patient's offer lapsed and
+    nothing swept it (the demo runs no sweeper). The slot search called those
+    five dates free, each hold over a lapsed one was refused and skipped, and the
+    second patient of the same doctor was offered two dates instead of five."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    deps = _by_intent_deps(session)
+    now = dt.datetime.now(tz=dt.UTC)
+    first = await _run(session, graph, "Quiero otra fecha", deps=deps, now=now)
+    other = await _another_patient(session, graph, "+573009990001")
+    assert other.phone_e164 is not None
+
+    second = await _run(
+        session,
+        graph,
+        "Quiero otra fecha",
+        deps=deps,
+        sender=other.phone_e164,
+        now=now + dt.timedelta(minutes=40),
+    )
+
+    assert len(_dates(first)) == 5
+    assert _dates(second) == _dates(first), "the lapsed offer shrank the next patient's"

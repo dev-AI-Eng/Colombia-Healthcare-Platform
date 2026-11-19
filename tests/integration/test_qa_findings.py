@@ -192,6 +192,99 @@ async def test_a_live_hold_still_blocks_a_booking(session: AsyncSession) -> None
     assert result.outcome is Outcome.TAKEN
 
 
+async def test_an_expired_hold_does_not_block_another_hold(session: AsyncSession) -> None:
+    """Found in the delivery campaign. QA finding 2 reclaimed expired holds in
+    `book()` only. The reschedule offers are holds, and the slot search already
+    calls an expired hold's slot free, so each offer over a lapsed, unswept hold
+    failed on the constraint and was skipped: patients were offered two dates
+    where five were free, and in the demo, where nothing sweeps, the offers of
+    every patient of one doctor shrank as the others' holds piled up."""
+    graph = await create_graph(session, hours=True)
+    start = at(6, 9, 0)
+    end = start + dt.timedelta(minutes=20)
+    common = {
+        "clinic_id": graph.clinic_id,
+        "patient_id": graph.patient_id,
+        "doctor_id": graph.doctor_id,
+        "location_id": graph.location_id,
+        "appointment_type_id": graph.appointment_type_id,
+        "start": start,
+        "end": end,
+        "minutes": 15,
+    }
+    first = await booking.hold(session, now=at(6, 8, 0), **common)
+    assert first.appointment is not None
+
+    # 08:30: the first hold lapsed at 08:15 and nothing has swept it.
+    second = await booking.hold(session, now=at(6, 8, 30), **common)
+
+    assert second.appointment is not None, f"an expired hold blocked a new hold ({second.outcome})"
+    assert second.appointment.status is AppointmentStatus.HOLD
+
+
+async def test_a_live_hold_still_blocks_another_hold(session: AsyncSession) -> None:
+    graph = await create_graph(session, hours=True)
+    start = at(6, 9, 0)
+    common = {
+        "clinic_id": graph.clinic_id,
+        "patient_id": graph.patient_id,
+        "doctor_id": graph.doctor_id,
+        "location_id": graph.location_id,
+        "appointment_type_id": graph.appointment_type_id,
+        "start": start,
+        "end": start + dt.timedelta(minutes=20),
+        "minutes": 15,
+    }
+    assert (await booking.hold(session, now=at(6, 8, 0), **common)).appointment is not None
+
+    second = await booking.hold(session, now=at(6, 8, 10), **common)
+
+    assert second.appointment is None and second.outcome is Outcome.TAKEN
+
+
+async def test_an_expired_hold_does_not_block_a_reschedule(session: AsyncSession) -> None:
+    """The same gap in `reschedule()`: a move onto a slot whose hold had lapsed
+    was refused until the sweep caught up."""
+    graph = await create_graph(session, hours=True)
+    target = at(6, 9, 0)
+    original = await booking.book(
+        session,
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        doctor_id=graph.doctor_id,
+        location_id=graph.location_id,
+        appointment_type_id=graph.appointment_type_id,
+        start=at(6, 10, 0),
+        end=at(6, 10, 0) + dt.timedelta(minutes=20),
+        now=at(6, 8, 0),
+    )
+    assert original.appointment is not None
+    lapsed = await booking.hold(
+        session,
+        clinic_id=graph.clinic_id,
+        patient_id=graph.patient_id,
+        doctor_id=graph.doctor_id,
+        location_id=graph.location_id,
+        appointment_type_id=graph.appointment_type_id,
+        start=target,
+        end=target + dt.timedelta(minutes=20),
+        now=at(6, 8, 0),
+        minutes=15,
+    )
+    assert lapsed.appointment is not None
+
+    moved = await booking.reschedule(
+        session,
+        clinic_id=graph.clinic_id,
+        appointment_id=original.appointment.id,
+        start=target,
+        end=target + dt.timedelta(minutes=20),
+        now=at(6, 8, 30),
+    )
+
+    assert moved.appointment is not None, f"an expired hold blocked a move ({moved.outcome})"
+
+
 # ========================================================= finding 6: buffers
 
 
