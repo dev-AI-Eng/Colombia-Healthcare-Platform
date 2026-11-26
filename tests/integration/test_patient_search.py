@@ -128,6 +128,30 @@ async def test_a_passport_is_found_in_whatever_case_it_is_typed(
     assert str(traveller.id) in found
 
 
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "1020 304 050",  # spaces
+        "1-020-304-050",  # hyphens
+        "AB 1234567",  # a passport with a space
+        "AB-1234567",  # a passport with a hyphen
+        "1020\u2013304050",  # an en dash, which Word and Excel paste in
+        "1020\u00a0304050",  # a no-break space, the same
+    ],
+)
+def test_a_number_with_spaces_or_dashes_is_refused_with_a_message(
+    scoped,  # type: ignore[no-untyped-def]
+    typed: str,
+) -> None:
+    """The client's decision on item 7 of the M3 report: keep refusing spaces and
+    dashes, but say so. Before, these answered an empty list, which a receptionist
+    reads as "this patient is not in the system"."""
+    client, _ = scoped
+    response = client.get("/review/patients", params={"document_number": typed})
+    assert response.status_code == 422, f"{typed!r}: {response.text}"
+    assert "sin espacios ni guiones" in response.json()["detail"]
+
+
 def test_a_partial_number_matches_nobody_rather_than_everybody(scoped) -> None:  # type: ignore[no-untyped-def]
     """The match is exact by design -- the index cannot do prefixes. The screen
     says so; the API's part is to return nobody, not a guess."""

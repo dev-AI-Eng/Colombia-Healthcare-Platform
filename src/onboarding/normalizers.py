@@ -226,6 +226,23 @@ def document_type(raw: str) -> Outcome[DocumentType]:
 _SCIENTIFIC = re.compile(r"^\d(?:\.\d+)?[eE][+-]?\d+$")
 
 
+def has_space_or_dash(text: str) -> bool:
+    """Whether `text` holds a space or a dash anywhere: a no-break space as well,
+    and the en dash, em dash and minus sign that Word and Excel paste in place of
+    a hyphen.
+
+    One definition for the importer and for the staff search, so that a number
+    refused here is a number the search refuses, and a number that is stored can
+    be typed to find it.
+    """
+    return any(
+        character.isspace()
+        or unicodedata.category(character) == "Pd"
+        or character == "\N{MINUS SIGN}"
+        for character in text
+    )
+
+
 def document_number(raw: str) -> Outcome[str]:
     """Return the digits of a document number, or refuse the row.
 
@@ -233,6 +250,12 @@ def document_number(raw: str) -> Outcome[str]:
     rather than repaired: a long number stored as a float becomes scientific
     notation and loses its low-order digits, and a number stored numerically
     loses any leading zero. A repaired cédula is a different person's.
+
+    A space or a dash inside the number goes to a person, the client's rule on
+    item 7 of the M3 report. A hyphen used to be accepted and stored as typed, so
+    "1-020-304-050" could never be found by "1020304050" and the same person in
+    another file became a second patient. Removing the character would be a
+    repair, which this module never makes.
     """
     text = raw.strip()
     if not text:
@@ -245,6 +268,13 @@ def document_number(raw: str) -> Outcome[str]:
             "Re-export the column formatted as text.",
         )
 
+    if has_space_or_dash(text):
+        return _review(
+            "document_number.spacing",
+            f"{raw!r} has a space or a dash. Write the number without spaces or dashes, "
+            "only numbers and letters.",
+        )
+
     # "1.045.678.901" is the Spanish thousands form; "1045678901.0" is a float
     # that happens to be whole. Neither loses information, so both are accepted.
     if re.fullmatch(r"\d{1,3}(\.\d{3})+", text):
@@ -254,7 +284,7 @@ def document_number(raw: str) -> Outcome[str]:
 
     if not _ascii_digits(text):
         # Passports and foreign documents legitimately contain letters.
-        if re.fullmatch(r"[A-Za-z0-9-]{4,20}", text):
+        if re.fullmatch(r"[A-Za-z0-9]{4,20}", text):
             return _valid(text.upper(), "document_number.alphanumeric")
         return _review("document_number.unexpected", f"{raw!r} is not a recognisable number.")
 

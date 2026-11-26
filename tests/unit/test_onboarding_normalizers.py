@@ -543,6 +543,49 @@ def test_a_cedula_of_non_ascii_digits_is_refused(raw: str) -> None:
     assert n.document_number(raw).status is n.Status.REVIEW
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1020 304 050",  # spaces
+        "1-020-304-050",  # a cédula written with hyphens
+        "AB 1234567",  # a passport with a space
+        "AB-123456",  # a passport with a hyphen
+        "V-1234567",
+        "1020\u2013304050",  # an en dash, which Word and Excel paste in
+        "1020\u00a0304050",  # a no-break space, the same
+    ],
+)
+def test_a_document_number_with_a_space_or_a_dash_goes_to_a_person(raw: str) -> None:
+    """The client's rule on item 7 of the M3 report, applied to what is stored as
+    well as to what is searched. A hyphen used to be accepted and stored as typed,
+    so "1-020-304-050" became a number that a search for "1020304050" could never
+    find, and the same person arriving in a file without hyphens became a second
+    patient. Stripping the characters would be a repair, and a repaired document
+    number can belong to somebody else, so a person decides."""
+    outcome = n.document_number(raw)
+    assert outcome.status is n.Status.REVIEW
+    assert outcome.rule == "document_number.spacing"
+    assert outcome.value is None
+    assert "without spaces or dashes" in outcome.message
+
+
+def test_scientific_notation_with_a_minus_sign_is_still_scientific_notation() -> None:
+    """The exponent's minus sign is not a dash in the number."""
+    assert n.document_number("1.2E-05").rule == "document_number.scientific_notation"
+
+
+@pytest.mark.parametrize(
+    "text", [" ", "\t", "-", "\u2013", "\u2014", "\u2212", "\u00a0", "1 2", "A-1"]
+)
+def test_a_space_or_a_dash_is_recognised_in_every_form(text: str) -> None:
+    assert n.has_space_or_dash(text)
+
+
+@pytest.mark.parametrize("text", ["", "1020304050", "1.020.304.050", "AB1234567", "ab1234567"])
+def test_a_number_without_a_space_or_a_dash_is_left_alone(text: str) -> None:
+    assert not n.has_space_or_dash(text)
+
+
 @pytest.mark.parametrize("raw", ["1020304050", "71234567", "1020304050.0"])
 def test_a_real_cedula_still_passes(raw: str) -> None:
     """The narrower test must not refuse what clinics actually send."""

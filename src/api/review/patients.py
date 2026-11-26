@@ -9,7 +9,7 @@ import uuid
 from datetime import date, datetime, time, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, status
 
 from src.api.dependencies import ClinicScopeDep, PageDep, SessionDep, require_found
 from src.api.review.auth import UNMASKED_FIELDS, RoleDep
@@ -67,6 +67,12 @@ async def _record_disclosure(session: SessionDep, patients: list[uuid.UUID]) -> 
     )
 
 
+DOCUMENT_SPACING_REFUSED = (
+    "El número de documento no puede llevar espacios ni guiones: escríbalo sin espacios ni guiones, "
+    "solo con números y letras (por ejemplo 1020304050 o AB1234567)."
+)
+
+
 def _searchable_document(raw: str | None) -> str | None:
     """A typed document number in the form it is stored in.
 
@@ -76,11 +82,19 @@ def _searchable_document(raw: str | None) -> str | None:
     "1020304050.0" loses its ".0". Input the normalizer cannot make sense of
     falls back to the trimmed text, which matches nobody -- the right answer for
     a string that is not a document number.
+
+    A space or a dash inside the number is refused with a 422 that says so (the
+    client's decision on item 7 of the M3 report). It used to answer an empty
+    list, which a receptionist reads as "this patient is not in the system".
+    Leading and trailing spaces are trimmed first, as before.
     """
     if raw is None or not raw.strip():
         return None
-    outcome = normalizers.document_number(raw)
-    return outcome.value if isinstance(outcome.value, str) else raw.strip()
+    text = raw.strip()
+    if normalizers.has_space_or_dash(text):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, DOCUMENT_SPACING_REFUSED)
+    outcome = normalizers.document_number(text)
+    return outcome.value if isinstance(outcome.value, str) else text
 
 
 @router.get("/patients", response_model=Page[PatientOut])
@@ -94,7 +108,13 @@ async def list_patients(
         Query(description="Exact phone number, written however staff write it"),
     ] = None,
     document_number: Annotated[
-        str | None, Query(description="Exact document number, with or without dots")
+        str | None,
+        Query(
+            description=(
+                "Exact document number: digits and letters, in any case, with or without dots. "
+                "A space or a dash inside it is a 422."
+            )
+        ),
     ] = None,
 ) -> Page[PatientOut]:
     """Active patients of the clinic, oldest first.

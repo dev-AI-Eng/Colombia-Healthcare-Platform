@@ -127,6 +127,14 @@ GUIDANCE: Final[dict[str, tuple[str, str]]] = {
         "El documento tiene más o menos dígitos de los que admite el registro RIPS.",
         "Verifique el documento en la historia del paciente.",
     ),
+    "document_number.spacing": (
+        "El número de documento tiene un espacio o un guion. Un número guardado así "
+        "no se podría encontrar después en la búsqueda, que no admite espacios ni "
+        "guiones, y la misma persona podría quedar registrada dos veces.",
+        "Escriba el número sin espacios ni guiones, solo con números y letras (por "
+        "ejemplo 1020304050 o AB1234567). Si no está seguro de cuál es el número "
+        "correcto, verifíquelo en la historia del paciente: no se corrige solo.",
+    ),
     "document_number.unexpected": (
         "El valor no tiene forma de número de documento.",
         "Revise esa celda en el archivo original.",
