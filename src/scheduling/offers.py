@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Final
 
@@ -60,6 +61,14 @@ from src.scheduling.models import (
 #: from somebody else, so more is not better.
 DEFAULT_OFFER_COUNT: Final = 3
 
+#: How far through a day's free times each successive date's offer falls, when an
+#: offer spreads its times: the first date gets the day's earliest time, the next
+#: a late one, then an early-middle one, and so on. A fraction of the day's own
+#: free times rather than a fixed hour, so it fits a doctor who works only
+#: mornings as well as one who works a split day. Fixed, not random: the same
+#: search gives the same offer.
+TIME_OF_DAY_SPREAD: Final = (0.0, 0.7, 0.35, 0.9, 0.5)
+
 
 @dataclass(frozen=True, slots=True)
 class SlotSearch:
@@ -89,6 +98,10 @@ class SlotSearch:
     #: At most one slot per clinic-local day, so an offer is a choice between
     #: dates rather than five times on the same morning.
     one_per_day: bool = False
+    #: With `one_per_day`, vary where in the day each date's slot falls (see
+    #: `TIME_OF_DAY_SPREAD`) instead of always taking the earliest. The client's
+    #: condition on the date offer: every date at 8:00 a.m. is not a choice of times.
+    spread_times: bool = False
 
 
 async def _load_rules(
@@ -251,20 +264,43 @@ async def find_slots(
         buffer_minutes=appointment_type.buffer_minutes,
         now=now,
     )
+    if search.one_per_day:
+        return _one_per_day(slots, search, limit)
     chosen: list[Slot] = []
-    days: set[dt.date] = set()
     for slot in slots:
         if not _acceptable(slot, search):
             continue
-        if search.one_per_day:
-            day = slot.local_start.date()
-            if day in days:
-                continue
-            days.add(day)
         chosen.append(slot)
         if len(chosen) == limit:
             break
     return chosen
+
+
+def _one_per_day(slots: Iterable[Slot], search: SlotSearch, limit: int) -> list[Slot]:
+    """One slot on each of the first `limit` acceptable dates, soonest date first.
+
+    The slots arrive in time order, so a date's slots are complete as soon as the
+    next date starts, and the walk stops there rather than reading the whole range.
+    """
+    by_day: dict[dt.date, list[Slot]] = {}
+    for slot in slots:
+        if not _acceptable(slot, search):
+            continue
+        day = slot.local_start.date()
+        if day not in by_day and len(by_day) == limit:
+            break
+        by_day.setdefault(day, []).append(slot)
+    return [
+        _spread(day_slots, position) if search.spread_times else day_slots[0]
+        for position, day_slots in enumerate(by_day.values())
+    ]
+
+
+def _spread(day_slots: list[Slot], position: int) -> Slot:
+    """The slot that fraction of the way through this date's free times that
+    `TIME_OF_DAY_SPREAD` gives the `position`-th date of the offer."""
+    fraction = TIME_OF_DAY_SPREAD[position % len(TIME_OF_DAY_SPREAD)]
+    return day_slots[round(fraction * (len(day_slots) - 1))]
 
 
 async def recent_rounds(

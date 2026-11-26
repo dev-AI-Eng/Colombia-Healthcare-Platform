@@ -227,6 +227,79 @@ async def test_one_per_day_offers_dates_rather_than_one_mornings_times(
     assert all(s.local_start.time() == dt.time(8) for s in slots), "the earliest time each day"
 
 
+async def _add_rule(
+    session: AsyncSession, graph: Graph, start: dt.time, end: dt.time, weekdays: range = range(5)
+) -> None:
+    for weekday in weekdays:
+        session.add(
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=graph.location_id,
+                weekday=weekday,
+                start_time=start,
+                end_time=end,
+                valid_from=dt.date(2026, 1, 1),
+            )
+        )
+    await session.flush()
+
+
+async def test_spread_times_offers_mornings_and_afternoons_across_the_dates(
+    session: AsyncSession,
+) -> None:
+    """The client's condition on the date offer: the times are varied through the
+    day. Taking the earliest time of every date put all five at 8:00 a.m."""
+    graph = await create_graph(session)
+    await _add_rule(session, graph, dt.time(8), dt.time(12))
+    await _add_rule(session, graph, dt.time(14), dt.time(17))
+    search = _search(graph, one_per_day=True, spread_times=True)
+
+    slots = await offers.find_slots(session, search, now=NOW, limit=5)
+
+    times = [s.local_start.time() for s in slots]
+    assert [s.local_start.date() for s in slots] == [
+        MONDAY + dt.timedelta(days=offset) for offset in range(5)
+    ], "still five different dates, soonest first"
+    assert times[0] == dt.time(8), "the first date keeps the day's earliest time"
+    assert len(set(times)) == 5, f"five different times, got {times}"
+    assert any(t < dt.time(12) for t in times) and any(t >= dt.time(14) for t in times), times
+    assert all(dt.time(8) <= t < dt.time(12) or dt.time(14) <= t < dt.time(17) for t in times), (
+        "every time is one the doctor works"
+    )
+    assert slots == await offers.find_slots(session, search, now=NOW, limit=5), (
+        "the same search gives the same offer"
+    )
+
+
+async def test_spread_times_varies_within_the_morning_for_a_mornings_only_doctor(
+    session: AsyncSession,
+) -> None:
+    graph = await create_graph(session)
+    await _weekday_mornings(session, graph)
+
+    slots = await offers.find_slots(
+        session, _search(graph, one_per_day=True, spread_times=True), now=NOW, limit=5
+    )
+
+    times = [s.local_start.time() for s in slots]
+    assert len(set(times)) == 5, f"all five at one time: {times}"
+    assert all(dt.time(8) <= t < dt.time(12) for t in times)
+
+
+async def test_spread_times_on_a_day_with_one_free_time_offers_that_time(
+    session: AsyncSession,
+) -> None:
+    graph = await create_graph(session)
+    await _add_rule(session, graph, dt.time(8), dt.time(8, 20))
+
+    slots = await offers.find_slots(
+        session, _search(graph, one_per_day=True, spread_times=True), now=NOW, limit=5
+    )
+
+    assert [s.local_start.time() for s in slots] == [dt.time(8)] * 5
+
+
 async def test_an_excluded_date_is_never_offered(session: AsyncSession) -> None:
     """A second round must not repeat the dates the patient turned down."""
     graph = await create_graph(session)

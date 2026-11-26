@@ -1292,6 +1292,42 @@ def _dates(result: dict) -> list[dt.date]:
     return [s.starts_at.astimezone(BOGOTA).date() for s in result["verified_facts"].offered_slots]
 
 
+async def test_the_offered_times_are_spread_through_the_day(session: AsyncSession) -> None:
+    """The client's condition on the date offer: with every date at the doctor's
+    first free time, all five came out at 8:00 a.m. A doctor who works mornings
+    and afternoons is offered both, on five different dates."""
+    graph = await _clinic_with_patient(session)
+    await _bookable_week(session, graph)
+    for weekday in range(5):
+        session.add(
+            AvailabilityRule(
+                clinic_id=graph.clinic_id,
+                doctor_id=graph.doctor_id,
+                location_id=graph.location_id,
+                weekday=weekday,
+                start_time=dt.time(14, 0),
+                end_time=dt.time(17, 0),
+                valid_from=dt.date(2026, 1, 1),
+            )
+        )
+    await session.flush()
+
+    offered = await _run(
+        session,
+        graph,
+        "Quiero otra fecha",
+        deps=_by_intent_deps(session),
+        now=dt.datetime.now(tz=dt.UTC),
+    )
+
+    slots = offered["verified_facts"].offered_slots
+    hours = [s.starts_at.astimezone(BOGOTA).time() for s in slots]
+    assert len(slots) == 5 and len(set(_dates(offered))) == 5
+    assert len(set(hours)) == 5, f"five different times, got {hours}"
+    assert any(h < dt.time(12) for h in hours) and any(h >= dt.time(14) for h in hours), hours
+    assert "a.m." in offered["outbound_text"] and "p.m." in offered["outbound_text"]
+
+
 async def test_the_first_round_offers_five_different_dates_inside_the_window(
     session: AsyncSession,
 ) -> None:

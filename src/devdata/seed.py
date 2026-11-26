@@ -9,7 +9,8 @@ relative to the current date, and availability and appointment dates to the
 Generated data:
 * one clinic with one location and one 20-minute appointment type;
 * doctors cycling through eight specialties, each available Monday to Friday
-  08:00-12:00;
+  08:00-12:00 and 14:00-17:00 (a morning and an afternoon, so an offer of dates
+  can show times across the day);
 * patients, each with a phone binding to their own number and an
   appointment-messaging consent;
 * one handset shared by the first three patients, bound as `caregiver`, to
@@ -126,6 +127,8 @@ def _document_type_for_age(drawn: DocumentType, born: date, today: date) -> Docu
 
 
 APPOINTMENT_MINUTES = 20
+#: A morning and an afternoon, with the lunch hour between them.
+WORKING_BLOCKS = ((time(8, 0), time(12, 0)), (time(14, 0), time(17, 0)))
 APPOINTMENTS_PER_DOCTOR = 12
 SHARED_HANDSET_PATIENTS = 3
 
@@ -295,12 +298,13 @@ async def seed_synthetic_data(
             doctor_id=doctor.id,
             location_id=location.id,
             weekday=weekday,
-            start_time=time(8, 0),
-            end_time=time(12, 0),
+            start_time=start,
+            end_time=end,
             valid_from=anchor,
         )
         for doctor in doctor_rows
         for weekday in range(5)
+        for start, end in WORKING_BLOCKS
     )
 
     patient_rows = await _create_patients(session, clinic, patients, fake, rng)

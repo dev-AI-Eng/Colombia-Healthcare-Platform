@@ -203,8 +203,10 @@ async def find_slots(
     earliest: dt.time | None = None,
     latest: dt.time | None = None,
 ) -> ToolResult:
-    """Compute offerable times, one per date, never on `exclude_dates` and,
-    when `only_dates` is given, only on those. Nothing is reserved.
+    """Compute offerable times, one per date and spread through the day (the
+    client's condition on the offer: not every date at the same early hour),
+    never on `exclude_dates` and, when `only_dates` is given, only on those.
+    Nothing is reserved.
 
     Computed from the doctor's rules on this request rather than read from a
     slot table: a stored list drifts the moment a doctor changes their hours or
@@ -222,6 +224,7 @@ async def find_slots(
         excluded_dates=frozenset(exclude_dates),
         only_dates=frozenset(only_dates),
         one_per_day=True,
+        spread_times=True,
     )
     found = await offers.find_slots(session, search, now=now, limit=MAX_OFFERED_SLOTS)
 
